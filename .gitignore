@@ -11,3 +11,5 @@ env/
 
 *.db
 *.sqlite
+secrets/
+.streamlit/secrets.toml

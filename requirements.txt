@@ -3,3 +3,9 @@ pandas>=2.0
 sqlalchemy>=2.0
 pymysql>=1.1
 python-dotenv>=1.0
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+gspread>=6.0
+google-auth>=2.0
+
