@@ -1,0 +1,5 @@
+streamlit>=1.34
+pandas>=2.0
+sqlalchemy>=2.0
+pymysql>=1.1
+python-dotenv>=1.0

@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+.vscode/
+
+# Streamlit secrets (important!)
+.streamlit/secrets.toml
+
+# Local data
+*.db
+*.sqlite
