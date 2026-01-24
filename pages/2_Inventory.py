@@ -10,6 +10,7 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
+
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -71,34 +72,34 @@ NUMERIC_COLS = ["purchase_price", "shipping", "tax", "total_price"]
 
 @st.cache_resource
 def get_gspread_client():
-    """
-    Reads service account JSON from file path specified in st.secrets:
-      service_account_json_path = "secrets/gpc_service_account.json"
-    """
-    try:
-        sa_rel = st.secrets["service_account_json_path"]
-        sa_path = Path(sa_rel)
-        if not sa_path.is_absolute():
-            # resolve relative to project root (current working directory)
-            sa_path = Path.cwd() / sa_rel
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
 
-        if not sa_path.exists():
-            st.error(f"Service account JSON not found at: {sa_path}")
-            st.stop()
-
-        sa_info = json.loads(sa_path.read_text(encoding="utf-8"))
-
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
+    # 1) Streamlit Cloud path: JSON stored directly in secrets as a string
+    if "gcp_service_account" in st.secrets:
+        sa_json_str = st.secrets["gcp_service_account"]
+        sa_info = json.loads(sa_json_str)
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         return gspread.authorize(creds)
 
-    except Exception as e:
-        st.error(f"Failed to initialize Google Sheets client: {e}")
-        st.stop()
+    # 2) Local dev path: JSON file on disk (your current setup)
+    if "service_account_json_path" in st.secrets:
+        sa_rel = st.secrets["service_account_json_path"]
+        sa_path = Path(sa_rel)
+        if not sa_path.is_absolute():
+            sa_path = Path.cwd() / sa_rel
 
+        if not sa_path.exists():
+            raise FileNotFoundError(f"Service account JSON not found at: {sa_path}")
+
+        sa_info = json.loads(sa_path.read_text(encoding="utf-8"))
+        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        return gspread.authorize(creds)
+
+    # Nothing configured
+    raise KeyError('Missing secrets: add "gcp_service_account" (Cloud) or "service_account_json_path" (local).')
 
 def get_worksheet():
     client = get_gspread_client()
