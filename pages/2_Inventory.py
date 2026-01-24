@@ -77,14 +77,21 @@ def get_gspread_client():
         "https://www.googleapis.com/auth/drive",
     ]
 
-    # 1) Streamlit Cloud path: JSON stored directly in secrets as a string
-    if "gcp_service_account" in st.secrets:
+    # Streamlit Cloud format: secrets stored as TOML table
+    if "gcp_service_account" in st.secrets and not isinstance(st.secrets["gcp_service_account"], str):
+        sa = st.secrets["gcp_service_account"]
+        sa_info = {k: sa[k] for k in sa.keys()}
+        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        return gspread.authorize(creds)
+
+    # Streamlit Cloud alternate: secrets stored as JSON string
+    if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], str):
         sa_json_str = st.secrets["gcp_service_account"]
         sa_info = json.loads(sa_json_str)
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         return gspread.authorize(creds)
 
-    # 2) Local dev path: JSON file on disk (your current setup)
+    # Local dev: JSON file path
     if "service_account_json_path" in st.secrets:
         sa_rel = st.secrets["service_account_json_path"]
         sa_path = Path(sa_rel)
@@ -98,7 +105,6 @@ def get_gspread_client():
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         return gspread.authorize(creds)
 
-    # Nothing configured
     raise KeyError('Missing secrets: add "gcp_service_account" (Cloud) or "service_account_json_path" (local).')
 
 def get_worksheet():
