@@ -3,7 +3,7 @@ import re
 import uuid
 from datetime import date
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import pandas as pd
 import requests
@@ -17,32 +17,11 @@ from google.oauth2.service_account import Credentials
 # CONFIG
 # =========================================================
 
-INVENTORY_STATE_KEY = "inventory_df_v6"
+INVENTORY_STATE_KEY = "inventory_df_v8"
 
-# Columns we store in Google Sheets
-DEFAULT_COLUMNS = [
-    "inventory_id",
-    "product_type",        # Card / Sealed
-    "sealed_product_type", # Booster Box / ETB / etc (only for sealed)
-    "card_type",           # Pokemon / Sports / Other
-    "brand_or_league",     # Pokemon TCG / Football / Basketball / etc.
-    "set_name",
-    "year",
-    "card_name",           # for sealed: item name (e.g., Elite Trainer Box)
-    "card_number",
-    "variant",
-    "card_subtype",        # Rookie / Insert / Parallel / EX / etc.
-    "reference_link",
-    "purchase_date",
-    "purchased_from",
-    "purchase_price",
-    "shipping",
-    "tax",
-    "total_price",         # computed per row
-    "condition",           # Card condition; for sealed we store "Sealed"
-    "notes",
-    "created_at",
-]
+STATUS_ACTIVE = "ACTIVE"
+STATUS_LISTED = "LISTED"
+STATUS_SOLD = "SOLD"
 
 PRODUCT_TYPE_OPTIONS = ["Card", "Sealed"]
 CARD_TYPE_OPTIONS = ["Pokemon", "Sports", "Other"]
@@ -56,25 +35,6 @@ POKEMON_SEALED_TYPE_OPTIONS = [
     "Tech Sticker Collection",
     "Collection Box",
 ]
-
-# Common sealed types we can infer from PriceCharting slug/title
-SEALED_TYPE_KEYWORDS = {
-    "elite-trainer-box": "Elite Trainer Box",
-    "etb": "Elite Trainer Box",
-    "booster-box": "Booster Box",
-    "booster-display": "Booster Box",
-    "booster-bundle": "Booster Bundle",
-    "booster-pack": "Booster Pack",
-    "sleeved-booster": "Sleeved Booster",
-    "tin": "Tin",
-    "collection-box": "Collection Box",
-    "premium-collection": "Premium Collection Box",
-    "battle-box": "Battle Box",
-    "theme-deck": "Theme Deck",
-    "starter-deck": "Starter Deck",
-    "trainer-toolkit": "Trainer Toolkit",
-    "bundle": "Bundle",
-}
 
 CONDITION_OPTIONS = [
     "Near Mint",
@@ -97,28 +57,89 @@ SPORT_TOKENS = {
 
 NUMERIC_COLS = ["purchase_price", "shipping", "tax", "total_price"]
 
-# Support both header styles if you added columns manually
-HEADER_ALIASES = {
-    "product_type": ["product_type", "Product Type"],
-    "sealed_product_type": ["sealed_product_type", "Sealed Product Type"],
+# Canonical sheet columns (snake_case only)
+DEFAULT_COLUMNS = [
+    "inventory_id",
+    "image_url",            # scraped from reference_link
+    "product_type",
+    "sealed_product_type",
+    "card_type",
+    "brand_or_league",
+    "set_name",
+    "year",
+    "card_name",
+    "card_number",
+    "variant",
+    "card_subtype",
+    "reference_link",
+    "purchase_date",
+    "purchased_from",
+    "purchase_price",
+    "shipping",
+    "tax",
+    "total_price",
+    "condition",
+    "notes",
+    "created_at",
+    "inventory_status",
+    "listed_transaction_id",
+]
+
+SEALED_TYPE_KEYWORDS = {
+    "elite-trainer-box": "Elite Trainer Box",
+    "etb": "Elite Trainer Box",
+    "booster-box": "Booster Box",
+    "booster-display": "Booster Box",
+    "booster-bundle": "Booster Bundle",
+    "premium-collection": "Premium Collection Box",
+    "collection-box": "Collection Box",
+    "blister": "Blister Pack",
+    "tech-sticker-collection": "Tech Sticker Collection",
 }
 
-def internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
-    aliases = HEADER_ALIASES.get(internal, [internal])
-    for a in aliases:
-        if a in existing_headers:
-            return a
-    if internal == "product_type":
-        return "Product Type"
-    if internal == "sealed_product_type":
-        return "Sealed Product Type"
-    return internal
+# ---- UI sizing for image tables (your request) ----
+# ~2 inches at typical 96dpi ~= 192px. We’ll use 200px for “actually visible”.
+TABLE_ROW_HEIGHT_PX = 200
+TABLE_IMAGE_WIDTH_PX = 190
 
-def sheet_header_to_internal(header: str) -> str:
-    for internal, aliases in HEADER_ALIASES.items():
-        if header in aliases:
-            return internal
-    return header
+
+# =========================================================
+# GLOBAL CSS: force bigger rows + bigger images in Streamlit tables
+# =========================================================
+def inject_table_css():
+    st.markdown(
+        f"""
+        <style>
+        /* Applies to st.dataframe + st.data_editor (AgGrid) */
+        div[data-testid="stDataFrame"] .ag-row,
+        div[data-testid="stDataEditor"] .ag-row {{
+            height: {TABLE_ROW_HEIGHT_PX}px !important;
+        }}
+
+        div[data-testid="stDataFrame"] .ag-cell,
+        div[data-testid="stDataEditor"] .ag-cell {{
+            line-height: normal !important;
+            display: flex;
+            align-items: center;
+        }}
+
+        /* Make images big and readable */
+        div[data-testid="stDataFrame"] .ag-cell img,
+        div[data-testid="stDataEditor"] .ag-cell img {{
+            width: {TABLE_IMAGE_WIDTH_PX}px !important;
+            height: auto !important;
+            border-radius: 6px;
+        }}
+
+        /* Give the image column enough room so it doesn't clip */
+        div[data-testid="stDataFrame"] .ag-header-cell[col-id="image_url"],
+        div[data-testid="stDataEditor"] .ag-header-cell[col-id="image_url"] {{
+            min-width: {TABLE_IMAGE_WIDTH_PX + 40}px !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # =========================================================
@@ -127,43 +148,34 @@ def sheet_header_to_internal(header: str) -> str:
 
 @st.cache_resource
 def get_gspread_client():
-    """
-    Supports:
-    - Streamlit Cloud: gcp_service_account stored as TOML table OR JSON string
-    - Local: service_account_json_path points to a JSON file
-    """
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
 
-    # Streamlit Cloud: TOML table
     if "gcp_service_account" in st.secrets and not isinstance(st.secrets["gcp_service_account"], str):
         sa = st.secrets["gcp_service_account"]
         sa_info = {k: sa[k] for k in sa.keys()}
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         return gspread.authorize(creds)
 
-    # Streamlit Cloud: JSON string
     if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], str):
-        sa_json_str = st.secrets["gcp_service_account"]
-        sa_info = json.loads(sa_json_str)
+        sa_info = json.loads(st.secrets["gcp_service_account"])
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         return gspread.authorize(creds)
 
-    # Local dev: JSON file
     if "service_account_json_path" in st.secrets:
-        sa_rel = st.secrets["service_account_json_path"]
-        sa_path = Path(sa_rel)
-        if not sa_path.is_absolute():
-            sa_path = Path.cwd() / sa_rel
-        if not sa_path.exists():
-            raise FileNotFoundError(f"Service account JSON not found at: {sa_path}")
-        sa_info = json.loads(sa_path.read_text(encoding="utf-8"))
+        rel = st.secrets["service_account_json_path"]
+        p = Path(rel)
+        if not p.is_absolute():
+            p = Path.cwd() / rel
+        if not p.exists():
+            raise FileNotFoundError(f"Service account JSON not found at: {p}")
+        sa_info = json.loads(p.read_text(encoding="utf-8"))
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         return gspread.authorize(creds)
 
-    raise KeyError('Missing secrets: add "gcp_service_account" (Cloud) or "service_account_json_path" (local).')
+    raise KeyError('Missing secrets. Add "gcp_service_account" (Cloud) OR "service_account_json_path" (local).')
 
 
 def get_worksheet():
@@ -174,44 +186,75 @@ def get_worksheet():
     return sh.worksheet(worksheet_name)
 
 
-def ensure_headers(ws, internal_headers):
-    first_row = ws.row_values(1)
-    if not first_row:
-        sheet_headers = []
-        for internal in internal_headers:
-            if internal == "product_type":
-                sheet_headers.append("Product Type")
-            elif internal == "sealed_product_type":
-                sheet_headers.append("Sealed Product Type")
-            else:
-                sheet_headers.append(internal)
-        ws.append_row(sheet_headers)
-        return sheet_headers
+def _canonicalize_header(h: str) -> str:
+    if h is None:
+        return ""
+    raw = str(h).strip()
+    low = raw.lower().strip()
 
-    existing = first_row
-    existing_internal = set(sheet_header_to_internal(h) for h in existing)
+    # Normalize a few known “human headers” to canonical snake_case
+    mapping = {
+        "product type": "product_type",
+        "sealed product type": "sealed_product_type",
+        "image url": "image_url",
+    }
+    if low in mapping:
+        return mapping[low]
 
-    missing_internal = [h for h in internal_headers if h not in existing_internal]
-    if missing_internal:
-        additions = []
-        for internal in missing_internal:
-            additions.append(internal_to_sheet_header(internal, existing))
-        new_headers = existing + additions
-        ws.update("1:1", [new_headers])
-        return new_headers
+    # If it’s already snake_case we keep it
+    return raw
 
-    return existing
+
+def migrate_and_fix_headers(ws):
+    """
+    - Canonicalize headers into snake_case for known fields
+    - Delete duplicate columns in the SHEET (keep first occurrence)
+    - Ensure all DEFAULT_COLUMNS exist (append missing)
+    """
+    headers = ws.row_values(1)
+
+    if not headers:
+        ws.append_row(DEFAULT_COLUMNS)
+        return DEFAULT_COLUMNS
+
+    canon = [_canonicalize_header(h) for h in headers]
+
+    if canon != headers:
+        ws.update("1:1", [canon])
+        headers = canon
+
+    # Delete duplicates (in the sheet)
+    seen = {}
+    dup_idxs = []
+    for idx, h in enumerate(headers, start=1):
+        key = str(h).strip()
+        if key == "":
+            continue
+        if key in seen:
+            dup_idxs.append(idx)
+        else:
+            seen[key] = idx
+
+    for col_idx in sorted(dup_idxs, reverse=True):
+        ws.delete_columns(col_idx)
+
+    headers = ws.row_values(1)
+
+    existing = set(headers)
+    missing = [c for c in DEFAULT_COLUMNS if c not in existing]
+    if missing:
+        ws.update("1:1", [headers + missing])
+        headers = ws.row_values(1)
+
+    return headers
 
 
 def sheets_load_inventory() -> pd.DataFrame:
     ws = get_worksheet()
-    sheet_headers = ensure_headers(ws, DEFAULT_COLUMNS)
+    headers = migrate_and_fix_headers(ws)
 
     records = ws.get_all_records()
-    df = pd.DataFrame(records)
-
-    if not df.empty:
-        df = df.rename(columns={c: sheet_header_to_internal(c) for c in df.columns})
+    df = pd.DataFrame(records) if records else pd.DataFrame(columns=headers)
 
     for col in DEFAULT_COLUMNS:
         if col not in df.columns:
@@ -223,12 +266,13 @@ def sheets_load_inventory() -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
     df["inventory_id"] = df["inventory_id"].astype(str)
-    if "product_type" in df.columns:
-        df["product_type"] = df["product_type"].replace("", "Card").fillna("Card")
+    df["product_type"] = df["product_type"].replace("", "Card").fillna("Card")
+    df["inventory_status"] = df["inventory_status"].replace("", STATUS_ACTIVE).fillna(STATUS_ACTIVE)
+    df["listed_transaction_id"] = df["listed_transaction_id"].astype(str).replace("nan", "").fillna("")
+    df["image_url"] = df["image_url"].astype(str).replace("nan", "").fillna("")
 
-    # If any sealed rows have blank condition, fill it for cleanliness
-    if "condition" in df.columns:
-        df.loc[(df["product_type"] == "Sealed") & (df["condition"].astype(str).str.strip() == ""), "condition"] = "Sealed"
+    sealed_mask = (df["product_type"] == "Sealed") & (df["condition"].astype(str).str.strip() == "")
+    df.loc[sealed_mask, "condition"] = "Sealed"
 
     return df
 
@@ -237,22 +281,15 @@ def _find_row_numbers_by_inventory_id(ws, inventory_ids):
     col_a = ws.col_values(1)
     id_to_row = {}
     for idx, val in enumerate(col_a[1:], start=2):
-        if val:
+        if val is not None and str(val).strip() != "":
             id_to_row[str(val)] = idx
     return {str(inv_id): id_to_row.get(str(inv_id)) for inv_id in inventory_ids}
 
 
 def sheets_append_inventory_row(row_internal: dict):
     ws = get_worksheet()
-    sheet_headers = ensure_headers(ws, DEFAULT_COLUMNS)
-
-    header_to_internal = {h: sheet_header_to_internal(h) for h in sheet_headers}
-
-    ordered = []
-    for sheet_h in sheet_headers:
-        internal = header_to_internal.get(sheet_h, sheet_h)
-        ordered.append(row_internal.get(internal, ""))
-
+    headers = migrate_and_fix_headers(ws)
+    ordered = [row_internal.get(h, "") for h in headers]
     ws.append_row(ordered, value_input_option="USER_ENTERED")
 
 
@@ -261,13 +298,12 @@ def sheets_update_rows(rows_internal: pd.DataFrame):
         return
 
     ws = get_worksheet()
-    sheet_headers = ensure_headers(ws, DEFAULT_COLUMNS)
-    header_to_internal = {h: sheet_header_to_internal(h) for h in sheet_headers}
+    headers = migrate_and_fix_headers(ws)
 
     inv_ids = rows_internal["inventory_id"].astype(str).tolist()
     id_to_rownum = _find_row_numbers_by_inventory_id(ws, inv_ids)
 
-    last_col_letter = gspread.utils.rowcol_to_a1(1, len(sheet_headers)).split("1")[0]
+    last_col_letter = gspread.utils.rowcol_to_a1(1, len(headers)).split("1")[0]
 
     for _, r in rows_internal.iterrows():
         inv_id = str(r["inventory_id"])
@@ -276,9 +312,8 @@ def sheets_update_rows(rows_internal: pd.DataFrame):
             continue
 
         values = []
-        for sheet_h in sheet_headers:
-            internal = header_to_internal.get(sheet_h, sheet_h)
-            v = r.get(internal, "")
+        for h in headers:
+            v = r.get(h, "")
             if pd.isna(v):
                 v = ""
             values.append(v)
@@ -292,7 +327,7 @@ def sheets_delete_rows_by_ids(inventory_ids):
         return
 
     ws = get_worksheet()
-    ensure_headers(ws, DEFAULT_COLUMNS)
+    migrate_and_fix_headers(ws)
 
     id_to_rownum = _find_row_numbers_by_inventory_id(ws, inventory_ids)
     rownums = [rn for rn in id_to_rownum.values() if rn]
@@ -302,8 +337,44 @@ def sheets_delete_rows_by_ids(inventory_ids):
 
 
 # =========================================================
-# SCRAPE HELPERS (PriceCharting + Sportscardspro)
+# SCRAPE HELPERS
 # =========================================================
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def scrape_image_url(reference_link: str) -> str:
+    """
+    Tries, in order:
+    - og:image
+    - twitter:image
+    - first <img> tag
+    Returns absolute URL when possible.
+    """
+    if not reference_link or not str(reference_link).strip():
+        return ""
+
+    url = str(reference_link).strip()
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (CardTracker; +Streamlit)"}
+        r = requests.get(url, headers=headers, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content"):
+            return urljoin(url, og["content"].strip())
+
+        tw = soup.find("meta", attrs={"name": "twitter:image"})
+        if tw and tw.get("content"):
+            return urljoin(url, tw["content"].strip())
+
+        img = soup.find("img")
+        if img and img.get("src"):
+            return urljoin(url, img["src"].strip())
+    except Exception:
+        return ""
+
+    return ""
+
 
 def _money(x) -> float:
     try:
@@ -337,14 +408,11 @@ def _parse_set_slug_generic(set_slug: str):
     sport_token = tokens[0].lower() if tokens else ""
     if sport_token in SPORT_TOKENS:
         brand_or_league = SPORT_TOKENS[sport_token]
-
         cleaned = tokens[:]
         if len(cleaned) > 1 and cleaned[1].lower() == "cards":
             cleaned = [cleaned[0]] + cleaned[2:]
-
         cleaned_no_year = [t for t in cleaned[1:] if t != year]
         set_name = _title_case_from_slug("-".join(cleaned_no_year)) if cleaned_no_year else ""
-
         return {"card_type": "Sports", "brand_or_league": brand_or_league, "year": year, "set_name": set_name}
 
     return {"card_type": "", "brand_or_league": "", "year": year, "set_name": _title_case_from_slug(set_slug)}
@@ -354,14 +422,11 @@ def _find_best_title(soup: BeautifulSoup) -> str:
     og = soup.find("meta", property="og:title")
     if og and og.get("content"):
         return og["content"].strip()
-
     h1 = soup.find("h1")
     if h1 and h1.get_text(strip=True):
         return h1.get_text(" ", strip=True)
-
     if soup.title and soup.title.string:
         return soup.title.string.strip()
-
     return ""
 
 
@@ -369,9 +434,7 @@ def _parse_header_like_sportscardspro(header: str):
     out = {"card_name": "", "variant": "", "card_number": "", "year": "", "set_name": ""}
     if not header:
         return out
-
     header = header.strip()
-
     m_num = re.search(r"#\s*([A-Za-z0-9]+)", header)
     if m_num:
         out["card_number"] = m_num.group(1).strip()
@@ -428,26 +491,6 @@ def _infer_sealed_type_from_slug_or_title(slug: str, title: str) -> str:
     for k, v in SEALED_TYPE_KEYWORDS.items():
         if k in t:
             return v
-    if "elite trainer box" in t:
-        return "Elite Trainer Box"
-    if "booster box" in t:
-        return "Booster Box"
-    if "booster bundle" in t:
-        return "Booster Bundle"
-    if "collection box" in t:
-        return "Collection Box"
-    if "premium collection" in t:
-        return "Premium Collection Box"
-    if "blister" in t:
-        return "Blister Pack"
-    if "box" in t:
-        return "Box"
-    if "bundle" in t:
-        return "Bundle"
-    if "tin" in t:
-        return "Tin"
-    if "pack" in t:
-        return "Pack"
     return ""
 
 
@@ -459,7 +502,7 @@ def _looks_like_single_card_slug(card_slug: str) -> bool:
 
 def fetch_item_details_from_link(url: str):
     """
-    Returns details for both Cards and Sealed items.
+    Returns card/sealed details + image_url.
     """
     result = {
         "product_type": "Card",
@@ -473,6 +516,7 @@ def fetch_item_details_from_link(url: str):
         "variant": "",
         "card_subtype": "",
         "reference_link": url,
+        "image_url": "",
     }
 
     if not url or not url.strip():
@@ -486,7 +530,7 @@ def fetch_item_details_from_link(url: str):
     soup = None
     page_title = ""
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (CardTrackerPrototype; +Streamlit)"}
+        headers = {"User-Agent": "Mozilla/5.0 (CardTracker; +Streamlit)"}
         r = requests.get(url, headers=headers, timeout=12)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
@@ -494,6 +538,9 @@ def fetch_item_details_from_link(url: str):
     except Exception:
         soup = None
         page_title = ""
+
+    # image
+    result["image_url"] = scrape_image_url(url)
 
     def _extract_game_parts(p: str):
         parts = [x for x in p.split("/") if x]
@@ -503,7 +550,6 @@ def fetch_item_details_from_link(url: str):
 
     set_slug, card_slug = _extract_game_parts(path)
 
-    # Sportscardspro = singles (Card)
     if "sportscardspro.com" in host and set_slug:
         result["product_type"] = "Card"
         result.update(_parse_set_slug_generic(set_slug))
@@ -520,59 +566,23 @@ def fetch_item_details_from_link(url: str):
             if header_info.get(k):
                 result[k] = header_info[k] or result.get(k, "")
 
-        if not result["card_name"] and card_slug:
-            result["card_name"] = _title_case_from_slug(re.sub(r"-(\d+[A-Za-z0-9]*)$", "", card_slug))
-        if not result["card_number"] and card_slug:
-            m = re.search(r"-(\d+[A-Za-z0-9]*)$", card_slug)
-            if m:
-                result["card_number"] = m.group(1)
-
         return result
 
-    # PriceCharting = could be card or sealed
     if "pricecharting.com" in host and set_slug:
         result.update(_parse_set_slug_generic(set_slug))
 
         if card_slug and not _looks_like_single_card_slug(card_slug):
-            # Sealed item
             result["product_type"] = "Sealed"
             result["sealed_product_type"] = _infer_sealed_type_from_slug_or_title(card_slug, page_title)
-
-            # Use page title for nicer label, but keep it simple
             result["card_name"] = result["sealed_product_type"] or (page_title or _title_case_from_slug(card_slug))
-
-            # Clear card-only bits
             result["card_number"] = ""
             result["variant"] = ""
             result["card_subtype"] = ""
             return result
 
-        # Single card
         result["product_type"] = "Card"
         result.update(_parse_pricecharting_title(page_title))
-
-        if not result["card_number"] and card_slug:
-            m = re.search(r"-(\d+[A-Za-z0-9]*)$", card_slug)
-            if m:
-                result["card_number"] = m.group(1)
-        if not result["card_name"] and card_slug:
-            cleaned = re.sub(r"-(\d+[A-Za-z0-9]*)$", "", card_slug)
-            result["card_name"] = _title_case_from_slug(cleaned)
-
         return result
-
-    # Generic fallback
-    header_info = _parse_header_like_sportscardspro(page_title)
-    for k in ["card_name", "variant", "card_number", "year", "set_name"]:
-        if header_info.get(k):
-            result[k] = header_info[k]
-
-    lowered = (url + " " + page_title).lower()
-    if "pokemon" in lowered:
-        result["card_type"] = "Pokemon"
-        result["brand_or_league"] = "Pokemon TCG"
-    elif any(tok in lowered for tok in ["prizm", "optic", "select", "donruss", "panini", "topps"]):
-        result["card_type"] = "Sports"
 
     return result
 
@@ -599,11 +609,21 @@ def _safe_money_display(x):
         return str(x)
 
 
+def _label_for_row(r: pd.Series) -> str:
+    inv = str(r.get("inventory_id", "")).strip()
+    name = str(r.get("card_name", "")).strip()
+    setn = str(r.get("set_name", "")).strip()
+    yr = str(r.get("year", "")).strip()
+    pt = str(r.get("product_type", "")).strip()
+    return f"{inv} — {name} ({setn}{' ' + yr if yr else ''}) [{pt}]"
+
+
 # =========================================================
 # UI
 # =========================================================
 
 st.set_page_config(page_title="Inventory", layout="wide")
+inject_table_css()
 init_inventory_from_sheets()
 
 st.title("Inventory")
@@ -621,7 +641,7 @@ tab_new, tab_list, tab_summary = st.tabs(["New Inventory", "Inventory List", "In
 # ---------------------------
 with tab_new:
     st.subheader("Add new inventory (intake)")
-    st.caption("Paste a PriceCharting or Sportscardspro link and click Pull details to auto-fill fields.")
+    st.caption("Paste a PriceCharting or Sportscardspro link and click Pull details to auto-fill fields (and image).")
 
     link_col1, link_col2 = st.columns([4, 1])
     with link_col1:
@@ -636,15 +656,16 @@ with tab_new:
     if pull:
         details = fetch_item_details_from_link(reference_link)
         st.session_state["prefill_details"] = details
-        if any(details.get(k) for k in ["card_name", "set_name", "card_number", "variant", "card_type", "year", "sealed_product_type", "product_type"]):
-            st.success("Pulled details. Review/adjust below, then add to inventory.")
-        else:
-            st.warning("Could not pull much from that link. You can still enter details manually.")
+        st.success("Pulled details. Review/adjust below, then add to inventory.")
 
     prefill = st.session_state.get("prefill_details", {}) or {}
 
-    with st.form("new_inventory_form_v6", clear_on_submit=True):
-        # Select Product Type + Card Type first
+    # Image: upper-left after pulling details
+    img_url = (prefill.get("image_url") or "").strip()
+    if img_url:
+        st.image(img_url, width=180)
+
+    with st.form("new_inventory_form_v8", clear_on_submit=True):
         a1, a2, a3, a4 = st.columns([1.2, 1.2, 2.2, 1.0])
 
         with a1:
@@ -662,17 +683,11 @@ with tab_new:
         with a3:
             sealed_product_type = ""
             if product_type == "Sealed":
-                # Pokemon sealed -> dropdown. Anything else -> free text.
                 if card_type == "Pokemon":
                     pre = (prefill.get("sealed_product_type") or "").strip()
                     options = [""] + POKEMON_SEALED_TYPE_OPTIONS
                     idx = options.index(pre) if pre in options else 0
-                    sealed_product_type = st.selectbox(
-                        "Sealed Product Type*",
-                        options=options,
-                        index=idx,
-                        help="For Pokemon sealed products, choose a standardized type.",
-                    )
+                    sealed_product_type = st.selectbox("Sealed Product Type*", options=options, index=idx)
                 else:
                     sealed_product_type = st.text_input(
                         "Sealed Product Type*",
@@ -702,51 +717,37 @@ with tab_new:
             year = st.text_input("Year (optional)", value=prefill.get("year", ""), placeholder="2024, 2025, ...")
 
         with c2:
-            set_name = st.text_input(
-                "Set (optional)",
-                value=prefill.get("set_name", ""),
-                placeholder="Surging Sparks, Panini Prizm, Optic, ...",
-            )
-
+            set_name = st.text_input("Set (optional)", value=prefill.get("set_name", ""))
             name_label = "Item name*" if product_type == "Sealed" else "Card name*"
-            card_name = st.text_input(
-                name_label,
-                value=prefill.get("card_name", ""),
-                placeholder="Elite Trainer Box / Pikachu / Jaxson Dart / etc.",
-            )
+            card_name = st.text_input(name_label, value=prefill.get("card_name", ""))
 
-            # Card #: hide for sealed
             if product_type == "Card":
-                card_number = st.text_input("Card # (optional)", value=prefill.get("card_number", ""), placeholder="332")
+                card_number = st.text_input("Card # (optional)", value=prefill.get("card_number", ""))
             else:
                 card_number = ""
 
         with c3:
-            # Hide card-only fields for sealed
             if product_type == "Card":
-                variant = st.text_input("Variant (optional)", value=prefill.get("variant", ""), placeholder="White Disco, Silver, Holo, Parallel, EX, ...")
-                card_subtype = st.text_input("Card subtype (optional)", value=prefill.get("card_subtype", ""), placeholder="Rookie, Insert, Parallel, etc.")
+                variant = st.text_input("Variant (optional)", value=prefill.get("variant", ""))
+                card_subtype = st.text_input("Card subtype (optional)", value=prefill.get("card_subtype", ""))
                 condition = st.selectbox("Condition*", CONDITION_OPTIONS, index=0)
             else:
                 variant = ""
                 card_subtype = ""
                 condition = "Sealed"
-                st.caption("Variant / Card subtype / Condition are not applicable for sealed products.")
+                st.caption("Variant / subtype / card # / condition not applicable for sealed.")
 
         st.markdown("---")
-
         c4, c5, c6 = st.columns(3)
         with c4:
             purchase_date = st.date_input("Purchase date*", value=date.today())
             purchased_from = st.text_input("Purchased from*", placeholder="eBay, Opened, Whatnot, Card show, LCS, etc.")
-
         with c5:
             purchase_price = st.number_input("Purchase price (per item)*", min_value=0.0, step=1.0, format="%.2f")
             shipping = st.number_input("Shipping (per item)", min_value=0.0, step=1.0, format="%.2f")
-
         with c6:
             tax = st.number_input("Tax (per item)", min_value=0.0, step=1.0, format="%.2f")
-            notes = st.text_area("Notes (optional)", height=92, placeholder="Anything you want to remember…")
+            notes = st.text_area("Notes (optional)", height=92)
 
         submitted = st.form_submit_button("Add to Inventory", type="primary", use_container_width=True)
 
@@ -760,19 +761,22 @@ with tab_new:
                 missing.append("Purchased from")
             if product_type == "Sealed" and not sealed_product_type.strip():
                 missing.append("Sealed Product Type")
-            if product_type == "Card" and not condition.strip():
-                missing.append("Condition")
 
             if missing:
                 st.error("Missing required fields: " + ", ".join(missing))
             else:
-                # One row per item
                 total_price = _compute_total(purchase_price, shipping, tax)
-
                 created_ids = []
+
+                # If no image_url was scraped, try once at submit time (in case user didn't click Pull)
+                final_image_url = img_url.strip()
+                if not final_image_url and reference_link:
+                    final_image_url = scrape_image_url(reference_link)
+
                 for _ in range(int(quantity)):
                     new_row = {
                         "inventory_id": str(uuid.uuid4())[:8],
+                        "image_url": final_image_url,
                         "product_type": product_type.strip(),
                         "sealed_product_type": sealed_product_type.strip() if product_type == "Sealed" else "",
                         "card_type": card_type.strip(),
@@ -793,26 +797,36 @@ with tab_new:
                         "condition": condition if product_type == "Card" else "Sealed",
                         "notes": notes.strip() if notes else "",
                         "created_at": pd.Timestamp.utcnow().isoformat(),
+                        "inventory_status": STATUS_ACTIVE,
+                        "listed_transaction_id": "",
                     }
-
                     sheets_append_inventory_row(new_row)
                     created_ids.append(new_row["inventory_id"])
 
                 st.session_state["prefill_details"] = {}
                 refresh_inventory_from_sheets()
+                st.success(f"Added {len(created_ids)} item(s).")
 
-                if len(created_ids) == 1:
-                    st.success(f"Added: {created_ids[0]} — {card_name} ({set_name})")
-                else:
-                    st.success(f"Added {len(created_ids)} items: {', '.join(created_ids[:5])}{'...' if len(created_ids) > 5 else ''}")
-
-    df = st.session_state[INVENTORY_STATE_KEY]
-    if len(df) > 0:
+    # ---- Recently added table (FIX #1 + FIX #2)
+    df_recent = st.session_state[INVENTORY_STATE_KEY].copy()
+    df_recent = df_recent[df_recent["inventory_status"].isin([STATUS_ACTIVE, STATUS_LISTED])]
+    if len(df_recent) > 0:
         st.markdown("#### Recently added")
-        show = df.tail(10).copy()
+        show = df_recent.tail(10).copy()
+
         for col in ["purchase_price", "shipping", "tax", "total_price"]:
             show[col] = show[col].apply(_safe_money_display)
-        st.dataframe(show, use_container_width=True, hide_index=True)
+
+        st.dataframe(
+            show,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                # ✅ show the image instead of URL
+                "image_url": st.column_config.ImageColumn("Image", width="large"),
+                "reference_link": st.column_config.LinkColumn("Reference link"),
+            },
+        )
     else:
         st.info("No inventory yet — add your first item above.")
 
@@ -826,20 +840,23 @@ with tab_list:
     if df.empty:
         st.info("No inventory yet. Add items in the New Inventory tab.")
     else:
-        f1, f2, f3, f4, f5 = st.columns([1.1, 1.1, 1.1, 1.1, 2])
-
+        f1, f2, f3, f4, f5, f6 = st.columns([1.1, 1.1, 1.1, 1.1, 1.2, 2])
         with f1:
-            product_filter = st.multiselect("Product Type", sorted(df["product_type"].dropna().unique().tolist()), default=[])
+            status_filter = st.multiselect("Status", sorted(df["inventory_status"].dropna().unique().tolist()), default=[STATUS_ACTIVE, STATUS_LISTED])
         with f2:
-            type_filter = st.multiselect("Card Type", sorted(df["card_type"].dropna().unique().tolist()), default=[])
+            product_filter = st.multiselect("Product Type", sorted(df["product_type"].dropna().unique().tolist()), default=[])
         with f3:
-            league_filter = st.multiselect("Brand/League", sorted(df["brand_or_league"].dropna().unique().tolist()), default=[])
+            type_filter = st.multiselect("Card Type", sorted(df["card_type"].dropna().unique().tolist()), default=[])
         with f4:
-            set_filter = st.multiselect("Set", sorted(df["set_name"].dropna().unique().tolist()), default=[])
+            league_filter = st.multiselect("Brand/League", sorted(df["brand_or_league"].dropna().unique().tolist()), default=[])
         with f5:
+            set_filter = st.multiselect("Set", sorted(df["set_name"].dropna().unique().tolist()), default=[])
+        with f6:
             search = st.text_input("Search (name/set/notes/id)", placeholder="Type to filter…")
 
         filtered = df.copy()
+        if status_filter:
+            filtered = filtered[filtered["inventory_status"].isin(status_filter)]
         if product_filter:
             filtered = filtered[filtered["product_type"].isin(product_filter)]
         if type_filter:
@@ -876,9 +893,12 @@ with tab_list:
             hide_index=True,
             num_rows="fixed",
             column_config={
-                "delete": st.column_config.CheckboxColumn("Delete", help="Check to delete this row"),
+                "delete": st.column_config.CheckboxColumn("Delete"),
                 "reference_link": st.column_config.LinkColumn("Reference link"),
+                # ✅ image shown as image + bigger column width (row height handled by CSS)
+                "image_url": st.column_config.ImageColumn("Image", width="large"),
             },
+            disabled=["inventory_id"],
         )
 
         c1, c2 = st.columns([1, 3])
@@ -902,16 +922,12 @@ with tab_list:
                 if c in edited_rows.columns:
                     edited_rows[c] = pd.to_numeric(edited_rows[c], errors="coerce").fillna(0.0)
 
-            if set(["purchase_price", "shipping", "tax"]).issubset(edited_rows.columns):
-                edited_rows["total_price"] = (edited_rows["purchase_price"] + edited_rows["shipping"] + edited_rows["tax"]).round(2)
+            edited_rows["total_price"] = (edited_rows["purchase_price"] + edited_rows["shipping"] + edited_rows["tax"]).round(2)
 
-            # Ensure sealed rows keep condition = Sealed
-            if "product_type" in edited_rows.columns and "condition" in edited_rows.columns:
-                edited_rows.loc[edited_rows["product_type"] == "Sealed", "condition"] = "Sealed"
-                # Optionally clear card-only fields for sealed
-                for col in ["variant", "card_subtype", "card_number"]:
-                    if col in edited_rows.columns:
-                        edited_rows.loc[edited_rows["product_type"] == "Sealed", col] = ""
+            sealed_mask = edited_rows["product_type"] == "Sealed"
+            edited_rows.loc[sealed_mask, "condition"] = "Sealed"
+            for col in ["variant", "card_subtype", "card_number"]:
+                edited_rows.loc[sealed_mask, col] = ""
 
             delete_ids = edited.loc[edited["delete"] == True, "inventory_id"].astype(str).tolist()
 
@@ -938,9 +954,20 @@ with tab_summary:
         total_items = len(df)
         total_invested = df["total_price"].fillna(0).sum()
 
-        k1, k2 = st.columns(2)
+        k1, k2, k3 = st.columns(3)
         k1.metric("Items", f"{total_items:,}")
         k2.metric("Total Invested", f"${total_invested:,.2f}")
+        k3.metric("Listed Items", f"{(df['inventory_status'] == STATUS_LISTED).sum():,}")
+
+        st.markdown("---")
+        st.markdown("### Breakdown by Status")
+        s_summary = (
+            df.groupby("inventory_status", dropna=False)
+            .agg(items=("inventory_id", "count"), invested=("total_price", "sum"))
+            .reset_index()
+            .sort_values("items", ascending=False)
+        )
+        st.dataframe(s_summary, use_container_width=True, hide_index=True)
 
         st.markdown("---")
         st.markdown("### Breakdown by Product Type")
@@ -952,23 +979,3 @@ with tab_summary:
         )
         st.dataframe(p_summary, use_container_width=True, hide_index=True)
         st.bar_chart(p_summary.set_index("product_type")[["invested"]])
-
-        st.markdown("---")
-        st.markdown("### Breakdown by Card Type")
-        type_summary = (
-            df.groupby("card_type", dropna=False)
-            .agg(items=("inventory_id", "count"), invested=("total_price", "sum"))
-            .reset_index()
-            .sort_values("invested", ascending=False)
-        )
-        st.dataframe(type_summary, use_container_width=True, hide_index=True)
-
-        st.markdown("---")
-        st.markdown("### Top Sets by Invested")
-        set_summary = (
-            df.groupby(["product_type", "card_type", "brand_or_league", "set_name"], dropna=False)
-            .agg(items=("inventory_id", "count"), invested=("total_price", "sum"))
-            .reset_index()
-            .sort_values("invested", ascending=False)
-        )
-        st.dataframe(set_summary.head(30), use_container_width=True, hide_index=True)
