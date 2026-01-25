@@ -17,9 +17,9 @@ from google.oauth2.service_account import Credentials
 # CONFIG
 # =========================================================
 
-INVENTORY_STATE_KEY = "inventory_df_v5"
+INVENTORY_STATE_KEY = "inventory_df_v6"
 
-# New: Product Type + Sealed Product Type
+# Columns we store in Google Sheets
 DEFAULT_COLUMNS = [
     "inventory_id",
     "product_type",        # Card / Sealed
@@ -28,18 +28,18 @@ DEFAULT_COLUMNS = [
     "brand_or_league",     # Pokemon TCG / Football / Basketball / etc.
     "set_name",
     "year",
-    "card_name",
+    "card_name",           # for sealed: item name (e.g., Elite Trainer Box)
     "card_number",
     "variant",
-    "card_subtype",        # optional: Rookie / Insert / Parallel / EX / etc.
+    "card_subtype",        # Rookie / Insert / Parallel / EX / etc.
     "reference_link",
     "purchase_date",
     "purchased_from",
     "purchase_price",
     "shipping",
     "tax",
-    "total_price",         # computed
-    "condition",
+    "total_price",         # computed per row
+    "condition",           # Card condition; for sealed we store "Sealed"
     "notes",
     "created_at",
 ]
@@ -68,7 +68,7 @@ SEALED_TYPE_KEYWORDS = {
     "sleeved-booster": "Sleeved Booster",
     "tin": "Tin",
     "collection-box": "Collection Box",
-    "premium-collection": "Premium Collection",
+    "premium-collection": "Premium Collection Box",
     "battle-box": "Battle Box",
     "theme-deck": "Theme Deck",
     "starter-deck": "Starter Deck",
@@ -97,16 +97,13 @@ SPORT_TOKENS = {
 
 NUMERIC_COLS = ["purchase_price", "shipping", "tax", "total_price"]
 
-# IMPORTANT:
-# You manually added "Product Type" in Google Sheets (with a space).
-# We support BOTH styles using aliases.
+# Support both header styles if you added columns manually
 HEADER_ALIASES = {
     "product_type": ["product_type", "Product Type"],
     "sealed_product_type": ["sealed_product_type", "Sealed Product Type"],
 }
 
 def internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
-    """Return the actual header name in the sheet for an internal column key."""
     aliases = HEADER_ALIASES.get(internal, [internal])
     for a in aliases:
         if a in existing_headers:
@@ -118,7 +115,6 @@ def internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
     return internal
 
 def sheet_header_to_internal(header: str) -> str:
-    """Map a sheet header name to the internal column key, if known."""
     for internal, aliases in HEADER_ALIASES.items():
         if header in aliases:
             return internal
@@ -179,11 +175,6 @@ def get_worksheet():
 
 
 def ensure_headers(ws, internal_headers):
-    """
-    - If sheet empty, write header row using preferred sheet header names
-    - If header exists, ensure it includes columns for all internal headers
-      while respecting aliases like "Product Type".
-    """
     first_row = ws.row_values(1)
     if not first_row:
         sheet_headers = []
@@ -232,9 +223,12 @@ def sheets_load_inventory() -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
     df["inventory_id"] = df["inventory_id"].astype(str)
-
     if "product_type" in df.columns:
         df["product_type"] = df["product_type"].replace("", "Card").fillna("Card")
+
+    # If any sealed rows have blank condition, fill it for cleanliness
+    if "condition" in df.columns:
+        df.loc[(df["product_type"] == "Sealed") & (df["condition"].astype(str).str.strip() == ""), "condition"] = "Sealed"
 
     return df
 
@@ -434,6 +428,18 @@ def _infer_sealed_type_from_slug_or_title(slug: str, title: str) -> str:
     for k, v in SEALED_TYPE_KEYWORDS.items():
         if k in t:
             return v
+    if "elite trainer box" in t:
+        return "Elite Trainer Box"
+    if "booster box" in t:
+        return "Booster Box"
+    if "booster bundle" in t:
+        return "Booster Bundle"
+    if "collection box" in t:
+        return "Collection Box"
+    if "premium collection" in t:
+        return "Premium Collection Box"
+    if "blister" in t:
+        return "Blister Pack"
     if "box" in t:
         return "Box"
     if "bundle" in t:
@@ -531,12 +537,14 @@ def fetch_item_details_from_link(url: str):
             # Sealed item
             result["product_type"] = "Sealed"
             result["sealed_product_type"] = _infer_sealed_type_from_slug_or_title(card_slug, page_title)
-            if result["sealed_product_type"]:
-                result["card_name"] = result["sealed_product_type"]
-            else:
-                result["card_name"] = page_title or _title_case_from_slug(card_slug)
+
+            # Use page title for nicer label, but keep it simple
+            result["card_name"] = result["sealed_product_type"] or (page_title or _title_case_from_slug(card_slug))
+
+            # Clear card-only bits
             result["card_number"] = ""
             result["variant"] = ""
+            result["card_subtype"] = ""
             return result
 
         # Single card
@@ -628,16 +636,16 @@ with tab_new:
     if pull:
         details = fetch_item_details_from_link(reference_link)
         st.session_state["prefill_details"] = details
-        if any(details.get(k) for k in ["card_name", "set_name", "card_number", "variant", "card_type", "year", "sealed_product_type"]):
+        if any(details.get(k) for k in ["card_name", "set_name", "card_number", "variant", "card_type", "year", "sealed_product_type", "product_type"]):
             st.success("Pulled details. Review/adjust below, then add to inventory.")
         else:
             st.warning("Could not pull much from that link. You can still enter details manually.")
 
     prefill = st.session_state.get("prefill_details", {}) or {}
 
-    with st.form("new_inventory_form_v5", clear_on_submit=True):
-        # First choose Product Type and Card Type (so we can decide sealed type behavior)
-        a1, a2, a3 = st.columns([1.2, 1.2, 2.2])
+    with st.form("new_inventory_form_v6", clear_on_submit=True):
+        # Select Product Type + Card Type first
+        a1, a2, a3, a4 = st.columns([1.2, 1.2, 2.2, 1.0])
 
         with a1:
             product_type = st.selectbox(
@@ -674,6 +682,15 @@ with tab_new:
             else:
                 st.caption("Sealed Product Type appears when Product Type = Sealed")
 
+        with a4:
+            quantity = st.number_input(
+                "Quantity*",
+                min_value=1,
+                step=1,
+                value=1,
+                help="Creates one inventory row per item. Prices/tax/shipping are per-item.",
+            )
+
         c1, c2, c3 = st.columns(3)
 
         with c1:
@@ -685,17 +702,36 @@ with tab_new:
             year = st.text_input("Year (optional)", value=prefill.get("year", ""), placeholder="2024, 2025, ...")
 
         with c2:
-            set_name = st.text_input("Set (optional)", value=prefill.get("set_name", ""), placeholder="Surging Sparks, Panini Prizm, Optic, ...")
+            set_name = st.text_input(
+                "Set (optional)",
+                value=prefill.get("set_name", ""),
+                placeholder="Surging Sparks, Panini Prizm, Optic, ...",
+            )
 
-            card_name_label = "Item name*" if product_type == "Sealed" else "Card name*"
-            card_name = st.text_input(card_name_label, value=prefill.get("card_name", ""), placeholder="Elite Trainer Box / Pikachu / Jaxson Dart / etc.")
+            name_label = "Item name*" if product_type == "Sealed" else "Card name*"
+            card_name = st.text_input(
+                name_label,
+                value=prefill.get("card_name", ""),
+                placeholder="Elite Trainer Box / Pikachu / Jaxson Dart / etc.",
+            )
 
-            card_number = st.text_input("Card # (optional)", value=prefill.get("card_number", ""), placeholder="332")
+            # Card #: hide for sealed
+            if product_type == "Card":
+                card_number = st.text_input("Card # (optional)", value=prefill.get("card_number", ""), placeholder="332")
+            else:
+                card_number = ""
 
         with c3:
-            variant = st.text_input("Variant (optional)", value=prefill.get("variant", ""), placeholder="White Disco, Silver, Holo, Parallel, EX, ...")
-            card_subtype = st.text_input("Card subtype (optional)", value=prefill.get("card_subtype", ""), placeholder="Rookie, Insert, Parallel, etc.")
-            condition = st.selectbox("Condition*", CONDITION_OPTIONS, index=0)
+            # Hide card-only fields for sealed
+            if product_type == "Card":
+                variant = st.text_input("Variant (optional)", value=prefill.get("variant", ""), placeholder="White Disco, Silver, Holo, Parallel, EX, ...")
+                card_subtype = st.text_input("Card subtype (optional)", value=prefill.get("card_subtype", ""), placeholder="Rookie, Insert, Parallel, etc.")
+                condition = st.selectbox("Condition*", CONDITION_OPTIONS, index=0)
+            else:
+                variant = ""
+                card_subtype = ""
+                condition = "Sealed"
+                st.caption("Variant / Card subtype / Condition are not applicable for sealed products.")
 
         st.markdown("---")
 
@@ -705,11 +741,11 @@ with tab_new:
             purchased_from = st.text_input("Purchased from*", placeholder="eBay, Opened, Whatnot, Card show, LCS, etc.")
 
         with c5:
-            purchase_price = st.number_input("Purchase price*", min_value=0.0, step=1.0, format="%.2f")
-            shipping = st.number_input("Shipping", min_value=0.0, step=1.0, format="%.2f")
+            purchase_price = st.number_input("Purchase price (per item)*", min_value=0.0, step=1.0, format="%.2f")
+            shipping = st.number_input("Shipping (per item)", min_value=0.0, step=1.0, format="%.2f")
 
         with c6:
-            tax = st.number_input("Tax", min_value=0.0, step=1.0, format="%.2f")
+            tax = st.number_input("Tax (per item)", min_value=0.0, step=1.0, format="%.2f")
             notes = st.text_area("Notes (optional)", height=92, placeholder="Anything you want to remember…")
 
         submitted = st.form_submit_button("Add to Inventory", type="primary", use_container_width=True)
@@ -724,41 +760,51 @@ with tab_new:
                 missing.append("Purchased from")
             if product_type == "Sealed" and not sealed_product_type.strip():
                 missing.append("Sealed Product Type")
+            if product_type == "Card" and not condition.strip():
+                missing.append("Condition")
 
             if missing:
                 st.error("Missing required fields: " + ", ".join(missing))
             else:
+                # One row per item
                 total_price = _compute_total(purchase_price, shipping, tax)
 
-                new_row = {
-                    "inventory_id": str(uuid.uuid4())[:8],
-                    "product_type": product_type.strip(),
-                    "sealed_product_type": sealed_product_type.strip() if product_type == "Sealed" else "",
-                    "card_type": card_type.strip(),
-                    "brand_or_league": brand_or_league.strip(),
-                    "set_name": set_name.strip() if set_name else "",
-                    "year": year.strip() if year else "",
-                    "card_name": card_name.strip(),
-                    "card_number": card_number.strip() if card_number else "",
-                    "variant": variant.strip() if variant else "",
-                    "card_subtype": card_subtype.strip() if card_subtype else "",
-                    "reference_link": reference_link.strip() if reference_link else "",
-                    "purchase_date": str(purchase_date),
-                    "purchased_from": purchased_from.strip(),
-                    "purchase_price": float(purchase_price),
-                    "shipping": float(shipping),
-                    "tax": float(tax),
-                    "total_price": float(total_price),
-                    "condition": condition,
-                    "notes": notes.strip() if notes else "",
-                    "created_at": pd.Timestamp.utcnow().isoformat(),
-                }
+                created_ids = []
+                for _ in range(int(quantity)):
+                    new_row = {
+                        "inventory_id": str(uuid.uuid4())[:8],
+                        "product_type": product_type.strip(),
+                        "sealed_product_type": sealed_product_type.strip() if product_type == "Sealed" else "",
+                        "card_type": card_type.strip(),
+                        "brand_or_league": brand_or_league.strip(),
+                        "set_name": set_name.strip() if set_name else "",
+                        "year": year.strip() if year else "",
+                        "card_name": card_name.strip(),
+                        "card_number": card_number.strip() if card_number else "",
+                        "variant": variant.strip() if variant else "",
+                        "card_subtype": card_subtype.strip() if card_subtype else "",
+                        "reference_link": reference_link.strip() if reference_link else "",
+                        "purchase_date": str(purchase_date),
+                        "purchased_from": purchased_from.strip(),
+                        "purchase_price": float(purchase_price),
+                        "shipping": float(shipping),
+                        "tax": float(tax),
+                        "total_price": float(total_price),
+                        "condition": condition if product_type == "Card" else "Sealed",
+                        "notes": notes.strip() if notes else "",
+                        "created_at": pd.Timestamp.utcnow().isoformat(),
+                    }
 
-                sheets_append_inventory_row(new_row)
+                    sheets_append_inventory_row(new_row)
+                    created_ids.append(new_row["inventory_id"])
+
                 st.session_state["prefill_details"] = {}
                 refresh_inventory_from_sheets()
 
-                st.success(f"Added: {new_row['inventory_id']} — {new_row['card_name']} ({new_row['set_name']})")
+                if len(created_ids) == 1:
+                    st.success(f"Added: {created_ids[0]} — {card_name} ({set_name})")
+                else:
+                    st.success(f"Added {len(created_ids)} items: {', '.join(created_ids[:5])}{'...' if len(created_ids) > 5 else ''}")
 
     df = st.session_state[INVENTORY_STATE_KEY]
     if len(df) > 0:
@@ -858,6 +904,14 @@ with tab_list:
 
             if set(["purchase_price", "shipping", "tax"]).issubset(edited_rows.columns):
                 edited_rows["total_price"] = (edited_rows["purchase_price"] + edited_rows["shipping"] + edited_rows["tax"]).round(2)
+
+            # Ensure sealed rows keep condition = Sealed
+            if "product_type" in edited_rows.columns and "condition" in edited_rows.columns:
+                edited_rows.loc[edited_rows["product_type"] == "Sealed", "condition"] = "Sealed"
+                # Optionally clear card-only fields for sealed
+                for col in ["variant", "card_subtype", "card_number"]:
+                    if col in edited_rows.columns:
+                        edited_rows.loc[edited_rows["product_type"] == "Sealed", col] = ""
 
             delete_ids = edited.loc[edited["delete"] == True, "inventory_id"].astype(str).tolist()
 
