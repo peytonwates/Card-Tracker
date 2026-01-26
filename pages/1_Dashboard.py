@@ -870,7 +870,12 @@ with tab_bs:
         g["__synced"] = g["synced_to_inventory"].astype(str).str.upper().str.strip()
 
         # Only include rows NOT synced yet, and still in-flight
-        inflight = g[(g["__synced"] != "YES") & (g["__status"].isin(["SUBMITTED", "IN_GRADING", "SENT", "IN_TRANSIT"]))].copy()
+        # Include RETURNED too (until synced_to_inventory=YES), because inventory may not have been updated yet
+        inflight = g[
+            (g["__synced"] != "YES")
+            & (g["__status"].isin(["SUBMITTED", "IN_GRADING", "SENT", "IN_TRANSIT", "RETURNED"]))
+        ].copy()
+
         if not inflight.empty:
             inflight["__grading_cost"] = (inflight["__fee"] + inflight["__add"]).fillna(0.0)
             grading_cost_by_inv_id = inflight.groupby("__inv_id")["__grading_cost"].sum().to_dict()
@@ -972,19 +977,25 @@ with tab_bs:
 
 
             # Totals row
+            # Totals row (DO NOT sum display rows — it double counts)
             if not assets_df.empty:
+                total_items = int(len(inv_asof))
+                total_cost = float(inv_asof["__cost"].sum())
+                total_mv = float(inv_asof["__mv"].sum())
+
                 assets_df = pd.concat(
                     [
                         assets_df,
                         pd.DataFrame([{
                             "Inventory": "Totals",
-                            "# of items": int(assets_df["# of items"].sum()),
-                            "Cost of Goods": float(assets_df["Cost of Goods"].sum()),
-                            "Market Value": float(assets_df["Market Value"].sum()),
+                            "# of items": total_items,
+                            "Cost of Goods": total_cost,
+                            "Market Value": total_mv,
                         }])
                     ],
                     ignore_index=True
                 )
+
 
 
         sty = (
@@ -1077,7 +1088,16 @@ with tab_bs:
         st.markdown("### Summary")
 
         # Expenses = inventory purchases + misc + grading (in selected window)
-        inv_spend = float(inv_f[inv_total_col].sum()) if not inv_f.empty else 0.0
+        # Inventory spend should include unsynced grading cost (RETURNED or in-flight)
+        if not inv_f.empty:
+            tmp_inv = inv_f.copy()
+            tmp_inv["__inv_id_key"] = tmp_inv[inv_id_col].apply(lambda x: _safe_str(x).strip())
+            tmp_inv["__grading_cost_unsynced"] = tmp_inv["__inv_id_key"].map(grading_cost_by_inv_id).fillna(0.0)
+            tmp_inv["__eff_cost"] = _to_num(tmp_inv[inv_total_col]) + _to_num(tmp_inv["__grading_cost_unsynced"])
+            inv_spend = float(tmp_inv["__eff_cost"].sum())
+        else:
+            inv_spend = 0.0
+
         misc_spend = float(misc_f["__amount"].sum()) if not misc_f.empty else 0.0
 
         # Grading costs are embedded in inventory total_price (COGS) once incurred;
@@ -1096,7 +1116,15 @@ with tab_bs:
             else:
                 tx_ct = pd.DataFrame()
 
-            exp_ct = float(inv_ct[inv_total_col].sum()) if not inv_ct.empty else 0.0
+            if not inv_ct.empty:
+                inv_ct2 = inv_ct.copy()
+                inv_ct2["__inv_id_key"] = inv_ct2[inv_id_col].apply(lambda x: _safe_str(x).strip())
+                inv_ct2["__grading_cost_unsynced"] = inv_ct2["__inv_id_key"].map(grading_cost_by_inv_id).fillna(0.0)
+                inv_ct2["__eff_cost"] = _to_num(inv_ct2[inv_total_col]) + _to_num(inv_ct2["__grading_cost_unsynced"])
+                exp_ct = float(inv_ct2["__eff_cost"].sum())
+            else:
+                exp_ct = 0.0
+
             sales_ct = float(tx_ct["__sold_price"].sum()) if not tx_ct.empty else 0.0
             fees_ct = float(tx_ct["__fees"].sum()) if not tx_ct.empty else 0.0
             net_ct = float(tx_ct["__net"].sum()) if not tx_ct.empty else 0.0
