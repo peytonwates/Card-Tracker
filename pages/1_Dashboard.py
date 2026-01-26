@@ -424,11 +424,47 @@ def _style_group_and_total_rows(df: pd.DataFrame, first_col: str):
 
 @st.cache_data(show_spinner=False, ttl=60 * 10)
 def load_sheet_df(worksheet_name: str) -> pd.DataFrame:
+    """
+    Robust sheet read that tolerates:
+    - duplicate headers (gspread.get_all_records fails)
+    - blank headers
+    - ragged rows
+    """
     ws = _open_ws(worksheet_name)
-    records = ws.get_all_records()
-    df = pd.DataFrame(records)
-    df = _ensure_unique_columns(df)
+    values = ws.get_all_values()
+
+    if not values:
+        return pd.DataFrame()
+
+    header = [str(h or "").strip() for h in values[0]]
+    rows = values[1:] if len(values) > 1 else []
+
+    # Fill blank headers and make them unique (so pandas + streamlit won't crash)
+    fixed = []
+    seen = {}
+    for i, h in enumerate(header):
+        name = h if h else f"col_{i+1}"
+        if name not in seen:
+            seen[name] = 0
+            fixed.append(name)
+        else:
+            seen[name] += 1
+            fixed.append(f"{name}__dup{seen[name]}")
+
+    # Pad rows to header length
+    width = len(fixed)
+    norm_rows = []
+    for r in rows:
+        r = list(r)
+        if len(r) < width:
+            r = r + [""] * (width - len(r))
+        elif len(r) > width:
+            r = r[:width]
+        norm_rows.append(r)
+
+    df = pd.DataFrame(norm_rows, columns=fixed)
     return df
+
 
 
 # =========================
