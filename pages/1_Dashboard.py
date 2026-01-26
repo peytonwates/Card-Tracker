@@ -1042,16 +1042,17 @@ with tab_bs:
             st.info("No sales in selected period.")
             sales_df = pd.DataFrame(columns=["Sales", "# of Sales", "Dollar Sales"])
             fees_total = 0.0
-            sales_total = 0.0
             net_total = 0.0
+            sales_count_total = 0
         else:
             tx = txn_f.copy()
 
-            # FIX: remove "Other" entirely + fix Charizard promo mapping by using txn card_type if present
+            # card type + bucket
             tx["__card_type"] = tx.apply(_tx_card_type_rowaware, axis=1)
             tx["__bucket"] = tx["__inventory_id"].map(_tx_product_bucket).fillna("Cards")
 
-            sales_total = float(tx["__sold_price"].sum())
+            # TRUE totals (do NOT derive from sales_df display rows)
+            sales_count_total = int(len(tx))
             fees_total = float(tx["__fees"].sum())
             net_total = float(tx["__net"].sum())
 
@@ -1061,26 +1062,37 @@ with tab_bs:
                 if sub.empty:
                     continue
 
-                rows.append([ct, int(len(sub)), float(sub["__sold_price"].sum())])
+                # parent row = NET proceeds
+                rows.append([ct, int(len(sub)), float(sub["__net"].sum())])
 
+                # child rows = NET proceeds by bucket
                 for b in ["Cards", "Graded Cards", "Sealed"]:
                     sb = sub[sub["__bucket"] == b]
-                    rows.append([f"  {b}", int(len(sb)), float(sb["__sold_price"].sum())])
+                    rows.append([f"  {b}", int(len(sb)), float(sb["__net"].sum())])
 
             sales_df = pd.DataFrame(rows, columns=["Sales", "# of Sales", "Dollar Sales"])
 
+            # Totals row = from tx (not from sales_df)
             if not sales_df.empty:
                 sales_df = pd.concat(
                     [
                         sales_df,
                         pd.DataFrame([{
                             "Sales": "Totals",
-                            "# of Sales": int(sales_df["# of Sales"].sum()),
-                            "Dollar Sales": float(sales_df["Dollar Sales"].sum()),
+                            "# of Sales": sales_count_total,
+                            "Dollar Sales": net_total,
                         }])
                     ],
                     ignore_index=True
                 )
+
+        sty3 = (
+            _style_group_and_total_rows(sales_df, "Sales")
+            .format({"Dollar Sales": "${:,.2f}"})
+            .set_table_styles(_styler_table_header())
+        )
+        st.dataframe(sty3, use_container_width=True, hide_index=True)
+
 
         sty3 = _style_group_and_total_rows(sales_df, "Sales").format({"Dollar Sales": "${:,.2f}"}).set_table_styles(_styler_table_header())
         st.dataframe(sty3, use_container_width=True, hide_index=True)
@@ -1125,7 +1137,7 @@ with tab_bs:
             else:
                 exp_ct = 0.0
 
-            sales_ct = float(tx_ct["__sold_price"].sum()) if not tx_ct.empty else 0.0
+            sales_ct = float(tx_ct["__net"].sum()) if not tx_ct.empty else 0.0
             fees_ct = float(tx_ct["__fees"].sum()) if not tx_ct.empty else 0.0
             net_ct = float(tx_ct["__net"].sum()) if not tx_ct.empty else 0.0
 
@@ -1136,7 +1148,8 @@ with tab_bs:
             summary_rows.append([ct, exp_ct, sales_ct, fees_ct, pl_ct])
 
         totals_pl = (net_total - total_expenses)
-        summary_rows.append(["Totals", total_expenses, sales_total, fees_total, totals_pl])
+        summary_rows.append(["Totals", total_expenses, net_total, fees_total, totals_pl])
+
 
         summary_df = pd.DataFrame(summary_rows, columns=["Total", "Total Expenses", "Sales", "Fees/shipping", "Profit/Loss"])
 
