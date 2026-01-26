@@ -969,6 +969,11 @@ with tab_create:
                 else:
                     st.success("Listing created and inventory marked LISTED.")
 
+                # IMPORTANT: tx_df was loaded earlier in this run.
+                # Force a rerun so Tab 2 reloads the fresh transactions sheet.
+                st.rerun()
+
+
 
 # =========================================================
 # TAB 2: MARK SOLD / UPDATE LISTING
@@ -1097,6 +1102,8 @@ with tab_update:
                     st.session_state.pop("gr_df_cache_tx", None)
                     _read_sheet_values_cached.clear()
                     st.success("Listing cancelled. Item returned to ACTIVE inventory.")
+                    st.rerun()
+
 
                 if mark_btn:
                     all_in_cost = float(tx_internal.get("all_in_cost", 0.0) or 0.0)
@@ -1141,6 +1148,8 @@ with tab_update:
                     st.session_state.pop("gr_df_cache_tx", None)
                     _read_sheet_values_cached.clear()
                     st.success("Marked sold. Inventory updated to SOLD.")
+                    st.rerun()
+
 
 
 # =========================================================
