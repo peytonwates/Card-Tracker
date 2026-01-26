@@ -8,13 +8,14 @@
 # - Delete/Cancel listing                  -> inventory returns to ACTIVE (transaction kept as CANCELLED)
 # - Rate-limit safe reads (cache + single-read + backoff)
 #
-# Fixes:
-# - Prevent duplicate-column collisions (e.g., grading_company + Grading Company)
-# - Pull grading fee + grade/company from grading sheet and carry into transactions
-# - Avoid writing pandas Series to sheets (caused by duplicate internal columns)
+# Alignments/Fixes vs latest Inventory + Dashboard + Grading:
+# - Robust header normalization (prevents "Product Type" vs product_type duplicates)
+# - card_type normalized to ONLY Pokemon/Sports (never "Other")
+# - Writes fees_total so Dashboard net (sold_price - fees_total) matches Transactions net
 # ---------------------------------------------------------
 
 import json
+import re
 import time
 import uuid
 from datetime import date
@@ -51,7 +52,6 @@ TX_STATUS_CANCELLED = "CANCELLED"
 TX_TYPES = ["Auction", "Buy It Now", "Trade In"]
 
 # --- Inventory columns (internal canonical names) ---
-# (We keep only canonical internal names here; aliases handle your current sheet headers.)
 INV_COLUMNS = [
     "inventory_id",
     "product_type",
@@ -77,8 +77,7 @@ INV_COLUMNS = [
     "created_at",
     "inventory_status",
     "listed_transaction_id",
-
-    # Grading + market (canonical)
+    # Grading + market
     "grading_company",
     "grade",
     "market_price",
@@ -86,7 +85,6 @@ INV_COLUMNS = [
 ]
 
 # --- Transactions columns (internal canonical names) ---
-# Note: aliases map your existing columns like tx_status, fees_total, profit_loss, cost_basis, etc.
 TX_COLUMNS = [
     "transaction_id",
     "inventory_id",
@@ -99,8 +97,12 @@ TX_COLUMNS = [
     "sold_date",
     "sold_price",
 
-    "fees",
-    "shipping_charged",
+    # Keep your inputs:
+    "fees",                 # platform fees (input)
+    "shipping_charged",     # shipping collected from buyer (input)
+
+    # Add for Dashboard alignment:
+    "fees_total",           # = fees - shipping_charged (so Dashboard net matches)
 
     "net_proceeds",
     "profit",
@@ -140,7 +142,6 @@ TX_COLUMNS = [
 ]
 
 # --- Grading columns (internal canonical names) ---
-# We only need the fields required to compute fee/grade/company for an inventory_id.
 GRADING_COLUMNS = [
     "grading_id",
     "inventory_id",
@@ -161,12 +162,17 @@ GRADING_COLUMNS = [
 ]
 
 NUMERIC_INV = ["purchase_price", "shipping", "tax", "total_price", "market_price"]
-NUMERIC_TX = ["list_price", "sold_price", "fees", "shipping_charged", "net_proceeds", "profit", "purchase_total", "grading_fee_total", "all_in_cost"]
+NUMERIC_TX = [
+    "list_price", "sold_price",
+    "fees", "shipping_charged", "fees_total",
+    "net_proceeds", "profit",
+    "purchase_total", "grading_fee_total", "all_in_cost",
+]
 NUMERIC_GR = ["grading_fee_initial", "grading_fee_per_card", "additional_costs", "extra_costs", "total_grading_cost"]
 
 
 # =========================================================
-# HEADER ALIASES (CRITICAL: prevents duplicate columns / schema drift)
+# HEADER ALIASES (prevents duplicates / schema drift)
 # =========================================================
 
 HEADER_ALIASES = {
@@ -178,7 +184,7 @@ HEADER_ALIASES = {
     "inventory_status": ["inventory_status", "Status", "inventoryStatus"],
     "listed_transaction_id": ["listed_transaction_id", "Listed Transaction ID"],
 
-    # Inventory grading/market duplicates
+    # Inventory grading/market
     "grading_company": ["grading_company", "Grading Company", "grading company", "company"],
     "grade": ["grade", "Grade", "graded", "received_grade", "returned_grade"],
     "market_price": ["market_price", "Market Price", "Market price", "market price"],
@@ -188,17 +194,20 @@ HEADER_ALIASES = {
     "transaction_id": ["transaction_id", "Transaction ID"],
     "transaction_type": ["transaction_type", "Transaction Type", "listing_type"],
     "status": ["status", "tx_status", "TX Status"],
-    "fees": ["fees", "fees_total", "Fees", "Fees Total"],
+
+    # keep inputs
+    "fees": ["fees", "platform_fees", "fee", "Fees"],
+    "shipping_charged": ["shipping_charged", "Shipping Charged"],
+
+    # IMPORTANT: dashboard prefers fees_total if present
+    "fees_total": ["fees_total", "fees_total_calc", "Fees Total", "fees_total_dashboard"],
+
     "profit": ["profit", "profit_loss", "Profit", "Profit/Loss"],
     "net_proceeds": ["net_proceeds", "Net Proceeds"],
     "purchase_total": ["purchase_total", "cost_basis", "Cost Basis", "purchase_total_allin"],
-    "shipping_charged": ["shipping_charged", "Shipping Charged"],
 
-    # New transaction fields (if not present, we add them once)
     "grading_fee_total": ["grading_fee_total", "Grading Fee", "grading_fee", "grading_fee_per_card", "total_grading_cost"],
     "all_in_cost": ["all_in_cost", "All In Cost", "all_in"],
-    "grading_company": ["grading_company", "Grading Company"],
-    "grade": ["grade", "Grade"],
     "condition": ["condition", "Condition"],
 
     # Grading sheet duplicates
@@ -210,12 +219,25 @@ HEADER_ALIASES = {
 }
 
 
+def _norm_header(s: str) -> str:
+    """
+    Normalize header strings so:
+      "Product Type" == "product_type" == "product type"
+    """
+    s = str(s or "").strip().lower()
+    s = re.sub(r"\s+", "_", s)
+    return s
+
+
 def sheet_header_to_internal(h: str) -> str:
-    h = str(h or "").strip()
+    h_raw = str(h or "").strip()
+    h_norm = _norm_header(h_raw)
     for internal, aliases in HEADER_ALIASES.items():
-        if h in aliases:
-            return internal
-    return h
+        for a in aliases:
+            if _norm_header(a) == h_norm:
+                return internal
+    # fall back to normalized raw header (keeps stable if you add new fields)
+    return _norm_header(h_raw) if h_norm else h_raw
 
 
 def internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
@@ -223,33 +245,27 @@ def internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
     Prefer an existing alias header if present to avoid creating duplicates.
     """
     aliases = HEADER_ALIASES.get(internal, [internal])
-    for a in aliases:
-        if a in existing_headers:
-            return a
 
-    # default pretty names for some common columns
-    pretty = {
+    # Prefer exact existing match by normalized comparison
+    existing_norm = {_norm_header(x): x for x in existing_headers}
+    for a in aliases:
+        if _norm_header(a) in existing_norm:
+            return existing_norm[_norm_header(a)]
+
+    # reasonable defaults
+    defaults = {
         "product_type": "Product Type",
         "sealed_product_type": "Sealed Product Type",
         "image_url": "Image URL",
-        "grading_company": "iocase("  # sentinel; handled below
+        "grading_company": "Grading Company",
+        "grade": "Grade",
+        "market_price": "Market Price",
+        "market_price_updated_at": "Market Price Updated At",
+        "grading_fee_total": "Grading Fee",
+        "all_in_cost": "All In Cost",
+        "fees_total": "Fees Total",
     }
-
-    if internal == "grading_company":
-        # if none exist, pick "Grading Company" (matches your inventory sheet)
-        return "Grading Company"
-    if internal == "grade":
-        return "Grade"
-    if internal == "market_price":
-        return "Market Price"
-    if internal == "market_price_updated_at":
-        return "Market Price Updated At"
-    if internal == "grading_fee_total":
-        return "Grading Fee"
-    if internal == "all_in_cost":
-        return "All In Cost"
-
-    return pretty.get(internal, internal)
+    return defaults.get(internal, internal)
 
 
 # =========================================================
@@ -279,11 +295,6 @@ def _with_backoff(fn, tries: int = 6, base_sleep: float = 0.8):
 
 @st.cache_resource
 def get_gspread_client():
-    """
-    Supports:
-    - Streamlit Cloud: gcp_service_account stored as TOML table OR JSON string
-    - Local: service_account_json_path points to a JSON file path
-    """
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -354,9 +365,8 @@ def _read_sheet_values_cached(spreadsheet_id: str, worksheet_name: str) -> list[
 
 def _coalesce_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    If df has duplicate column names (after renaming aliases to internals),
+    If df has duplicate column names (after alias normalization),
     collapse them into a single column by taking first non-empty value per row.
-    This prevents row.get('grading_company') returning a Series.
     """
     if df.columns.duplicated().any():
         new = pd.DataFrame(index=df.index)
@@ -365,7 +375,6 @@ def _coalesce_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
             if cols.shape[1] == 1:
                 new[col] = cols.iloc[:, 0]
             else:
-                # take first non-empty across duplicates
                 stacked = cols.astype(str).replace("nan", "").replace("None", "")
                 new[col] = stacked.apply(lambda r: next((v for v in r.tolist() if str(v).strip() != ""), ""), axis=1)
         return new
@@ -431,7 +440,7 @@ def load_inventory_df(force_refresh: bool = False) -> pd.DataFrame:
     if "inventory_status" in df.columns:
         df["inventory_status"] = df["inventory_status"].replace("", STATUS_ACTIVE).fillna(STATUS_ACTIVE)
 
-    df["inventory_id"] = df["inventory_id"].astype(str)
+    df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
     st.session_state[ss_key] = df.copy()
     return df
 
@@ -455,8 +464,8 @@ def load_transactions_df(force_refresh: bool = False) -> pd.DataFrame:
     df, _headers = _sheet_to_df(values, TX_COLUMNS)
     df = _coerce_numeric(df, NUMERIC_TX)
 
-    df["transaction_id"] = df["transaction_id"].astype(str)
-    df["inventory_id"] = df["inventory_id"].astype(str)
+    df["transaction_id"] = df["transaction_id"].astype(str).str.strip()
+    df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
 
     st.session_state[ss_key] = df.copy()
     return df
@@ -481,17 +490,45 @@ def load_grading_df(force_refresh: bool = False) -> pd.DataFrame:
     df, _headers = _sheet_to_df(values, GRADING_COLUMNS)
     df = _coerce_numeric(df, NUMERIC_GR)
 
-    df["inventory_id"] = df["inventory_id"].astype(str)
+    df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
+
     # prefer updated_at_utc then updated_at for ordering
     sort_col = "updated_at_utc" if "updated_at_utc" in df.columns else "updated_at"
     if sort_col in df.columns:
         df[sort_col] = pd.to_datetime(df[sort_col], errors="coerce")
+
     st.session_state[ss_key] = df.copy()
     return df
 
 
+# =========================================================
+# NORMALIZATIONS (match Dashboard behavior)
+# =========================================================
+
+def _safe_str(x) -> str:
+    if x is None:
+        return ""
+    return str(x)
+
+
+def _normalize_card_type(val: str) -> str:
+    """
+    ONLY Pokemon or Sports. Never show 'Other'.
+    Default unknown/blank to Pokemon (matches Dashboard fix).
+    """
+    s = _safe_str(val).strip().lower()
+    if s == "sports" or "sport" in s:
+        return "Sports"
+    if s == "pokemon" or "pok" in s:
+        return "Pokemon"
+    return "Pokemon"
+
+
+# =========================================================
+# GRADING LOOKUPS
+# =========================================================
+
 def _best_grade_from_grading_row(gr: pd.Series) -> str:
-    # Prefer received_grade, then returned_grade
     for k in ["received_grade", "returned_grade"]:
         v = str(gr.get(k, "")).strip()
         if v and v.lower() not in ["nan", "none"]:
@@ -500,15 +537,7 @@ def _best_grade_from_grading_row(gr: pd.Series) -> str:
 
 
 def _best_fee_from_grading_row(gr: pd.Series) -> float:
-    """
-    Pick the best available fee field:
-    - total_grading_cost (best if present)
-    - grading_fee_per_card
-    - grading_fee_initial
-    + additional/extra costs if present
-    """
     base = 0.0
-
     for k in ["total_grading_cost", "grading_fee_per_card", "grading_fee_initial"]:
         try:
             v = float(gr.get(k, 0.0) or 0.0)
@@ -518,7 +547,6 @@ def _best_fee_from_grading_row(gr: pd.Series) -> float:
         except Exception:
             continue
 
-    # add-ons
     add = 0.0
     for k in ["additional_costs", "extra_costs"]:
         try:
@@ -530,41 +558,43 @@ def _best_fee_from_grading_row(gr: pd.Series) -> float:
 
 
 def _lookup_grading_for_inventory(gr_df: pd.DataFrame, inventory_id: str) -> dict:
-    """
-    Returns dict with grading_company, grade, grading_fee_total based on grading sheet.
-    Prefer RETURNED records; otherwise most recently updated.
-    """
     inv_id = str(inventory_id).strip()
     if gr_df.empty or not inv_id:
         return {"grading_company": "", "grade": "", "grading_fee_total": 0.0}
 
-    sub = gr_df[gr_df["inventory_id"].astype(str) == inv_id].copy()
+    sub = gr_df[gr_df["inventory_id"].astype(str).str.strip() == inv_id].copy()
     if sub.empty:
         return {"grading_company": "", "grade": "", "grading_fee_total": 0.0}
 
-    # prefer returned status
     returned = sub[sub["status"].astype(str).str.upper().isin(["RETURNED", "COMPLETED", "DONE"])]
-    pick = None
-
     if not returned.empty:
-        pick = returned.sort_values(by=[c for c in ["updated_at_utc", "updated_at", "created_at"] if c in returned.columns], ascending=False).iloc[0]
+        pick = returned.sort_values(
+            by=[c for c in ["updated_at_utc", "updated_at", "created_at"] if c in returned.columns],
+            ascending=False
+        ).iloc[0]
     else:
-        pick = sub.sort_values(by=[c for c in ["updated_at_utc", "updated_at", "created_at"] if c in sub.columns], ascending=False).iloc[0]
+        pick = sub.sort_values(
+            by=[c for c in ["updated_at_utc", "updated_at", "created_at"] if c in sub.columns],
+            ascending=False
+        ).iloc[0]
 
     company = str(pick.get("grading_company", "")).strip()
     grade = _best_grade_from_grading_row(pick)
     fee = _best_fee_from_grading_row(pick)
-
     return {"grading_company": company, "grade": grade, "grading_fee_total": float(fee)}
 
+
+# =========================================================
+# SHEET WRITE HELPERS
+# =========================================================
 
 def _find_rownum_by_id(values: list[list[str]], id_col_index_1based: int, ids: list[str]) -> dict[str, int]:
     mapping = {}
     for i, row in enumerate(values[1:], start=2):
         val = row[id_col_index_1based - 1] if len(row) >= id_col_index_1based else ""
         if val:
-            mapping[str(val)] = i
-    return {str(_id): mapping.get(str(_id)) for _id in ids}
+            mapping[str(val).strip()] = i
+    return {str(_id).strip(): mapping.get(str(_id).strip()) for _id in ids}
 
 
 def _append_row(ws, sheet_headers: list[str], row_internal: dict):
@@ -573,7 +603,6 @@ def _append_row(ws, sheet_headers: list[str], row_internal: dict):
     for sheet_h in sheet_headers:
         internal = header_to_internal.get(sheet_h, sheet_h)
         v = row_internal.get(internal, "")
-        # prevent pandas Series/objects from being written
         if isinstance(v, (pd.Series, pd.DataFrame)):
             v = ""
         ordered.append(v)
@@ -595,14 +624,32 @@ def _update_row(ws, sheet_headers: list[str], rownum: int, row_internal: dict):
     _with_backoff(lambda: ws.update(rng, [values], value_input_option="USER_ENTERED"))
 
 
-def _compute_net_and_profit(purchase_total: float, sold_price: float, fees: float, shipping_charged: float) -> tuple[float, float]:
+def _compute_net_and_profit(all_in_cost: float, sold_price: float, fees: float, shipping_charged: float) -> tuple[float, float]:
+    """
+    Transactions page definition (kept):
+      net_proceeds = sold_price - fees + shipping_charged
+      profit      = net_proceeds - all_in_cost
+
+    Dashboard definition (current):
+      net = sold_price - fees_total
+
+    To align:
+      fees_total = fees - shipping_charged  => sold_price - fees_total == sold_price - fees + shipping_charged
+    """
     sold_price = float(sold_price or 0.0)
     fees = float(fees or 0.0)
     shipping_charged = float(shipping_charged or 0.0)
-    purchase_total = float(purchase_total or 0.0)
+    all_in_cost = float(all_in_cost or 0.0)
+
     net = round(sold_price - fees + shipping_charged, 2)
-    profit = round(net - purchase_total, 2)
+    profit = round(net - all_in_cost, 2)
     return net, profit
+
+
+def _compute_fees_total_for_dashboard(fees: float, shipping_charged: float) -> float:
+    fees = float(fees or 0.0)
+    shipping_charged = float(shipping_charged or 0.0)
+    return float(round(fees - shipping_charged, 2))
 
 
 # =========================================================
@@ -638,7 +685,7 @@ def scrape_image_url(reference_link: str) -> str:
 
 
 # =========================================================
-# UI HELPERS
+# UI HELPERS (UI unchanged)
 # =========================================================
 
 def _money(x) -> str:
@@ -738,7 +785,7 @@ with tab_create:
 
         st.markdown("---")
 
-        # Transaction form
+        # Transaction form (UI unchanged)
         with st.form("create_tx_form", clear_on_submit=False):
             c1, c2, c3 = st.columns([1.2, 1.2, 2.0])
 
@@ -814,23 +861,27 @@ with tab_create:
                     img_url_final = scrape_image_url(str(selected_row.get("reference_link", "")).strip())
 
                 purchase_total = float(selected_row.get("total_price", 0.0) or 0.0)
-
                 grading_fee_total = float(gr_info.get("grading_fee_total", 0.0) or 0.0)
                 all_in_cost = float(round(purchase_total + grading_fee_total, 2))
 
                 tx_id = str(uuid.uuid4())
                 now_iso = pd.Timestamp.utcnow().isoformat()
 
+                # Align card_type to Dashboard (Pokemon/Sports only)
+                card_type_norm = _normalize_card_type(selected_row.get("card_type", ""))
+
                 if tx_type == "Trade In":
                     net, profit = _compute_net_and_profit(
-                        purchase_total=all_in_cost,
+                        all_in_cost=all_in_cost,
                         sold_price=sold_price,
                         fees=fees,
                         shipping_charged=shipping_charged,
                     )
+                    fees_total = _compute_fees_total_for_dashboard(fees, shipping_charged)
                     tx_status = TX_STATUS_SOLD
                 else:
                     net, profit = 0.0, 0.0
+                    fees_total = 0.0
                     tx_status = TX_STATUS_LISTED
 
                 tx_row = {
@@ -844,6 +895,7 @@ with tab_create:
                     "sold_price": float(sold_price or 0.0),
                     "fees": float(fees or 0.0),
                     "shipping_charged": float(shipping_charged or 0.0),
+                    "fees_total": float(fees_total),
                     "net_proceeds": float(net),
                     "profit": float(profit),
                     "notes": notes.strip(),
@@ -854,7 +906,7 @@ with tab_create:
                     # snapshots
                     "product_type": str(selected_row.get("product_type", "")).strip(),
                     "sealed_product_type": str(selected_row.get("sealed_product_type", "")).strip(),
-                    "card_type": str(selected_row.get("card_type", "")).strip(),
+                    "card_type": card_type_norm,
                     "brand_or_league": str(selected_row.get("brand_or_league", "")).strip(),
                     "set_name": str(selected_row.get("set_name", "")).strip(),
                     "year": str(selected_row.get("year", "")).strip(),
@@ -906,6 +958,7 @@ with tab_create:
 
                     _update_row(inv_ws, inv_sheet_headers, inv_rownum, row_internal)
 
+                # clear caches
                 st.session_state.pop("inv_df_cache_tx", None)
                 st.session_state.pop("tx_df_cache", None)
                 st.session_state.pop("gr_df_cache_tx", None)
@@ -949,7 +1002,6 @@ with tab_update:
             c1, c2, c3 = st.columns(3)
             c1.write(f"**Purchase date:** {tx_row.get('purchase_date', '')}")
             c2.write(f"**Purchased from:** {tx_row.get('purchased_from', '')}")
-            # show all-in cost (includes grading fee)
             c3.write(f"**All-in cost:** {_money(tx_row.get('all_in_cost', 0.0) or 0.0)}")
 
             st.markdown("---")
@@ -995,8 +1047,8 @@ with tab_update:
                     st.error("Could not locate required ID columns in one of the sheets.")
                     st.stop()
 
-                tx_id = str(tx_row["transaction_id"])
-                inv_id = str(tx_row["inventory_id"])
+                tx_id = str(tx_row["transaction_id"]).strip()
+                inv_id = str(tx_row["inventory_id"]).strip()
 
                 tx_rownum = _find_rownum_by_id(tx_values, tx_id_col_idx, [tx_id]).get(tx_id)
                 inv_rownum = _find_rownum_by_id(inv_values, inv_id_col_idx, [inv_id]).get(inv_id)
@@ -1022,6 +1074,7 @@ with tab_update:
                     tx_internal["sold_price"] = 0.0
                     tx_internal["fees"] = 0.0
                     tx_internal["shipping_charged"] = 0.0
+                    tx_internal["fees_total"] = 0.0
                     tx_internal["net_proceeds"] = 0.0
                     tx_internal["profit"] = 0.0
 
@@ -1046,23 +1099,23 @@ with tab_update:
                     st.success("Listing cancelled. Item returned to ACTIVE inventory.")
 
                 if mark_btn:
-                    # IMPORTANT: compute profit vs ALL-IN cost (purchase + grading)
                     all_in_cost = float(tx_internal.get("all_in_cost", 0.0) or 0.0)
                     if all_in_cost <= 0:
-                        # fallback to purchase_total
                         all_in_cost = float(tx_internal.get("purchase_total", 0.0) or 0.0)
 
                     net, profit = _compute_net_and_profit(
-                        purchase_total=all_in_cost,
+                        all_in_cost=all_in_cost,
                         sold_price=sold_price,
                         fees=fees,
                         shipping_charged=shipping_charged,
                     )
+                    fees_total = _compute_fees_total_for_dashboard(fees, shipping_charged)
 
                     tx_internal["sold_date"] = str(sold_date)
                     tx_internal["sold_price"] = float(sold_price)
                     tx_internal["fees"] = float(fees)
                     tx_internal["shipping_charged"] = float(shipping_charged)
+                    tx_internal["fees_total"] = float(fees_total)
                     tx_internal["net_proceeds"] = float(net)
                     tx_internal["profit"] = float(profit)
                     tx_internal["status"] = TX_STATUS_SOLD
@@ -1132,7 +1185,6 @@ with tab_history:
                 )
             ]
 
-        # Friendly columns (UI unchanged, but now includes grading fee + all-in cost + grade/company)
         show_cols = [
             "image_url",
             "transaction_id",
@@ -1148,6 +1200,7 @@ with tab_history:
             "sold_price",
             "fees",
             "shipping_charged",
+            "fees_total",
             "net_proceeds",
             "profit",
             "purchase_total",
@@ -1165,7 +1218,10 @@ with tab_history:
         st.caption(f"Showing {len(hist):,} transaction(s)")
 
         display = hist[show_cols].copy()
-        for c in ["list_price", "sold_price", "fees", "shipping_charged", "net_proceeds", "profit", "purchase_total", "grading_fee_total", "all_in_cost"]:
+        for c in [
+            "list_price", "sold_price", "fees", "shipping_charged", "fees_total",
+            "net_proceeds", "profit", "purchase_total", "grading_fee_total", "all_in_cost"
+        ]:
             display[c] = display[c].apply(lambda x: _money(x) if str(x).strip() != "" else "")
 
         st.dataframe(
