@@ -502,23 +502,26 @@ def get_ws(ws_name: str):
 
 def ensure_headers(ws, needed_headers: list[str]):
     """
-    Idempotent header repair:
+    Idempotent header repair (quota-safe):
     - strips whitespace
     - strips ANY stacked __dup suffixes (e.g., foo__dup2__dup2 -> foo)
     - rebuilds a stable unique header set: foo, foo__dup2, foo__dup3...
     - appends missing canonical columns by base-name
     - optionally deletes duplicate columns that are completely blank (safe prune)
+
+    IMPORTANT CHANGE:
+    - avoids an extra ws.row_values(1) read by reusing the header row already read from ws.get_all_values().
     """
     def strip_dups(h: str) -> str:
-        # remove stacked __dupN suffixes
         return re.sub(r"(?:__dup\d+)+$", "", str(h or "").strip())
 
+    # Single read for header + data (used for safe-prune)
     values = ws.get_all_values()
     if not values:
         ws.update("1:1", [needed_headers], value_input_option="USER_ENTERED")
         return needed_headers
 
-    raw = values[0]
+    raw = values[0] if values else []
     if not raw:
         ws.update("1:1", [needed_headers], value_input_option="USER_ENTERED")
         return needed_headers
@@ -536,10 +539,11 @@ def ensure_headers(ws, needed_headers: list[str]):
     # ensure needed headers exist by base-name
     base_set = set(bases)
     for h in needed_headers:
-        if strip_dups(h) not in base_set:
-            bases.append(strip_dups(h))
-            cleaned.append(strip_dups(h))
-            base_set.add(strip_dups(h))
+        b = strip_dups(h)
+        if b not in base_set:
+            bases.append(b)
+            cleaned.append(b)
+            base_set.add(b)
 
     # Build stable unique names from bases (NO stacking)
     counts = {}
@@ -557,14 +561,13 @@ def ensure_headers(ws, needed_headers: list[str]):
     # - this specific column is blank in all data rows
     # This prevents runaway columns without risking data loss.
     if len(values) > 1:
-        # pad rows to header length
+        # Pad rows to current raw header length (pre-delete)
         data_rows = []
         for r in values[1:]:
             if len(r) < len(raw):
                 r = r + [""] * (len(raw) - len(r))
             data_rows.append(r)
 
-        # map base -> list of (col_index_0based, col_name_raw)
         base_to_cols = {}
         for j, h in enumerate(raw):
             b = strip_dups(h)
@@ -574,7 +577,6 @@ def ensure_headers(ws, needed_headers: list[str]):
         for b, idxs in base_to_cols.items():
             if len(idxs) <= 1:
                 continue
-            # for each duplicate col beyond first, check if entirely blank
             for j in idxs[1:]:
                 all_blank = True
                 for r in data_rows:
@@ -586,35 +588,140 @@ def ensure_headers(ws, needed_headers: list[str]):
                     delete_col_idxs_1based.append(j + 1)
 
         # delete from right to left
+        deleted_any = False
         for col in sorted(delete_col_idxs_1based, reverse=True):
             try:
                 ws.delete_columns(col)
+                deleted_any = True
             except Exception:
                 pass
 
-        # If we deleted columns, re-read header row fresh
-        raw = ws.row_values(1)
-        cleaned = [str(h or "").strip() for h in raw]
-        bases = [strip_dups(h) if strip_dups(h) else f"unnamed__col{i}" for i, h in enumerate(cleaned, start=1)]
+        if deleted_any:
+            # Re-read once after deletions (needed because structure changed)
+            values = ws.get_all_values()
+            raw = values[0] if values else []
+            if not raw:
+                ws.update("1:1", [needed_headers], value_input_option="USER_ENTERED")
+                return needed_headers
 
-        base_set = set(bases)
-        for h in needed_headers:
-            if strip_dups(h) not in base_set:
-                bases.append(strip_dups(h))
-                base_set.add(strip_dups(h))
+            cleaned = []
+            for i, h in enumerate(raw, start=1):
+                hh = str(h or "").strip()
+                if hh == "":
+                    hh = f"unnamed__col{i}"
+                cleaned.append(hh)
 
-        counts = {}
-        new_header = []
-        for b in bases:
-            counts[b] = counts.get(b, 0) + 1
-            new_header.append(b if counts[b] == 1 else f"{b}__dup{counts[b]}")
+            bases = [strip_dups(h) for h in cleaned]
+            base_set = set(bases)
+            for h in needed_headers:
+                b = strip_dups(h)
+                if b not in base_set:
+                    bases.append(b)
+                    base_set.add(b)
 
-    # Only update header row if it changed
-    current = ws.row_values(1)
-    if current != new_header:
+            counts = {}
+            new_header = []
+            for b in bases:
+                counts[b] = counts.get(b, 0) + 1
+                new_header.append(b if counts[b] == 1 else f"{b}__dup{counts[b]}")
+
+            # raw is now the current header row after deletion
+            raw = values[0] if values else raw
+
+    # Only update header row if it changed (NO extra row_values read)
+    if raw != new_header:
         ws.update("1:1", [new_header], value_input_option="USER_ENTERED")
 
     return new_header
+
+
+def update_grading_rows(df_rows: pd.DataFrame):
+    """
+    Quota-safe update:
+    - Repairs headers once
+    - Uses a SINGLE read (ws.get_all_values) to map grading_row_id -> rownum
+    - Writes rows using RAW to prevent Sheets from auto-coercing to dates
+    """
+    if df_rows is None or df_rows.empty:
+        return
+
+    ws = get_ws(GRADING_WS_NAME)
+    headers = ensure_headers(ws, GRADING_CANON_COLS)  # may update header row
+
+    # Single read to build mapping (replaces ws.row_values + ws.col_values combo)
+    values = ws.get_all_values()
+    if not values:
+        return
+
+    sheet_header = values[0] if values else []
+    if not sheet_header:
+        return
+
+    # find grading_row_id column index (0-based) by base-name
+    id_col_idx = None
+    for j, h in enumerate(sheet_header):
+        if re.sub(r"__dup\d+$", "", str(h)) == "grading_row_id":
+            id_col_idx = j
+            break
+    if id_col_idx is None:
+        raise ValueError("grading_row_id must exist in grading sheet header row.")
+
+    # build id -> sheet row number mapping from the same read
+    id_to_rownum: dict[str, int] = {}
+    for rownum, row in enumerate(values[1:], start=2):  # header row is 1
+        v = ""
+        if len(row) > id_col_idx:
+            v = str(row[id_col_idx] or "").strip()
+        if v:
+            id_to_rownum[v] = rownum
+
+    # We'll write using the *current sheet header* (post-repair)
+    headers = sheet_header
+    last_col = a1_col_letter(len(headers))
+
+    NUM_COLS = {
+        "purchase_total",
+        "grading_fee_initial",
+        "additional_costs",
+        "psa9_price",
+        "psa10_price",
+    }
+
+    def _num_str(v):
+        # store as raw numeric string so Sheets doesn't coerce to date
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            return ""
+        try:
+            return str(float(str(v).replace("$", "").replace(",", "").strip()))
+        except Exception:
+            return ""
+
+    # Reduce burstiness (helps avoid quota spikes on big saves)
+    import time
+
+    for i, (_, r) in enumerate(df_rows.iterrows(), start=1):
+        rid = str(r.get("grading_row_id", "")).strip()
+        rownum = id_to_rownum.get(rid)
+        if not rownum:
+            continue
+
+        out_row = []
+        for h in headers:
+            base = re.sub(r"__dup\d+$", "", str(h))
+            v = r.get(base, "")
+            if pd.isna(v):
+                v = ""
+
+            if base in NUM_COLS:
+                v = _num_str(v)
+
+            out_row.append(v)
+
+        ws.update(f"A{rownum}:{last_col}{rownum}", [out_row], value_input_option="RAW")
+
+        # small backoff every few rows
+        if i % 5 == 0:
+            time.sleep(0.6)
 
 
 # =========================================================
