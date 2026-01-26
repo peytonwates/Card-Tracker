@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import urlparse, urljoin
 
 
+
 import pandas as pd
 import requests
 import streamlit as st
@@ -223,6 +224,39 @@ def _find_best_image(soup: BeautifulSoup) -> str:
     if img and img.get("src"):
         return img["src"].strip()
     return ""
+
+def _find_pricecharting_main_image(soup: BeautifulSoup) -> str:
+    """
+    PriceCharting often shows the real product/card image under:
+    'More Photos' -> 'Main Image' as a storage.googleapis.com link.
+    We prefer that over set icons like /images/pokemon-sets/....
+    """
+    if soup is None:
+        return ""
+
+    candidates = []
+
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+
+        # normalize protocol-relative
+        if href.startswith("//"):
+            href = "https:" + href
+
+        # only care about the real hosted photos
+        if "storage.googleapis.com" in href and "images.pricecharting.com" in href:
+            label = ""
+            if a.parent:
+                label = " ".join(a.parent.stripped_strings)
+            # Prefer the one explicitly labeled "Main Image"
+            if "main image" in (label or "").lower():
+                return href
+            candidates.append(href)
+
+    return candidates[0] if candidates else ""
+
 
 def _title_case_from_slug(slug: str) -> str:
     return " ".join([w for w in slug.replace("-", " ").split() if w]).title()
