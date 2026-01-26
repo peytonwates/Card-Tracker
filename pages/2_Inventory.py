@@ -4,7 +4,8 @@ import re
 import uuid
 from datetime import date
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+
 
 import pandas as pd
 import requests
@@ -347,8 +348,17 @@ def fetch_details_and_image(url: str):
         soup = BeautifulSoup(r.text, "lxml")
         page_title = _find_best_title(soup)
         image_url = _find_best_image(soup)
-        if image_url and image_url.startswith("//"):
-            image_url = "https:" + image_url
+
+        # Normalize image URL:
+        # - //cdn...  -> https://cdn...
+        # - /images.. -> https://pricecharting.com/images...
+        # - images..  -> https://pricecharting.com/game/.../images...
+        if image_url:
+            if image_url.startswith("//"):
+                image_url = "https:" + image_url
+            else:
+                image_url = urljoin(url, image_url)
+
     except Exception:
         soup = None
         page_title = ""
@@ -610,8 +620,13 @@ with tab_new:
     prefill = st.session_state.get("prefill_details", {}) or {}
 
     # show image
-    if prefill.get("image_url"):
-        st.image(prefill["image_url"], width=160)
+    img = prefill.get("image_url")
+    if img:
+        try:
+            st.image(img, width=160)
+        except Exception:
+            st.caption("Image unavailable")
+
 
     with st.form("new_inventory_form_v8", clear_on_submit=True):
         a1, a2, a3, a4 = st.columns([1.4, 1.2, 2.4, 1.0])
