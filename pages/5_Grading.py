@@ -126,9 +126,36 @@ def sync_returned_grades_to_inventory():
 
     inv_df = pd.DataFrame(inv_records)
     grd_df = pd.DataFrame(grd_records)
-        # collapse __dupN suffixes to base-name
-    grd_df = grd_df.rename(columns=lambda c: re.sub(r"__dup\d+$", "", str(c)).strip())
-    inv_df = inv_df.rename(columns=lambda c: re.sub(r"__dup\d+$", "", str(c)).strip())
+
+    def _strip_dup_suffixes(name: str) -> str:
+        return re.sub(r"(?:__dup\d+)+$", "", str(name or "").strip())
+
+    def _coalesce_duplicates(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+
+        # group original columns by base-name
+        groups = {}
+        for c in list(df.columns):
+            b = _strip_dup_suffixes(c)
+            groups.setdefault(b, []).append(c)
+
+        out = pd.DataFrame()
+        for base, cols in groups.items():
+            if len(cols) == 1:
+                out[base] = df[cols[0]]
+            else:
+                # coalesce left->right
+                s = df[cols[0]].astype(str)
+                for c in cols[1:]:
+                    t = df[c].astype(str)
+                    s = s.where(s.str.strip() != "", t)
+                out[base] = s
+        return out
+
+    inv_df = _coalesce_duplicates(inv_df)
+    grd_df = _coalesce_duplicates(grd_df)
+
 
 
     if inv_df.empty or grd_df.empty:
@@ -209,12 +236,12 @@ def sync_returned_grades_to_inventory():
         return 0
 
     id_vals = inv_ws.col_values(inv_id_col)
-    id_to_rownum = {str(v).strip(): i for i, v in enumerate(id_vals[1:], start=2) if v}
-
     id_to_rownum = {}
-    for idx, val in enumerate(col_a[1:], start=2):
-        if val:
-            id_to_rownum[str(val).strip()] = idx
+    for i, v in enumerate(id_vals[1:], start=2):
+        sv = str(v or "").strip()
+        if sv:
+            id_to_rownum[sv] = i
+
 
     # Header index based on repaired headers (unique, stripped)
     inv_header_index = {h: i for i, h in enumerate(inv_headers)}
@@ -475,48 +502,120 @@ def get_ws(ws_name: str):
 
 def ensure_headers(ws, needed_headers: list[str]):
     """
-    Fixes your duplicate header problem without adding new helper modules:
-    - strips whitespace on row 1
-    - makes headers unique if duplicates exist (suffix __dupN)
-    - prevents re-appending the same column due to whitespace/case drift
-    - then ensures canonical columns exist (by base-name, ignoring __dupN)
+    Idempotent header repair:
+    - strips whitespace
+    - strips ANY stacked __dup suffixes (e.g., foo__dup2__dup2 -> foo)
+    - rebuilds a stable unique header set: foo, foo__dup2, foo__dup3...
+    - appends missing canonical columns by base-name
+    - optionally deletes duplicate columns that are completely blank (safe prune)
     """
-    existing_raw = ws.row_values(1)
-    if not existing_raw:
-        ws.append_row(needed_headers, value_input_option="USER_ENTERED")
+    def strip_dups(h: str) -> str:
+        # remove stacked __dupN suffixes
+        return re.sub(r"(?:__dup\d+)+$", "", str(h or "").strip())
+
+    values = ws.get_all_values()
+    if not values:
+        ws.update("1:1", [needed_headers], value_input_option="USER_ENTERED")
         return needed_headers
 
-    # strip + fill blanks
+    raw = values[0]
+    if not raw:
+        ws.update("1:1", [needed_headers], value_input_option="USER_ENTERED")
+        return needed_headers
+
+    # Clean + base
     cleaned = []
-    for i, h in enumerate(existing_raw, start=1):
-        hh = "" if h is None else str(h).strip()
+    for i, h in enumerate(raw, start=1):
+        hh = str(h or "").strip()
         if hh == "":
             hh = f"unnamed__col{i}"
         cleaned.append(hh)
 
-    # make unique in place if duplicates exist
+    bases = [strip_dups(h) for h in cleaned]
+
+    # ensure needed headers exist by base-name
+    base_set = set(bases)
+    for h in needed_headers:
+        if strip_dups(h) not in base_set:
+            bases.append(strip_dups(h))
+            cleaned.append(strip_dups(h))
+            base_set.add(strip_dups(h))
+
+    # Build stable unique names from bases (NO stacking)
     counts = {}
-    unique = []
-    for h in cleaned:
-        if h not in counts:
-            counts[h] = 1
-            unique.append(h)
+    new_header = []
+    for b in bases:
+        counts[b] = counts.get(b, 0) + 1
+        if counts[b] == 1:
+            new_header.append(b)
         else:
-            counts[h] += 1
-            unique.append(f"{h}__dup{counts[h]}")
+            new_header.append(f"{b}__dup{counts[b]}")  # starts at __dup2
 
-    if unique != existing_raw:
-        ws.update("1:1", [unique], value_input_option="USER_ENTERED")
+    # --- Safe prune: delete duplicate columns that are entirely blank ---
+    # Only delete columns where:
+    # - base has multiple columns
+    # - this specific column is blank in all data rows
+    # This prevents runaway columns without risking data loss.
+    if len(values) > 1:
+        # pad rows to header length
+        data_rows = []
+        for r in values[1:]:
+            if len(r) < len(raw):
+                r = r + [""] * (len(raw) - len(r))
+            data_rows.append(r)
 
-    # compare by base-name (ignore __dupN)
-    base_existing = {re.sub(r"__dup\d+$", "", h) for h in unique}
-    missing = [h for h in needed_headers if h not in base_existing]
+        # map base -> list of (col_index_0based, col_name_raw)
+        base_to_cols = {}
+        for j, h in enumerate(raw):
+            b = strip_dups(h)
+            base_to_cols.setdefault(b, []).append(j)
 
-    if missing:
-        ws.update("1:1", [unique + missing], value_input_option="USER_ENTERED")
-        return unique + missing
+        delete_col_idxs_1based = []
+        for b, idxs in base_to_cols.items():
+            if len(idxs) <= 1:
+                continue
+            # for each duplicate col beyond first, check if entirely blank
+            for j in idxs[1:]:
+                all_blank = True
+                for r in data_rows:
+                    v = str(r[j] if j < len(r) else "").strip()
+                    if v != "":
+                        all_blank = False
+                        break
+                if all_blank:
+                    delete_col_idxs_1based.append(j + 1)
 
-    return unique
+        # delete from right to left
+        for col in sorted(delete_col_idxs_1based, reverse=True):
+            try:
+                ws.delete_columns(col)
+            except Exception:
+                pass
+
+        # If we deleted columns, re-read header row fresh
+        raw = ws.row_values(1)
+        cleaned = [str(h or "").strip() for h in raw]
+        bases = [strip_dups(h) if strip_dups(h) else f"unnamed__col{i}" for i, h in enumerate(cleaned, start=1)]
+
+        base_set = set(bases)
+        for h in needed_headers:
+            if strip_dups(h) not in base_set:
+                bases.append(strip_dups(h))
+                base_set.add(strip_dups(h))
+
+        counts = {}
+        new_header = []
+        for b in bases:
+            counts[b] = counts.get(b, 0) + 1
+            new_header.append(b if counts[b] == 1 else f"{b}__dup{counts[b]}")
+
+    # Only update header row if it changed
+    current = ws.row_values(1)
+    if current != new_header:
+        ws.update("1:1", [new_header], value_input_option="USER_ENTERED")
+
+    return new_header
+
 
 # =========================================================
 # PRICECHARTING PSA9 / PSA10
