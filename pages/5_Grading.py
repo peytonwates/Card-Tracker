@@ -545,10 +545,20 @@ def load_inventory_df():
             df[c] = ""
 
     df["inventory_id"] = df["inventory_id"].astype(str)
+
+    # Force year to a clean string (prevents Arrow trying to cast to int64 and choking on "")
+    df["year"] = (
+        df["year"]
+        .astype(str)
+        .replace({"nan": "", "None": "", "<NA>": ""})
+        .str.strip()
+    )
+
     df["total_price"] = pd.to_numeric(df["total_price"], errors="coerce").fillna(0.0)
     df["product_type"] = df["product_type"].astype(str)
 
     return df
+
 
 @st.cache_data(ttl=30)
 def load_grading_df():
@@ -744,7 +754,12 @@ def update_inventory_status(inventory_id: str, new_status: str):
             break
     if status_header:
         c = headers.index(status_header) + 1
-        inv_ws.update(f"{a1_col_letter(c)}{rownum}", new_status, value_input_option="USER_ENTERED")
+        inv_ws.update(
+            f"{a1_col_letter(c)}{rownum}",
+            [[new_status]],
+            value_input_option="USER_ENTERED",
+        )
+
 
 def mark_inventory_as_graded(inventory_id: str, grading_company: str, grade: str):
     inv_ws = get_ws(INVENTORY_WS_NAME)
