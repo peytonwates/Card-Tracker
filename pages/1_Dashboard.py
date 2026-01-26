@@ -913,6 +913,50 @@ with tab_bs:
             rec.get(inv_status_col, ""),
         )
 
+    # ---------------------------------------------------------
+    # AS-OF Holdings logic (exclude SOLD items from Assets)
+    # ---------------------------------------------------------
+    def _period_end_dt(year_choice: str, month_choice: str) -> pd.Timestamp:
+        # end of selected month/year; if All, use "today" end-of-day
+        today = pd.Timestamp(date.today())
+        if month_choice != "All":
+            m = pd.to_datetime(month_choice + "-01", errors="coerce")
+            if pd.notna(m):
+                return (m + pd.offsets.MonthEnd(0)) + pd.Timedelta(hours=23, minutes=59, seconds=59)
+        if year_choice != "All":
+            try:
+                y = int(year_choice)
+                return pd.Timestamp(year=y, month=12, day=31, hour=23, minute=59, second=59)
+            except Exception:
+                pass
+        return today + pd.Timedelta(hours=23, minutes=59, seconds=59)
+
+    # SOLD date by inventory_id (use ALL txn, not txn_f, so Assets always excludes sold items)
+    sold_dt_by_id = {}
+    if not txn.empty and "__sold_dt" in txn.columns and "__inventory_id" in txn.columns:
+        tmp = txn[["__inventory_id", "__sold_dt"]].copy()
+        tmp = tmp.dropna(subset=["__sold_dt"])
+        if not tmp.empty:
+            sold_dt_by_id = tmp.groupby("__inventory_id")["__sold_dt"].min().to_dict()
+
+    # Build holdings-as-of inventory (this is what Assets should use)
+    asof_cutoff = _period_end_dt(year_choice, month_choice)
+
+    inv_holdings = pd.DataFrame()
+    if not inv.empty and "__purchase_dt" in inv.columns:
+        inv_holdings = inv.copy()
+        inv_holdings[inv_id_col] = inv_holdings[inv_id_col].apply(lambda x: _safe_str(x).strip())
+        inv_holdings["__sold_dt"] = inv_holdings[inv_id_col].map(sold_dt_by_id)
+        inv_holdings["__sold_dt"] = _to_dt(inv_holdings["__sold_dt"])
+
+        inv_holdings = inv_holdings[
+            inv_holdings["__purchase_dt"].notna()
+            & (inv_holdings["__purchase_dt"] <= asof_cutoff)
+            & (inv_holdings["__sold_dt"].isna() | (inv_holdings["__sold_dt"] > asof_cutoff))
+        ].copy()
+
+
+
     # -------------------------
     # ASSETS (Inventory breakdown)
     # -------------------------
@@ -921,11 +965,12 @@ with tab_bs:
     with left:
         st.markdown("### Assets")
 
-        if inv_f.empty:
-            st.info("No inventory in selected period.")
+        if inv_holdings.empty:
+            st.info("No inventory held as of the selected period end.")
             assets_df = pd.DataFrame(columns=["Inventory", "# of items", "Cost of Goods", "Market Value"])
         else:
-            inv_asof = inv_f.copy()
+            inv_asof = inv_holdings.copy()
+
 
             # FIX: remove "Other" entirely
             inv_asof["__card_type"] = inv_asof[inv_card_type_col].apply(_normalize_card_type)
