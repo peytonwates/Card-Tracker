@@ -330,17 +330,31 @@ def get_gspread_client():
 
 
 @st.cache_resource
-def _get_ws(spreadsheet_id: str, worksheet_name: str):
+def _get_spreadsheet(spreadsheet_id: str):
     client = get_gspread_client()
-    sh = client.open_by_key(spreadsheet_id)
-    return sh.worksheet(worksheet_name)
+    return _with_backoff(lambda: client.open_by_key(spreadsheet_id))
+
+
+@st.cache_resource
+def _get_ws(spreadsheet_id: str, worksheet_name: str):
+    sh = _get_spreadsheet(spreadsheet_id)
+    return _with_backoff(lambda: sh.worksheet(worksheet_name))
+
 
 
 def _ensure_headers(ws, internal_headers: list[str]) -> list[str]:
-    first_row = _with_backoff(lambda: ws.row_values(1))
+    """
+    Quota-safer header ensure:
+    - single read via get_all_values() (instead of row_values(1))
+    - only updates header row if missing columns exist
+    """
+    values = _with_backoff(lambda: ws.get_all_values())
+    first_row = values[0] if values else []
+
+    # Sheet is empty -> write header row once
     if not first_row:
         sheet_headers = [internal_to_sheet_header(h, []) for h in internal_headers]
-        _with_backoff(lambda: ws.append_row(sheet_headers))
+        _with_backoff(lambda: ws.update("1:1", [sheet_headers], value_input_option="USER_ENTERED"))
         return sheet_headers
 
     existing_sheet_headers = first_row
@@ -351,10 +365,11 @@ def _ensure_headers(ws, internal_headers: list[str]) -> list[str]:
     if missing_internal:
         additions = [internal_to_sheet_header(h, existing_sheet_headers) for h in missing_internal]
         new_headers = existing_sheet_headers + additions
-        _with_backoff(lambda: ws.update("1:1", [new_headers]))
+        _with_backoff(lambda: ws.update("1:1", [new_headers], value_input_option="USER_ENTERED"))
         return new_headers
 
     return existing_sheet_headers
+
 
 
 @st.cache_data(ttl=45, show_spinner=False)
