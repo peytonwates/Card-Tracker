@@ -7,6 +7,11 @@
 # - Mark Sold for open listings            -> inventory marked SOLD
 # - Delete/Cancel listing                  -> inventory returns to ACTIVE (transaction kept as CANCELLED)
 # - Rate-limit safe reads (cache + single-read + backoff)
+#
+# Fixes:
+# - Prevent duplicate-column collisions (e.g., grading_company + Grading Company)
+# - Pull grading fee + grade/company from grading sheet and carry into transactions
+# - Avoid writing pandas Series to sheets (caused by duplicate internal columns)
 # ---------------------------------------------------------
 
 import json
@@ -33,6 +38,7 @@ st.set_page_config(page_title="Transactions", layout="wide")
 
 INVENTORY_WS_DEFAULT = "inventory"
 TRANSACTIONS_WS_DEFAULT = "transactions"
+GRADING_WS_DEFAULT = "grading"
 
 STATUS_ACTIVE = "ACTIVE"
 STATUS_LISTED = "LISTED"
@@ -44,7 +50,8 @@ TX_STATUS_CANCELLED = "CANCELLED"
 
 TX_TYPES = ["Auction", "Buy It Now", "Trade In"]
 
-# --- Inventory columns (canonical internal names) ---
+# --- Inventory columns (internal canonical names) ---
+# (We keep only canonical internal names here; aliases handle your current sheet headers.)
 INV_COLUMNS = [
     "inventory_id",
     "product_type",
@@ -70,22 +77,34 @@ INV_COLUMNS = [
     "created_at",
     "inventory_status",
     "listed_transaction_id",
+
+    # Grading + market (canonical)
+    "grading_company",
+    "grade",
+    "market_price",
+    "market_price_updated_at",
 ]
 
-# --- Transactions columns (canonical internal names) ---
+# --- Transactions columns (internal canonical names) ---
+# Note: aliases map your existing columns like tx_status, fees_total, profit_loss, cost_basis, etc.
 TX_COLUMNS = [
     "transaction_id",
     "inventory_id",
     "transaction_type",     # Auction / Buy It Now / Trade In
     "platform",             # eBay / Whatnot / LCS / Trade-in shop / etc.
+
     "list_date",
     "list_price",
+
     "sold_date",
     "sold_price",
+
     "fees",
     "shipping_charged",
+
     "net_proceeds",
     "profit",
+
     "notes",
     "status",               # LISTED / SOLD / CANCELLED
     "created_at",
@@ -106,28 +125,93 @@ TX_COLUMNS = [
     "image_url",
     "purchase_date",
     "purchased_from",
-    "purchase_total",
+
+    # Cost basis snapshots
+    "purchase_total",       # purchase all-in (tax+ship included)
+    "grading_fee_total",    # pulled from grading sheet (best available)
+    "all_in_cost",          # purchase_total + grading_fee_total
+
+    # Grading snapshots
+    "grading_company",
+    "grade",
+
+    # Condition snapshot
+    "condition",
 ]
 
-NUMERIC_INV = ["purchase_price", "shipping", "tax", "total_price"]
-NUMERIC_TX = ["list_price", "sold_price", "fees", "shipping_charged", "net_proceeds", "profit", "purchase_total"]
+# --- Grading columns (internal canonical names) ---
+# We only need the fields required to compute fee/grade/company for an inventory_id.
+GRADING_COLUMNS = [
+    "grading_id",
+    "inventory_id",
+    "grading_company",
+    "grading_fee_initial",
+    "grading_fee_per_card",
+    "additional_costs",
+    "extra_costs",
+    "total_grading_cost",
+    "status",
+    "estimated_return_date",
+    "returned_date",
+    "received_grade",
+    "returned_grade",
+    "updated_at",
+    "updated_at_utc",
+    "created_at",
+]
 
-# Header aliases (handles "Product Type" etc.)
+NUMERIC_INV = ["purchase_price", "shipping", "tax", "total_price", "market_price"]
+NUMERIC_TX = ["list_price", "sold_price", "fees", "shipping_charged", "net_proceeds", "profit", "purchase_total", "grading_fee_total", "all_in_cost"]
+NUMERIC_GR = ["grading_fee_initial", "grading_fee_per_card", "additional_costs", "extra_costs", "total_grading_cost"]
+
+
+# =========================================================
+# HEADER ALIASES (CRITICAL: prevents duplicate columns / schema drift)
+# =========================================================
+
 HEADER_ALIASES = {
     # Inventory
+    "inventory_id": ["inventory_id", "Inventory ID"],
     "product_type": ["product_type", "Product Type"],
     "sealed_product_type": ["sealed_product_type", "Sealed Product Type"],
     "image_url": ["image_url", "Image URL", "image", "Image"],
     "inventory_status": ["inventory_status", "Status", "inventoryStatus"],
+    "listed_transaction_id": ["listed_transaction_id", "Listed Transaction ID"],
 
-    # Transactions
+    # Inventory grading/market duplicates
+    "grading_company": ["grading_company", "Grading Company", "grading company", "company"],
+    "grade": ["grade", "Grade", "graded", "received_grade", "returned_grade"],
+    "market_price": ["market_price", "Market Price", "Market price", "market price"],
+    "market_price_updated_at": ["market_price_updated_at", "Market Price Updated At", "Market Price Update", "market_price_updated_at_utc"],
+
+    # Transactions (old/new)
     "transaction_id": ["transaction_id", "Transaction ID"],
-    "transaction_type": ["transaction_type", "Transaction Type"],
-    "sold_price": ["sold_price", "Sold Price", "sale_price", "Sale Price"],
+    "transaction_type": ["transaction_type", "Transaction Type", "listing_type"],
+    "status": ["status", "tx_status", "TX Status"],
+    "fees": ["fees", "fees_total", "Fees", "Fees Total"],
+    "profit": ["profit", "profit_loss", "Profit", "Profit/Loss"],
+    "net_proceeds": ["net_proceeds", "Net Proceeds"],
+    "purchase_total": ["purchase_total", "cost_basis", "Cost Basis", "purchase_total_allin"],
+    "shipping_charged": ["shipping_charged", "Shipping Charged"],
+
+    # New transaction fields (if not present, we add them once)
+    "grading_fee_total": ["grading_fee_total", "Grading Fee", "grading_fee", "grading_fee_per_card", "total_grading_cost"],
+    "all_in_cost": ["all_in_cost", "All In Cost", "all_in"],
+    "grading_company": ["grading_company", "Grading Company"],
+    "grade": ["grade", "Grade"],
+    "condition": ["condition", "Condition"],
+
+    # Grading sheet duplicates
+    "grading_id": ["grading_id", "submission_id", "Grading ID", "Submission ID"],
+    "additional_costs": ["additional_costs", "extra_costs", "Additional Costs", "Extra Costs"],
+    "received_grade": ["received_grade", "returned_grade", "Grade", "Returned Grade", "Received Grade"],
+    "returned_grade": ["returned_grade", "received_grade", "Returned Grade", "Received Grade"],
+    "updated_at": ["updated_at", "updated_at_utc"],
 }
 
 
 def sheet_header_to_internal(h: str) -> str:
+    h = str(h or "").strip()
     for internal, aliases in HEADER_ALIASES.items():
         if h in aliases:
             return internal
@@ -135,20 +219,37 @@ def sheet_header_to_internal(h: str) -> str:
 
 
 def internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
-    # Prefer keeping an existing alias header if present
+    """
+    Prefer an existing alias header if present to avoid creating duplicates.
+    """
     aliases = HEADER_ALIASES.get(internal, [internal])
     for a in aliases:
         if a in existing_headers:
             return a
 
-    # Default "pretty" headers for the two you manually added earlier
-    if internal == "product_type":
-        return "Product Type"
-    if internal == "sealed_product_type":
-        return "Sealed Product Type"
-    if internal == "image_url":
-        return "Image URL"
-    return internal
+    # default pretty names for some common columns
+    pretty = {
+        "product_type": "Product Type",
+        "sealed_product_type": "Sealed Product Type",
+        "image_url": "Image URL",
+        "grading_company": "iocase("  # sentinel; handled below
+    }
+
+    if internal == "grading_company":
+        # if none exist, pick "Grading Company" (matches your inventory sheet)
+        return "Grading Company"
+    if internal == "grade":
+        return "Grade"
+    if internal == "market_price":
+        return "Market Price"
+    if internal == "market_price_updated_at":
+        return "Market Price Updated At"
+    if internal == "grading_fee_total":
+        return "Grading Fee"
+    if internal == "all_in_cost":
+        return "All In Cost"
+
+    return pretty.get(internal, internal)
 
 
 # =========================================================
@@ -251,6 +352,26 @@ def _read_sheet_values_cached(spreadsheet_id: str, worksheet_name: str) -> list[
     return _with_backoff(lambda: ws.get_all_values())
 
 
+def _coalesce_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    If df has duplicate column names (after renaming aliases to internals),
+    collapse them into a single column by taking first non-empty value per row.
+    This prevents row.get('grading_company') returning a Series.
+    """
+    if df.columns.duplicated().any():
+        new = pd.DataFrame(index=df.index)
+        for col in pd.unique(df.columns):
+            cols = df.loc[:, df.columns == col]
+            if cols.shape[1] == 1:
+                new[col] = cols.iloc[:, 0]
+            else:
+                # take first non-empty across duplicates
+                stacked = cols.astype(str).replace("nan", "").replace("None", "")
+                new[col] = stacked.apply(lambda r: next((v for v in r.tolist() if str(v).strip() != ""), ""), axis=1)
+        return new
+    return df
+
+
 def _sheet_to_df(values: list[list[str]], internal_cols: list[str]) -> tuple[pd.DataFrame, list[str]]:
     """
     values includes header row.
@@ -264,15 +385,18 @@ def _sheet_to_df(values: list[list[str]], internal_cols: list[str]) -> tuple[pd.
 
     df = pd.DataFrame(rows, columns=sheet_headers)
 
-    # Normalize to internal names
+    # Normalize to internal names (may cause duplicates)
     df = df.rename(columns={h: sheet_header_to_internal(h) for h in df.columns})
+
+    # Coalesce duplicates created by alias normalization
+    df = _coalesce_duplicate_columns(df)
 
     # Ensure all internal cols exist
     for c in internal_cols:
         if c not in df.columns:
             df[c] = ""
 
-    # Keep only internal cols (in order)
+    # Keep only requested internal cols (in order)
     df = df[internal_cols].copy()
     return df, sheet_headers
 
@@ -338,13 +462,104 @@ def load_transactions_df(force_refresh: bool = False) -> pd.DataFrame:
     return df
 
 
+def load_grading_df(force_refresh: bool = False) -> pd.DataFrame:
+    ss_key = "gr_df_cache_tx"
+    if force_refresh:
+        _read_sheet_values_cached.clear()
+        st.session_state.pop(ss_key, None)
+
+    if ss_key in st.session_state and isinstance(st.session_state[ss_key], pd.DataFrame):
+        return st.session_state[ss_key].copy()
+
+    spreadsheet_id = st.secrets["spreadsheet_id"]
+    gr_ws_name = st.secrets.get("grading_worksheet", GRADING_WS_DEFAULT)
+
+    ws = _get_ws(spreadsheet_id, gr_ws_name)
+    _ensure_headers(ws, GRADING_COLUMNS)
+
+    values = _read_sheet_values_cached(spreadsheet_id, gr_ws_name)
+    df, _headers = _sheet_to_df(values, GRADING_COLUMNS)
+    df = _coerce_numeric(df, NUMERIC_GR)
+
+    df["inventory_id"] = df["inventory_id"].astype(str)
+    # prefer updated_at_utc then updated_at for ordering
+    sort_col = "updated_at_utc" if "updated_at_utc" in df.columns else "updated_at"
+    if sort_col in df.columns:
+        df[sort_col] = pd.to_datetime(df[sort_col], errors="coerce")
+    st.session_state[ss_key] = df.copy()
+    return df
+
+
+def _best_grade_from_grading_row(gr: pd.Series) -> str:
+    # Prefer received_grade, then returned_grade
+    for k in ["received_grade", "returned_grade"]:
+        v = str(gr.get(k, "")).strip()
+        if v and v.lower() not in ["nan", "none"]:
+            return v
+    return ""
+
+
+def _best_fee_from_grading_row(gr: pd.Series) -> float:
+    """
+    Pick the best available fee field:
+    - total_grading_cost (best if present)
+    - grading_fee_per_card
+    - grading_fee_initial
+    + additional/extra costs if present
+    """
+    base = 0.0
+
+    for k in ["total_grading_cost", "grading_fee_per_card", "grading_fee_initial"]:
+        try:
+            v = float(gr.get(k, 0.0) or 0.0)
+            if v > 0:
+                base = v
+                break
+        except Exception:
+            continue
+
+    # add-ons
+    add = 0.0
+    for k in ["additional_costs", "extra_costs"]:
+        try:
+            add += float(gr.get(k, 0.0) or 0.0)
+        except Exception:
+            pass
+
+    return float(round(base + add, 2))
+
+
+def _lookup_grading_for_inventory(gr_df: pd.DataFrame, inventory_id: str) -> dict:
+    """
+    Returns dict with grading_company, grade, grading_fee_total based on grading sheet.
+    Prefer RETURNED records; otherwise most recently updated.
+    """
+    inv_id = str(inventory_id).strip()
+    if gr_df.empty or not inv_id:
+        return {"grading_company": "", "grade": "", "grading_fee_total": 0.0}
+
+    sub = gr_df[gr_df["inventory_id"].astype(str) == inv_id].copy()
+    if sub.empty:
+        return {"grading_company": "", "grade": "", "grading_fee_total": 0.0}
+
+    # prefer returned status
+    returned = sub[sub["status"].astype(str).str.upper().isin(["RETURNED", "COMPLETED", "DONE"])]
+    pick = None
+
+    if not returned.empty:
+        pick = returned.sort_values(by=[c for c in ["updated_at_utc", "updated_at", "created_at"] if c in returned.columns], ascending=False).iloc[0]
+    else:
+        pick = sub.sort_values(by=[c for c in ["updated_at_utc", "updated_at", "created_at"] if c in sub.columns], ascending=False).iloc[0]
+
+    company = str(pick.get("grading_company", "")).strip()
+    grade = _best_grade_from_grading_row(pick)
+    fee = _best_fee_from_grading_row(pick)
+
+    return {"grading_company": company, "grade": grade, "grading_fee_total": float(fee)}
+
+
 def _find_rownum_by_id(values: list[list[str]], id_col_index_1based: int, ids: list[str]) -> dict[str, int]:
-    """
-    Uses already-read values (header + rows) to map id -> worksheet row number.
-    id_col_index_1based: 1-based column index of the id in the SHEET header row.
-    """
     mapping = {}
-    # rows start at sheet row 2
     for i, row in enumerate(values[1:], start=2):
         val = row[id_col_index_1based - 1] if len(row) >= id_col_index_1based else ""
         if val:
@@ -357,7 +572,11 @@ def _append_row(ws, sheet_headers: list[str], row_internal: dict):
     ordered = []
     for sheet_h in sheet_headers:
         internal = header_to_internal.get(sheet_h, sheet_h)
-        ordered.append(row_internal.get(internal, ""))
+        v = row_internal.get(internal, "")
+        # prevent pandas Series/objects from being written
+        if isinstance(v, (pd.Series, pd.DataFrame)):
+            v = ""
+        ordered.append(v)
     _with_backoff(lambda: ws.append_row(ordered, value_input_option="USER_ENTERED"))
 
 
@@ -366,7 +585,10 @@ def _update_row(ws, sheet_headers: list[str], rownum: int, row_internal: dict):
     values = []
     for sheet_h in sheet_headers:
         internal = header_to_internal.get(sheet_h, sheet_h)
-        values.append(row_internal.get(internal, ""))
+        v = row_internal.get(internal, "")
+        if isinstance(v, (pd.Series, pd.DataFrame)):
+            v = ""
+        values.append(v)
 
     last_col_letter = gspread.utils.rowcol_to_a1(1, len(sheet_headers)).split("1")[0]
     rng = f"A{rownum}:{last_col_letter}{rownum}"
@@ -401,7 +623,6 @@ def scrape_image_url(reference_link: str) -> str:
         if og and og.get("content"):
             return og["content"].strip()
 
-        # fallback: first reasonable image
         img = soup.find("img")
         if img and img.get("src"):
             src = img["src"].strip()
@@ -428,7 +649,6 @@ def _money(x) -> str:
 
 
 def _inv_label(r: pd.Series) -> str:
-    # Friendly pick-list label
     name = str(r.get("card_name", "")).strip()
     set_name = str(r.get("set_name", "")).strip()
     year = str(r.get("year", "")).strip()
@@ -465,8 +685,11 @@ with top[1]:
 
 inv_df = load_inventory_df(force_refresh=refresh)
 tx_df = load_transactions_df(force_refresh=refresh)
+gr_df = load_grading_df(force_refresh=refresh)
 
-tab_create, tab_update, tab_history = st.tabs(["Create Listing / Trade In", "Mark Sold / Update Listing", "Transactions History"])
+tab_create, tab_update, tab_history = st.tabs(
+    ["Create Listing / Trade In", "Mark Sold / Update Listing", "Transactions History"]
+)
 
 
 # =========================================================
@@ -475,7 +698,6 @@ tab_create, tab_update, tab_history = st.tabs(["Create Listing / Trade In", "Mar
 with tab_create:
     st.subheader("Create a Listing (Auction/Buy It Now) or record a Trade In")
 
-    # Only inventory not already sold; allow ACTIVE only for new listings/trade-ins
     inv_available = inv_df[inv_df["inventory_status"].isin([STATUS_ACTIVE])].copy()
 
     if inv_available.empty:
@@ -493,12 +715,15 @@ with tab_create:
             )
 
         selected_row = inv_available[inv_available["__label"] == selected_label].iloc[0]
+        inv_id = str(selected_row.get("inventory_id", "")).strip()
+
+        # pull grading info (fee/company/grade) from grading sheet
+        gr_info = _lookup_grading_for_inventory(gr_df, inv_id)
 
         # Image + quick identification info
         with col_left:
             img_url = str(selected_row.get("image_url", "")).strip()
             if not img_url:
-                # best-effort scrape (cached)
                 img_url = scrape_image_url(str(selected_row.get("reference_link", "")).strip())
             if img_url:
                 st.image(img_url, use_container_width=True)
@@ -530,7 +755,6 @@ with tab_create:
             with c3:
                 notes = st.text_input("Notes (optional)", value="", placeholder="Anything helpful...")
 
-            # Listing fields (only for Auction / Buy It Now)
             if tx_type in ["Auction", "Buy It Now"]:
                 l1, l2, l3 = st.columns(3)
                 with l1:
@@ -545,7 +769,6 @@ with tab_create:
                 fees = 0.0
                 shipping_charged = 0.0
 
-            # ✅ TRADE IN: bypass listing stage; record sold immediately
             else:
                 l1, l2, l3, l4 = st.columns([1.2, 1.2, 1.2, 1.2])
                 with l1:
@@ -563,7 +786,6 @@ with tab_create:
             submit = st.form_submit_button("Save", type="primary", use_container_width=True)
 
         if submit:
-            # Basic validation
             if not platform.strip():
                 st.error("Platform is required.")
             else:
@@ -577,22 +799,14 @@ with tab_create:
                 inv_sheet_headers = _ensure_headers(inv_ws, INV_COLUMNS)
                 tx_sheet_headers = _ensure_headers(tx_ws, TX_COLUMNS)
 
-                # Fresh read for row mapping (single read each)
                 inv_values = _with_backoff(lambda: inv_ws.get_all_values())
                 tx_values = _with_backoff(lambda: tx_ws.get_all_values())
 
-                # Identify ID column in inventory sheet (by header)
                 inv_header = inv_values[0] if inv_values else inv_sheet_headers
-                inv_id_col_idx = None
-                for i, h in enumerate(inv_header, start=1):
-                    if sheet_header_to_internal(h) == "inventory_id":
-                        inv_id_col_idx = i
-                        break
+                inv_id_col_idx = next((i for i, h in enumerate(inv_header, start=1) if sheet_header_to_internal(h) == "inventory_id"), None)
                 if inv_id_col_idx is None:
                     st.error("Could not find 'inventory_id' column in the inventory sheet header.")
                     st.stop()
-
-                inv_id = str(selected_row["inventory_id"]).strip()
 
                 # Ensure inventory has an image_url (optional write back)
                 img_url_final = str(selected_row.get("image_url", "")).strip()
@@ -601,14 +815,15 @@ with tab_create:
 
                 purchase_total = float(selected_row.get("total_price", 0.0) or 0.0)
 
-                # Build transaction row
+                grading_fee_total = float(gr_info.get("grading_fee_total", 0.0) or 0.0)
+                all_in_cost = float(round(purchase_total + grading_fee_total, 2))
+
                 tx_id = str(uuid.uuid4())
                 now_iso = pd.Timestamp.utcnow().isoformat()
 
-                # Compute net/profit if sold immediately (Trade In)
                 if tx_type == "Trade In":
                     net, profit = _compute_net_and_profit(
-                        purchase_total=purchase_total,
+                        purchase_total=all_in_cost,
                         sold_price=sold_price,
                         fees=fees,
                         shipping_charged=shipping_charged,
@@ -651,28 +866,34 @@ with tab_create:
                     "image_url": img_url_final,
                     "purchase_date": str(selected_row.get("purchase_date", "")).strip(),
                     "purchased_from": str(selected_row.get("purchased_from", "")).strip(),
+
+                    # cost basis snapshots
                     "purchase_total": float(purchase_total),
+                    "grading_fee_total": float(grading_fee_total),
+                    "all_in_cost": float(all_in_cost),
+
+                    # grading snapshots
+                    "grading_company": str(gr_info.get("grading_company", "")).strip(),
+                    "grade": str(gr_info.get("grade", "")).strip(),
+
+                    # condition snapshot
+                    "condition": str(selected_row.get("condition", "")).strip(),
                 }
 
-                # Append transaction
                 _append_row(tx_ws, tx_sheet_headers, tx_row)
 
-                # Update inventory row status + listed_transaction_id (and image_url if missing)
+                # Update inventory status + listed_transaction_id (and image_url if missing)
                 inv_rownum = _find_rownum_by_id(inv_values, inv_id_col_idx, [inv_id]).get(inv_id)
                 if not inv_rownum:
                     st.warning("Transaction saved, but could not locate inventory row to update status.")
                 else:
-                    # Build inventory row dict from current sheet row -> update only a few fields by reconstructing row map
-                    # We'll read the sheet row into a dict keyed by sheet headers, then convert to internal
                     row_vals = inv_values[inv_rownum - 1] if len(inv_values) >= inv_rownum else []
-                    sheet_header = inv_header
-                    # pad row to header length
-                    if len(row_vals) < len(sheet_header):
-                        row_vals = row_vals + [""] * (len(sheet_header) - len(row_vals))
-                    row_dict_sheet = dict(zip(sheet_header, row_vals))
+                    if len(row_vals) < len(inv_header):
+                        row_vals = row_vals + [""] * (len(inv_header) - len(row_vals))
+                    row_dict_sheet = dict(zip(inv_header, row_vals))
                     row_internal = {sheet_header_to_internal(k): v for k, v in row_dict_sheet.items()}
+                    row_internal = _coalesce_duplicate_columns(pd.DataFrame([row_internal])).iloc[0].to_dict()
 
-                    # Set fields
                     if tx_type == "Trade In":
                         row_internal["inventory_status"] = STATUS_SOLD
                     else:
@@ -680,15 +901,14 @@ with tab_create:
 
                     row_internal["listed_transaction_id"] = tx_id
 
-                    # store image url if you have the column
                     if "image_url" in row_internal and (not str(row_internal.get("image_url", "")).strip()):
                         row_internal["image_url"] = img_url_final
 
                     _update_row(inv_ws, inv_sheet_headers, inv_rownum, row_internal)
 
-                # Clear caches and reload
                 st.session_state.pop("inv_df_cache_tx", None)
                 st.session_state.pop("tx_df_cache", None)
+                st.session_state.pop("gr_df_cache_tx", None)
                 _read_sheet_values_cached.clear()
 
                 if tx_type == "Trade In":
@@ -729,7 +949,8 @@ with tab_update:
             c1, c2, c3 = st.columns(3)
             c1.write(f"**Purchase date:** {tx_row.get('purchase_date', '')}")
             c2.write(f"**Purchased from:** {tx_row.get('purchased_from', '')}")
-            c3.write(f"**Total cost:** {_money(tx_row.get('purchase_total', 0.0))}")
+            # show all-in cost (includes grading fee)
+            c3.write(f"**All-in cost:** {_money(tx_row.get('all_in_cost', 0.0) or 0.0)}")
 
             st.markdown("---")
 
@@ -767,7 +988,6 @@ with tab_update:
                 inv_header = inv_values[0] if inv_values else inv_sheet_headers
                 tx_header = tx_values[0] if tx_values else tx_sheet_headers
 
-                # Locate id columns
                 inv_id_col_idx = next((i for i, h in enumerate(inv_header, start=1) if sheet_header_to_internal(h) == "inventory_id"), None)
                 tx_id_col_idx = next((i for i, h in enumerate(tx_header, start=1) if sheet_header_to_internal(h) == "transaction_id"), None)
 
@@ -785,21 +1005,19 @@ with tab_update:
                     st.error("Could not locate the transaction row to update.")
                     st.stop()
 
-                # Load current tx row dict
                 tx_vals = tx_values[tx_rownum - 1] if len(tx_values) >= tx_rownum else []
                 if len(tx_vals) < len(tx_header):
                     tx_vals = tx_vals + [""] * (len(tx_header) - len(tx_vals))
                 tx_sheet_dict = dict(zip(tx_header, tx_vals))
                 tx_internal = {sheet_header_to_internal(k): v for k, v in tx_sheet_dict.items()}
+                tx_internal = _coalesce_duplicate_columns(pd.DataFrame([tx_internal])).iloc[0].to_dict()
 
                 now_iso = pd.Timestamp.utcnow().isoformat()
 
                 if cancel_btn:
-                    # Cancel listing -> inventory back to ACTIVE, keep tx record but status CANCELLED
                     tx_internal["status"] = TX_STATUS_CANCELLED
                     tx_internal["updated_at"] = now_iso
 
-                    # Clear sold fields for cleanliness
                     tx_internal["sold_date"] = ""
                     tx_internal["sold_price"] = 0.0
                     tx_internal["fees"] = 0.0
@@ -815,6 +1033,7 @@ with tab_update:
                             inv_vals = inv_vals + [""] * (len(inv_header) - len(inv_vals))
                         inv_sheet_dict = dict(zip(inv_header, inv_vals))
                         inv_internal = {sheet_header_to_internal(k): v for k, v in inv_sheet_dict.items()}
+                        inv_internal = _coalesce_duplicate_columns(pd.DataFrame([inv_internal])).iloc[0].to_dict()
 
                         inv_internal["inventory_status"] = STATUS_ACTIVE
                         inv_internal["listed_transaction_id"] = ""
@@ -822,13 +1041,19 @@ with tab_update:
 
                     st.session_state.pop("inv_df_cache_tx", None)
                     st.session_state.pop("tx_df_cache", None)
+                    st.session_state.pop("gr_df_cache_tx", None)
                     _read_sheet_values_cached.clear()
                     st.success("Listing cancelled. Item returned to ACTIVE inventory.")
 
                 if mark_btn:
-                    purchase_total = float(tx_row.get("purchase_total", 0.0) or 0.0)
+                    # IMPORTANT: compute profit vs ALL-IN cost (purchase + grading)
+                    all_in_cost = float(tx_internal.get("all_in_cost", 0.0) or 0.0)
+                    if all_in_cost <= 0:
+                        # fallback to purchase_total
+                        all_in_cost = float(tx_internal.get("purchase_total", 0.0) or 0.0)
+
                     net, profit = _compute_net_and_profit(
-                        purchase_total=purchase_total,
+                        purchase_total=all_in_cost,
                         sold_price=sold_price,
                         fees=fees,
                         shipping_charged=shipping_charged,
@@ -852,6 +1077,7 @@ with tab_update:
                             inv_vals = inv_vals + [""] * (len(inv_header) - len(inv_vals))
                         inv_sheet_dict = dict(zip(inv_header, inv_vals))
                         inv_internal = {sheet_header_to_internal(k): v for k, v in inv_sheet_dict.items()}
+                        inv_internal = _coalesce_duplicate_columns(pd.DataFrame([inv_internal])).iloc[0].to_dict()
 
                         inv_internal["inventory_status"] = STATUS_SOLD
                         inv_internal["listed_transaction_id"] = tx_id
@@ -859,6 +1085,7 @@ with tab_update:
 
                     st.session_state.pop("inv_df_cache_tx", None)
                     st.session_state.pop("tx_df_cache", None)
+                    st.session_state.pop("gr_df_cache_tx", None)
                     _read_sheet_values_cached.clear()
                     st.success("Marked sold. Inventory updated to SOLD.")
 
@@ -905,7 +1132,7 @@ with tab_history:
                 )
             ]
 
-        # Friendly columns
+        # Friendly columns (UI unchanged, but now includes grading fee + all-in cost + grade/company)
         show_cols = [
             "image_url",
             "transaction_id",
@@ -924,6 +1151,10 @@ with tab_history:
             "net_proceeds",
             "profit",
             "purchase_total",
+            "grading_fee_total",
+            "all_in_cost",
+            "grading_company",
+            "grade",
             "reference_link",
             "notes",
         ]
@@ -933,9 +1164,8 @@ with tab_history:
 
         st.caption(f"Showing {len(hist):,} transaction(s)")
 
-        # Make money columns readable
         display = hist[show_cols].copy()
-        for c in ["list_price", "sold_price", "fees", "shipping_charged", "net_proceeds", "profit", "purchase_total"]:
+        for c in ["list_price", "sold_price", "fees", "shipping_charged", "net_proceeds", "profit", "purchase_total", "grading_fee_total", "all_in_cost"]:
             display[c] = display[c].apply(lambda x: _money(x) if str(x).strip() != "" else "")
 
         st.dataframe(

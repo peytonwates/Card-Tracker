@@ -14,11 +14,13 @@ from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 
+
+
 # =========================================================
 # CONFIG
 # =========================================================
 
-INVENTORY_STATE_KEY = "inventory_df_v7"
+INVENTORY_STATE_KEY = "inventory_df_v8"
 
 STATUS_ACTIVE = "ACTIVE"
 STATUS_LISTED = "LISTED"
@@ -40,13 +42,9 @@ POKEMON_SEALED_TYPE_OPTIONS = [
 
 GRADING_COMPANY_OPTIONS = ["PSA", "CGC", "Beckett"]
 
-# PSA: 1-10 with half grades
-PSA_GRADE_OPTIONS = (
-    ["10", "9.5", "9", "8.5", "8", "7.5", "7", "6.5", "6", "5.5", "5", "4.5", "4", "3.5", "3", "2.5", "2", "1.5", "1"]
-)
-# CGC: 1-10 with half grades + Pristine
+# PSA: 1-10 with half grades (must include 10)
+PSA_GRADE_OPTIONS = ["10", "9.5", "9", "8.5", "8", "7.5", "7", "6.5", "6", "5.5", "5", "4.5", "4", "3.5", "3", "2.5", "2", "1.5", "1"]
 CGC_GRADE_OPTIONS = ["Pristine 10"] + PSA_GRADE_OPTIONS
-# Beckett: 1-10 with half grades + Black Label
 BECKETT_GRADE_OPTIONS = ["Black Label 10"] + PSA_GRADE_OPTIONS
 
 CONDITION_OPTIONS = [
@@ -67,8 +65,6 @@ SPORT_TOKENS = {
     "ufc": "UFC",
     "wrestling": "Wrestling",
 }
-
-NUMERIC_COLS = ["purchase_price", "shipping", "tax", "total_price"]
 
 # Columns stored in Google Sheets (internal names)
 DEFAULT_COLUMNS = [
@@ -98,7 +94,12 @@ DEFAULT_COLUMNS = [
     "created_at",
     "inventory_status",
     "listed_transaction_id",
+    # ---- cached market pricing (populated elsewhere, e.g. Transactions refresh) ----
+    "market_price",
+    "market_price_updated_at",
 ]
+
+NUMERIC_COLS = ["purchase_price", "shipping", "tax", "total_price", "market_price"]
 
 # Support both header styles if sheet was edited manually
 HEADER_ALIASES = {
@@ -360,7 +361,6 @@ def fetch_details_and_image(url: str):
     if len(parts) >= 3 and parts[0].lower() == "game":
         set_slug, item_slug = parts[1], parts[2]
 
-    # PriceCharting
     if "pricecharting.com" in host and set_slug:
         result.update(_parse_set_slug_generic(set_slug))
 
@@ -384,7 +384,6 @@ def fetch_details_and_image(url: str):
             result["card_name"] = _title_case_from_slug(cleaned)
         return result
 
-    # Generic fallback
     lowered = (url + " " + page_title).lower()
     if "pokemon" in lowered:
         result["card_type"] = "Pokemon"
@@ -434,64 +433,68 @@ def sheets_load_inventory() -> pd.DataFrame:
     if df.empty:
         df = pd.DataFrame(columns=DEFAULT_COLUMNS)
 
-    # Rename sheet headers -> internal names (may create duplicates!)
+    # rename sheet headers -> internal names (may create duplicates!)
     df = df.rename(columns={c: sheet_header_to_internal(c) for c in df.columns})
 
-    # Ensure expected columns exist (but duplicates can still remain)
+    # ensure expected columns exist
     for col in DEFAULT_COLUMNS:
         if col not in df.columns:
             df[col] = ""
 
-    # ---- COALESCE DUPLICATE COLUMNS SAFELY (fixes your .str crash) ----
-    # If duplicates exist, df[col] becomes a DataFrame. We coalesce to a single Series.
-    for col in ["product_type", "sealed_product_type", "inventory_status", "listed_transaction_id", "image_url"]:
+    # coalesce duplicates safely
+    coalesce_cols = [
+        "product_type",
+        "sealed_product_type",
+        "inventory_status",
+        "listed_transaction_id",
+        "image_url",
+        "market_price",
+        "market_price_updated_at",
+    ]
+    for col in coalesce_cols:
         if col in df.columns:
             obj = df.loc[:, col]
             if isinstance(obj, pd.DataFrame):
-                cols = []
+                combined = None
                 for i in range(obj.shape[1]):
-                    s = obj.iloc[:, i].astype(str)
+                    s = obj.iloc[:, i]
+                    s = s.astype(str)
                     s = s.where(s.str.strip() != "", "")
-                    cols.append(s)
-                combined = cols[0]
-                for s in cols[1:]:
-                    combined = combined.where(combined != "", s)
+                    if combined is None:
+                        combined = s
+                    else:
+                        combined = combined.where(combined != "", s)
                 df[col] = combined
             else:
                 s = obj.astype(str)
                 df[col] = s.where(s.str.strip() != "", "")
 
-    # Drop duplicate columns (keep first)
+    # drop duplicate columns (keep first)
     df = df.loc[:, ~df.columns.duplicated()].copy()
 
-    # Enforce ordering
+    # enforce ordering
     df = df[[c for c in DEFAULT_COLUMNS if c in df.columns]].copy()
 
     # numeric cleanup
     for c in NUMERIC_COLS:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
     # normalize defaults
     df["inventory_id"] = df["inventory_id"].astype(str)
-
     df["product_type"] = df["product_type"].replace("", "Card").fillna("Card")
     df["inventory_status"] = df["inventory_status"].replace("", STATUS_ACTIVE).fillna(STATUS_ACTIVE)
 
-    # Sealed rows should have condition="Sealed"
+    # enforce condition invariants
     df["condition"] = df["condition"].astype(str)
-    sealed_mask = (df["product_type"] == "Sealed")
-    df.loc[sealed_mask, "condition"] = "Sealed"
-
-    # Graded rows should have condition="Graded"
-    graded_mask = (df["product_type"] == "Graded Card")
-    df.loc[graded_mask, "condition"] = "Graded"
+    df.loc[df["product_type"] == "Sealed", "condition"] = "Sealed"
+    df.loc[df["product_type"] == "Graded Card", "condition"] = "Graded"
 
     return df
 
 def sheets_append_inventory_row(row_internal: dict):
     ws = get_worksheet()
     sheet_headers = ensure_headers(ws)
-
     header_to_internal = {h: sheet_header_to_internal(h) for h in sheet_headers}
 
     ordered = []
@@ -606,11 +609,11 @@ with tab_new:
 
     prefill = st.session_state.get("prefill_details", {}) or {}
 
-    # show image (upper-left) after pulling
+    # show image
     if prefill.get("image_url"):
         st.image(prefill["image_url"], width=160)
 
-    with st.form("new_inventory_form_v7", clear_on_submit=True):
+    with st.form("new_inventory_form_v8", clear_on_submit=True):
         a1, a2, a3, a4 = st.columns([1.4, 1.2, 2.4, 1.0])
 
         with a1:
@@ -643,7 +646,6 @@ with tab_new:
 
             elif product_type == "Graded Card":
                 grading_company = st.selectbox("Grading Company*", GRADING_COMPANY_OPTIONS, index=0)
-
                 if grading_company == "PSA":
                     grade = st.selectbox("Grade*", PSA_GRADE_OPTIONS, index=0)
                 elif grading_company == "CGC":
@@ -770,6 +772,8 @@ with tab_new:
                         "created_at": pd.Timestamp.utcnow().isoformat(),
                         "inventory_status": STATUS_ACTIVE,
                         "listed_transaction_id": "",
+                        "market_price": 0.0,
+                        "market_price_updated_at": "",
                     }
 
                     sheets_append_inventory_row(new_row)
@@ -778,10 +782,7 @@ with tab_new:
                 st.session_state["prefill_details"] = {}
                 refresh_inventory_from_sheets()
 
-                if len(created_ids) == 1:
-                    st.success(f"Added: {created_ids[0]} — {card_name}")
-                else:
-                    st.success(f"Added {len(created_ids)} items.")
+                st.success(f"Added {len(created_ids)} item(s).")
 
     df = st.session_state[INVENTORY_STATE_KEY].copy()
     df = df[df["inventory_status"].isin([STATUS_ACTIVE, STATUS_LISTED])]
@@ -789,8 +790,9 @@ with tab_new:
     if len(df) > 0:
         st.markdown("#### Recently added")
         show = df.tail(10).copy()
-        for col in ["purchase_price", "shipping", "tax", "total_price"]:
+        for col in ["purchase_price", "shipping", "tax", "total_price", "market_price"]:
             show[col] = show[col].apply(_safe_money_display)
+
         st.dataframe(
             show,
             use_container_width=True,
@@ -813,7 +815,6 @@ with tab_list:
     if df.empty:
         st.info("No inventory yet. Add items in the New Inventory tab.")
     else:
-        # Safe default filter values (fixes your multiselect default crash)
         status_options = sorted(df["inventory_status"].dropna().unique().tolist())
         default_status = [s for s in [STATUS_ACTIVE, STATUS_LISTED] if s in status_options]
         if not default_status and status_options:
@@ -869,7 +870,6 @@ with tab_list:
         display = filtered.copy()
         display.insert(0, "delete", False)
 
-        # keep sealed/graded fields consistent before edit view
         display.loc[display["product_type"] == "Sealed", "condition"] = "Sealed"
         display.loc[display["product_type"] == "Graded Card", "condition"] = "Graded"
 
@@ -902,14 +902,13 @@ with tab_list:
         if apply_btn:
             edited_rows = edited.drop(columns=["delete"], errors="ignore").copy()
 
-            for c in ["purchase_price", "shipping", "tax"]:
+            for c in ["purchase_price", "shipping", "tax", "market_price"]:
                 if c in edited_rows.columns:
                     edited_rows[c] = pd.to_numeric(edited_rows[c], errors="coerce").fillna(0.0)
 
             if set(["purchase_price", "shipping", "tax"]).issubset(edited_rows.columns):
                 edited_rows["total_price"] = (edited_rows["purchase_price"] + edited_rows["shipping"] + edited_rows["tax"]).round(2)
 
-            # enforce sealed/graded invariants
             edited_rows.loc[edited_rows["product_type"] == "Sealed", "condition"] = "Sealed"
             edited_rows.loc[edited_rows["product_type"] == "Sealed", ["variant", "card_subtype", "card_number", "grading_company", "grade"]] = ""
 
@@ -940,28 +939,29 @@ with tab_summary:
     else:
         total_items = len(df)
         total_invested = df["total_price"].fillna(0).sum()
+        total_market = df["market_price"].fillna(0).sum() if "market_price" in df.columns else 0.0
 
-        k1, k2, k3 = st.columns(3)
+        k1, k2, k3, k4 = st.columns(4)
         k1.metric("Items", f"{total_items:,}")
         k2.metric("Total Invested", f"${total_invested:,.2f}")
         k3.metric("Active Items", f"{(df['inventory_status'] == STATUS_ACTIVE).sum():,}")
+        k4.metric("Cached Market Total", f"${total_market:,.2f}")
 
         st.markdown("---")
         st.markdown("### Breakdown by Product Type")
         p_summary = (
             df.groupby("product_type", dropna=False)
-            .agg(items=("inventory_id", "count"), invested=("total_price", "sum"))
+            .agg(items=("inventory_id", "count"), invested=("total_price", "sum"), market=("market_price", "sum"))
             .reset_index()
             .sort_values("invested", ascending=False)
         )
         st.dataframe(p_summary, use_container_width=True, hide_index=True)
-        st.bar_chart(p_summary.set_index("product_type")[["invested"]])
 
         st.markdown("---")
         st.markdown("### Breakdown by Status")
         s_summary = (
             df.groupby("inventory_status", dropna=False)
-            .agg(items=("inventory_id", "count"), invested=("total_price", "sum"))
+            .agg(items=("inventory_id", "count"), invested=("total_price", "sum"), market=("market_price", "sum"))
             .reset_index()
             .sort_values("items", ascending=False)
         )
@@ -971,7 +971,7 @@ with tab_summary:
         st.markdown("### Top Sets by Invested")
         set_summary = (
             df.groupby(["product_type", "card_type", "brand_or_league", "set_name"], dropna=False)
-            .agg(items=("inventory_id", "count"), invested=("total_price", "sum"))
+            .agg(items=("inventory_id", "count"), invested=("total_price", "sum"), market=("market_price", "sum"))
             .reset_index()
             .sort_values("invested", ascending=False)
         )
