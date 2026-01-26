@@ -827,12 +827,54 @@ with tab_bs:
     misc_f = _apply_period_filter(misc, "__dt", year_choice, month_choice) if not misc.empty else misc
 
     # Join helpers (for sales bucket/card_type)
+    # Join helpers (for sales bucket/card_type)
     inv_by_id = {}
     if not inv.empty:
         # CRITICAL FIX: normalize inventory_id to string keys to prevent "2.01E+06" / numeric mismatches
         inv_keyed = inv.copy()
         inv_keyed[inv_id_col] = inv_keyed[inv_id_col].apply(lambda x: _safe_str(x).strip())
         inv_by_id = inv_keyed.set_index(inv_id_col, drop=False).to_dict("index")
+
+    # ---------------------------------------------------------
+    # NEW: Build in-flight grading cost map by inventory_id
+    # (Adds grading fees into COGS on Dashboard for GRADING items,
+    #  but ONLY when they haven't been synced into inventory yet.)
+    # ---------------------------------------------------------
+    grading_cost_by_inv_id = {}
+
+    if not grd.empty:
+        g = grd.copy()
+
+        # Ensure columns exist
+        for col in ["inventory_id", "grading_fee_initial", "additional_costs", "status", "synced_to_inventory"]:
+            if col not in g.columns:
+                g[col] = ""
+
+        # Normalize keys
+        g["__inv_id"] = g["inventory_id"].apply(lambda x: _safe_str(x).strip())
+
+        # Safe numeric parse
+        def _num(v):
+            try:
+                s = _safe_str(v).strip().replace("$", "").replace(",", "")
+                if s == "":
+                    return 0.0
+                return float(pd.to_numeric(s, errors="coerce") or 0.0)
+            except Exception:
+                return 0.0
+
+        g["__fee"] = g["grading_fee_initial"].apply(_num)
+        g["__add"] = g["additional_costs"].apply(_num)
+
+        g["__status"] = g["status"].astype(str).str.upper().str.strip()
+        g["__synced"] = g["synced_to_inventory"].astype(str).str.upper().str.strip()
+
+        # Only include rows NOT synced yet, and still in-flight
+        inflight = g[(g["__synced"] != "YES") & (g["__status"].isin(["SUBMITTED", "IN_GRADING", "SENT", "IN_TRANSIT"]))].copy()
+        if not inflight.empty:
+            inflight["__grading_cost"] = (inflight["__fee"] + inflight["__add"]).fillna(0.0)
+            grading_cost_by_inv_id = inflight.groupby("__inv_id")["__grading_cost"].sum().to_dict()
+
 
     def _tx_card_type_from_inv(inv_id: str) -> str:
         rec = inv_by_id.get(_safe_str(inv_id).strip())
@@ -893,6 +935,16 @@ with tab_bs:
                 axis=1,
             )
             inv_asof["__cost"] = _to_num(inv_asof[inv_total_col])
+
+            # NEW: add in-flight grading cost into COGS for items currently GRADING (not yet synced)
+            inv_asof["__inv_id_key"] = inv_asof[inv_id_col].apply(lambda x: _safe_str(x).strip())
+            inv_asof["__grading_cost_inflight"] = inv_asof["__inv_id_key"].map(grading_cost_by_inv_id).fillna(0.0)
+
+            inv_asof["__status_upper"] = inv_asof[inv_status_col].astype(str).str.upper().str.strip()
+            mask_grading = inv_asof["__status_upper"] == "GRADING"
+
+            inv_asof.loc[mask_grading, "__cost"] = inv_asof.loc[mask_grading, "__cost"] + inv_asof.loc[mask_grading, "__grading_cost_inflight"]
+
 
             # Market value source:
             # - Use inventory.market_price/market_value if present

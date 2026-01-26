@@ -792,30 +792,49 @@ def refresh_all():
 def append_grading_rows(rows: list[dict]):
     if not rows:
         return
+
     ws = get_ws(GRADING_WS_NAME)
-    headers = ws.row_values(1)
-    if not headers:
-        headers = ensure_headers(ws, GRADING_CANON_COLS)
-    else:
-        headers = ensure_headers(ws, GRADING_CANON_COLS)  # also repairs duplicates
+    headers = ensure_headers(ws, GRADING_CANON_COLS)  # also repairs duplicates
+
+    # columns we always want treated as numeric in storage
+    NUM_COLS = {
+        "purchase_total",
+        "grading_fee_initial",
+        "additional_costs",
+        "psa9_price",
+        "psa10_price",
+    }
+
+    def _num_str(v):
+        # store as raw numeric string so Sheets doesn't coerce to date
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            return ""
+        try:
+            return str(float(str(v).replace("$", "").replace(",", "").strip()))
+        except Exception:
+            return ""
 
     for row in rows:
         values = []
         for h in headers:
             base = re.sub(r"__dup\d+$", "", h)
-            values.append(row.get(base, ""))
-        ws.append_row(values, value_input_option="USER_ENTERED")
+            v = row.get(base, "")
+
+            if base in NUM_COLS:
+                v = _num_str(v)
+
+            # IMPORTANT: write as RAW to prevent Sheet parsing/auto-typing
+            values.append(v)
+
+        ws.append_row(values, value_input_option="RAW")
 
 
 def update_grading_rows(df_rows: pd.DataFrame):
     if df_rows.empty:
         return
+
     ws = get_ws(GRADING_WS_NAME)
-    headers = ws.row_values(1)
-    if not headers:
-        headers = ensure_headers(ws, GRADING_CANON_COLS)
-    else:
-        headers = ensure_headers(ws, GRADING_CANON_COLS)  # also repairs duplicates
+    headers = ensure_headers(ws, GRADING_CANON_COLS)  # also repairs duplicates
 
     # locate grading_row_id in column (by base-name match)
     id_header = None
@@ -836,6 +855,22 @@ def update_grading_rows(df_rows: pd.DataFrame):
 
     last_col = a1_col_letter(len(headers))
 
+    NUM_COLS = {
+        "purchase_total",
+        "grading_fee_initial",
+        "additional_costs",
+        "psa9_price",
+        "psa10_price",
+    }
+
+    def _num_str(v):
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            return ""
+        try:
+            return str(float(str(v).replace("$", "").replace(",", "").strip()))
+        except Exception:
+            return ""
+
     for _, r in df_rows.iterrows():
         rid = str(r.get("grading_row_id", "")).strip()
         rownum = id_to_rownum.get(rid)
@@ -845,12 +880,17 @@ def update_grading_rows(df_rows: pd.DataFrame):
         values = []
         for h in headers:
             base = re.sub(r"__dup\d+$", "", h)
-            v = r.get(base, "")  # always pull from canonical base name
+            v = r.get(base, "")
             if pd.isna(v):
                 v = ""
+
+            if base in NUM_COLS:
+                v = _num_str(v)
+
             values.append(v)
 
-        ws.update(f"A{rownum}:{last_col}{rownum}", [values], value_input_option="USER_ENTERED")
+        ws.update(f"A{rownum}:{last_col}{rownum}", [values], value_input_option="RAW")
+
 
 def update_inventory_status(inventory_id: str, new_status: str):
     inv_ws = get_ws(INVENTORY_WS_NAME)
@@ -1194,7 +1234,13 @@ with tab_update:
             ]
             show = sub_rows[edit_cols].copy()
 
+            # Force numeric columns to show as numbers (not strings/dates)
+            for c in ["purchase_total", "grading_fee_initial", "additional_costs", "psa9_price", "psa10_price"]:
+                if c in show.columns:
+                    show[c] = show[c].apply(lambda v: safe_float(v, 0.0))
+
             edited = st.data_editor(show, use_container_width=True, hide_index=True, num_rows="fixed")
+
 
             # Single action: Save updates
             save = st.button("Save updates", type="primary", use_container_width=True)
