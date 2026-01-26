@@ -8,6 +8,7 @@ from urllib.parse import urlparse, urljoin
 
 
 
+
 import pandas as pd
 import requests
 import streamlit as st
@@ -214,16 +215,50 @@ def _find_best_title(soup: BeautifulSoup) -> str:
     return ""
 
 def _find_best_image(soup: BeautifulSoup) -> str:
-    og = soup.find("meta", property="og:image")
-    if og and og.get("content"):
-        return og["content"].strip()
-    tw = soup.find("meta", attrs={"name": "twitter:image"})
-    if tw and tw.get("content"):
-        return tw["content"].strip()
-    img = soup.find("img")
-    if img and img.get("src"):
-        return img["src"].strip()
+    """
+    Prefer PriceCharting's real card/product photos (storage.googleapis.com)
+    over set icons like /images/pokemon-sets/*.png.
+    """
+    if soup is None:
+        return ""
+
+    # 1) If og/twitter image is already a real hosted photo, use it.
+    for meta in [
+        soup.find("meta", property="og:image"),
+        soup.find("meta", attrs={"name": "twitter:image"}),
+    ]:
+        if meta and meta.get("content"):
+            url = meta["content"].strip()
+            if "storage.googleapis.com/images.pricecharting.com" in url:
+                return url
+            # If it's the set icon, ignore it
+            if "/images/pokemon-sets/" not in url:
+                return url
+
+    # 2) Prefer any storage.googleapis.com PriceCharting image anywhere on the page
+    #    (often appears under "More Photos" links or sometimes in <img src>).
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if "storage.googleapis.com/images.pricecharting.com" in href:
+            return href
+
+    for img in soup.find_all("img", src=True):
+        src = (img.get("src") or "").strip()
+        if "storage.googleapis.com/images.pricecharting.com" in src:
+            return src
+
+    # 3) Otherwise, choose the first non-set-icon <img>
+    for img in soup.find_all("img", src=True):
+        src = (img.get("src") or "").strip()
+        if not src:
+            continue
+        if "/images/pokemon-sets/" in src:
+            continue
+        return src
+
     return ""
+
+
 
 def _find_pricecharting_main_image(soup: BeautifulSoup) -> str:
     """
@@ -381,17 +416,19 @@ def fetch_details_and_image(url: str):
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
         page_title = _find_best_title(soup)
-        image_url = _find_best_image(soup)
 
-        # Normalize image URL:
-        # - //cdn...  -> https://cdn...
-        # - /images.. -> https://pricecharting.com/images...
-        # - images..  -> https://pricecharting.com/game/.../images...
+        # Prefer PriceCharting's "Main Image" (storage.googleapis.com) when available
+        if "pricecharting.com" in host:
+            image_url = _find_pricecharting_main_image(soup) or _find_best_image(soup)
+        else:
+            image_url = _find_best_image(soup)
+
+        # Normalize relative/protocol-relative URLs for ALL sites (including PriceCharting)
         if image_url:
-            if image_url.startswith("//"):
-                image_url = "https:" + image_url
-            else:
-                image_url = urljoin(url, image_url)
+            image_url = urljoin(url, image_url)
+
+
+
 
     except Exception:
         soup = None
