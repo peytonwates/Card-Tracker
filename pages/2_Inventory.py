@@ -6,9 +6,6 @@ from datetime import date
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
 
-
-
-
 import pandas as pd
 import requests
 import streamlit as st
@@ -17,6 +14,9 @@ from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 
+
+
+st.set_page_config(page_title="Inventory", layout="wide")
 
 
 # =========================================================
@@ -31,7 +31,7 @@ STATUS_SOLD = "SOLD"
 STATUS_TRADED = "TRADED"
 
 PRODUCT_TYPE_OPTIONS = ["Card", "Sealed", "Graded Card"]
-CARD_TYPE_OPTIONS = ["Pokemon", "Sports", "Other"]
+CARD_TYPE_OPTIONS = ["Pokemon", "Sports"]
 
 POKEMON_SEALED_TYPE_OPTIONS = [
     "Booster Box",
@@ -99,10 +99,13 @@ DEFAULT_COLUMNS = [
     "listed_transaction_id",
     # ---- cached market pricing (populated elsewhere, e.g. Transactions refresh) ----
     "market_price",
+    "market_value",                # alias / compatibility with dashboard
     "market_price_updated_at",
 ]
 
-NUMERIC_COLS = ["purchase_price", "shipping", "tax", "total_price", "market_price"]
+
+NUMERIC_COLS = ["purchase_price", "shipping", "tax", "total_price", "market_price", "market_value"]
+
 
 # Support both header styles if sheet was edited manually
 HEADER_ALIASES = {
@@ -480,6 +483,58 @@ def fetch_details_and_image(url: str):
 # =========================================================
 # DATA HELPERS
 # =========================================================
+@st.cache_data(ttl=60 * 60 * 12)
+def fetch_pricecharting_prices(reference_link: str) -> dict:
+    out = {"raw": 0.0, "psa9": 0.0, "psa10": 0.0}
+    if not reference_link or "pricecharting.com" not in reference_link.lower():
+        return out
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (CardTracker; +Streamlit)"}
+        r = requests.get(reference_link.strip(), headers=headers, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+
+        nodes = soup.select(".price.js-price")
+        prices = []
+        for n in nodes:
+            t = n.get_text(" ", strip=True)
+            m = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", t)
+            prices.append(float(m.group(1).replace(",", "")) if m else 0.0)
+
+        out["raw"] = float(prices[0] if len(prices) >= 1 else 0.0)
+        out["psa9"] = float(prices[3] if len(prices) >= 4 else 0.0)
+        out["psa10"] = float(prices[5] if len(prices) >= 6 else 0.0)
+        return out
+    except Exception:
+        return out
+
+def compute_market_price_for_row(reference_link: str, product_type: str, grade: str) -> float:
+    """
+    PriceCharting slots:
+      raw  = slot 1 -> prices[0]
+      psa9 = slot 4 -> prices[3]
+      psa10= slot 6 -> prices[5]
+    Rules:
+      - Sealed: use raw slot
+      - Card (raw): use raw slot
+      - Graded Card: use graded slot by grade (10->psa10, 9->psa9, else raw fallback)
+    """
+    prices = fetch_pricecharting_prices(reference_link or "")
+    pt = (product_type or "").strip().lower()
+    g = (grade or "").strip().upper()
+
+    # default raw
+    mv = float(prices.get("raw", 0.0) or 0.0)
+
+    if "graded" in pt:
+        if "10" in g:
+            mv = float(prices.get("psa10", mv) or mv)
+        elif "9" in g:
+            mv = float(prices.get("psa9", mv) or mv)
+
+    return float(mv or 0.0)
+
+
 
 def _money(x) -> float:
     try:
@@ -530,8 +585,10 @@ def sheets_load_inventory() -> pd.DataFrame:
         "listed_transaction_id",
         "image_url",
         "market_price",
+        "market_value",
         "market_price_updated_at",
     ]
+
     for col in coalesce_cols:
         if col in df.columns:
             obj = df.loc[:, col]
@@ -565,6 +622,15 @@ def sheets_load_inventory() -> pd.DataFrame:
     df["inventory_id"] = df["inventory_id"].astype(str)
     df["product_type"] = df["product_type"].replace("", "Card").fillna("Card")
     df["inventory_status"] = df["inventory_status"].replace("", STATUS_ACTIVE).fillna(STATUS_ACTIVE)
+
+    # normalize card_type to ONLY Pokemon / Sports (never Other)
+    df["card_type"] = df["card_type"].astype(str).str.strip()
+    df.loc[df["card_type"].str.lower().eq("sports"), "card_type"] = "Sports"
+    df.loc[df["card_type"].str.lower().eq("pokemon"), "card_type"] = "Pokemon"
+
+    # anything blank/unknown/Other -> Pokemon
+    df.loc[~df["card_type"].isin(["Pokemon", "Sports"]), "card_type"] = "Pokemon"
+
 
     # enforce condition invariants
     df["condition"] = df["condition"].astype(str)
@@ -653,7 +719,7 @@ def refresh_inventory_from_sheets():
 # UI
 # =========================================================
 
-st.set_page_config(page_title="Inventory", layout="wide")
+
 init_inventory_from_sheets()
 
 st.title("Inventory")
@@ -831,6 +897,11 @@ with tab_new:
                 created_ids = []
 
                 for _ in range(int(quantity)):
+                    ref_link = reference_link.strip() if reference_link else ""
+                    mv = 0.0
+                    if ref_link and "pricecharting.com" in ref_link.lower():
+                        mv = compute_market_price_for_row(ref_link, product_type, grade if product_type == "Graded Card" else "")
+
                     new_row = {
                         "inventory_id": str(uuid.uuid4())[:8],
                         "image_url": (prefill.get("image_url") or ""),
@@ -846,7 +917,7 @@ with tab_new:
                         "card_subtype": card_subtype.strip() if card_subtype else "",
                         "grading_company": grading_company.strip() if product_type == "Graded Card" else "",
                         "grade": grade.strip() if product_type == "Graded Card" else "",
-                        "reference_link": reference_link.strip() if reference_link else "",
+                        "reference_link": ref_link,
                         "purchase_date": str(purchase_date),
                         "purchased_from": purchased_from.strip(),
                         "purchase_price": float(purchase_price),
@@ -858,12 +929,14 @@ with tab_new:
                         "created_at": pd.Timestamp.utcnow().isoformat(),
                         "inventory_status": STATUS_ACTIVE,
                         "listed_transaction_id": "",
-                        "market_price": 0.0,
-                        "market_price_updated_at": "",
+                        "market_price": float(mv),
+                        "market_value": float(mv),  # keep in sync
+                        "market_price_updated_at": pd.Timestamp.utcnow().isoformat() if mv else "",
                     }
 
                     sheets_append_inventory_row(new_row)
                     created_ids.append(new_row["inventory_id"])
+
 
                 st.session_state["prefill_details"] = {}
                 refresh_inventory_from_sheets()
@@ -988,12 +1061,16 @@ with tab_list:
         if apply_btn:
             edited_rows = edited.drop(columns=["delete"], errors="ignore").copy()
 
-            for c in ["purchase_price", "shipping", "tax", "market_price"]:
+            for c in ["purchase_price", "shipping", "tax", "market_price", "market_value"]:
                 if c in edited_rows.columns:
                     edited_rows[c] = pd.to_numeric(edited_rows[c], errors="coerce").fillna(0.0)
 
             if set(["purchase_price", "shipping", "tax"]).issubset(edited_rows.columns):
                 edited_rows["total_price"] = (edited_rows["purchase_price"] + edited_rows["shipping"] + edited_rows["tax"]).round(2)
+
+            # ✅ ADD THIS RIGHT HERE (after numeric cleanup, before sheet update)
+            if "market_price" in edited_rows.columns and "market_value" in edited_rows.columns:
+                edited_rows["market_value"] = edited_rows["market_price"]
 
             edited_rows.loc[edited_rows["product_type"] == "Sealed", "condition"] = "Sealed"
             edited_rows.loc[edited_rows["product_type"] == "Sealed", ["variant", "card_subtype", "card_number", "grading_company", "grade"]] = ""
@@ -1002,6 +1079,10 @@ with tab_list:
             edited_rows.loc[edited_rows["product_type"] == "Graded Card", "sealed_product_type"] = ""
 
             delete_ids = edited.loc[edited["delete"] == True, "inventory_id"].astype(str).tolist()
+            # If it's a normal Card, clear sealed + grading fields
+            edited_rows.loc[edited_rows["product_type"] == "Card", ["sealed_product_type", "grading_company", "grade"]] = ""
+
+
 
             sheets_update_rows(edited_rows)
 

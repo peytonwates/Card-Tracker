@@ -112,12 +112,24 @@ def sync_returned_grades_to_inventory():
     inv_headers = _repair_headers_in_place(inv_ws)
     grd_headers = _repair_headers_in_place(grd_ws)
 
+    # ensure synced_to_inventory header exists (by base-name)
+    base_grd = {re.sub(r"__dup\d+$", "", h) for h in grd_headers}
+    if "synced_to_inventory" not in base_grd:
+        grd_ws.update("1:1", [grd_headers + ["synced_to_inventory"]], value_input_option="USER_ENTERED")
+        grd_headers = grd_ws.row_values(1)
+        grd_header_index = {h: i for i, h in enumerate(grd_headers)}
+
+
     # --- READ ONCE (quota-friendly) ---
     inv_records = inv_ws.get_all_records()
     grd_records = grd_ws.get_all_records()
 
     inv_df = pd.DataFrame(inv_records)
     grd_df = pd.DataFrame(grd_records)
+        # collapse __dupN suffixes to base-name
+    grd_df = grd_df.rename(columns=lambda c: re.sub(r"__dup\d+$", "", str(c)).strip())
+    inv_df = inv_df.rename(columns=lambda c: re.sub(r"__dup\d+$", "", str(c)).strip())
+
 
     if inv_df.empty or grd_df.empty:
         return 0
@@ -186,7 +198,19 @@ def sync_returned_grades_to_inventory():
         return 0
 
     # Map inventory_id -> sheet rownum (read col A once)
-    col_a = inv_ws.col_values(1)
+    # find inventory_id column index by header (base-name)
+    inv_headers = inv_ws.row_values(1)
+    inv_id_col = None
+    for j, h in enumerate(inv_headers, start=1):
+        if re.sub(r"__dup\d+$", "", str(h)).strip() == "inventory_id":
+            inv_id_col = j
+            break
+    if not inv_id_col:
+        return 0
+
+    id_vals = inv_ws.col_values(inv_id_col)
+    id_to_rownum = {str(v).strip(): i for i, v in enumerate(id_vals[1:], start=2) if v}
+
     id_to_rownum = {}
     for idx, val in enumerate(col_a[1:], start=2):
         if val:
@@ -364,6 +388,7 @@ GRADING_CANON_COLS = [
     "notes",
     "created_at",
     "updated_at",
+    "synced_to_inventory",
 ]
 
 # =========================================================
@@ -498,8 +523,14 @@ def ensure_headers(ws, needed_headers: list[str]):
 # =========================================================
 
 @st.cache_data(ttl=60 * 60 * 12)
-def fetch_pricecharting_psa_prices(reference_link: str) -> dict:
-    out = {"psa9": 0.0, "psa10": 0.0}
+def fetch_pricecharting_prices(reference_link: str) -> dict:
+    """
+    Slots (matches your ImportXML indexing):
+      raw  = slot 1 -> prices[0]
+      psa9 = slot 4 -> prices[3]
+      psa10= slot 6 -> prices[5]
+    """
+    out = {"raw": 0.0, "psa9": 0.0, "psa10": 0.0}
     if not reference_link or "pricecharting.com" not in reference_link.lower():
         return out
 
@@ -516,13 +547,13 @@ def fetch_pricecharting_psa_prices(reference_link: str) -> dict:
             m = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", t)
             prices.append(safe_float(m.group(1), 0.0) if m else 0.0)
 
-        psa9 = prices[3] if len(prices) >= 4 else 0.0
-        psa10 = prices[5] if len(prices) >= 6 else 0.0
-        out["psa9"] = float(psa9 or 0.0)
-        out["psa10"] = float(psa10 or 0.0)
+        out["raw"] = float(prices[0] if len(prices) >= 1 else 0.0)
+        out["psa9"] = float(prices[3] if len(prices) >= 4 else 0.0)
+        out["psa10"] = float(prices[5] if len(prices) >= 6 else 0.0)
         return out
     except Exception:
         return out
+
 
 # =========================================================
 # LOADERS (CACHED)
@@ -670,7 +701,12 @@ def append_grading_rows(rows: list[dict]):
         headers = ensure_headers(ws, GRADING_CANON_COLS)  # also repairs duplicates
 
     for row in rows:
-        ws.append_row([row.get(h, "") for h in headers], value_input_option="USER_ENTERED")
+        values = []
+        for h in headers:
+            base = re.sub(r"__dup\d+$", "", h)
+            values.append(row.get(base, ""))
+        ws.append_row(values, value_input_option="USER_ENTERED")
+
 
 def update_grading_rows(df_rows: pd.DataFrame):
     if df_rows.empty:
@@ -767,11 +803,12 @@ def mark_inventory_as_graded(inventory_id: str, grading_company: str, grade: str
     if not headers:
         return
 
-    # repair header drift
-    _ = ensure_headers(inv_ws, ["inventory_id", "product_type", "grading_company", "grade"])
+    # ensure needed headers exist (includes market columns + reference_link)
+    _ = ensure_headers(inv_ws, ["inventory_id", "product_type", "grading_company", "grade", "reference_link", "market_price", "market_value"])
 
     headers = inv_ws.row_values(1)
 
+    # find inventory_id header by base-name
     id_header = None
     for h in headers:
         if re.sub(r"__dup\d+$", "", h) == "inventory_id":
@@ -791,25 +828,47 @@ def mark_inventory_as_graded(inventory_id: str, grading_company: str, grade: str
     if not rownum:
         return
 
-    def _set(base_name: str, value):
-        target = None
+    def _header_for(base_name: str):
         for h in headers:
             if re.sub(r"__dup\d+$", "", h) == base_name:
-                target = h
-                break
+                return h
+        return None
+
+    def _set(base_name: str, value):
+        target = _header_for(base_name)
         if not target:
             return
         c = headers.index(target) + 1
-        inv_ws.update(
-            f"{a1_col_letter(c)}{rownum}",
-            [[value]],
-            value_input_option="USER_ENTERED",
-        )
+        inv_ws.update(f"{a1_col_letter(c)}{rownum}", [[value]], value_input_option="USER_ENTERED")
 
 
+    def _get(base_name: str) -> str:
+        target = _header_for(base_name)
+        if not target:
+            return ""
+        c = headers.index(target) + 1
+        return str(inv_ws.cell(rownum, c).value or "").strip()
+
+    # set graded fields
     _set("product_type", "Graded Card")
     _set("grading_company", grading_company)
     _set("grade", grade)
+
+    # compute graded market value from pricecharting using grade slot logic
+    link = _get("reference_link")
+    if link and "pricecharting.com" in link.lower():
+        prices = fetch_pricecharting_prices(link)
+        g = safe_str(grade).strip().upper()
+
+        mv = float(prices.get("raw", 0.0) or 0.0)
+        if "10" in g:
+            mv = float(prices.get("psa10", 0.0) or 0.0)
+        elif "9" in g:
+            mv = float(prices.get("psa9", 0.0) or 0.0)
+
+        _set("market_price", mv)
+        _set("market_value", mv)
+
 
 # =========================================================
 # DATA
@@ -867,9 +926,10 @@ with tab_analysis:
         psa9 = 0.0
         psa10 = 0.0
         if link and "pricecharting.com" in link.lower():
-            prices = fetch_pricecharting_psa_prices(link)
+            prices = fetch_pricecharting_prices(link)
             psa9 = prices["psa9"]
             psa10 = prices["psa10"]
+
 
         profit9 = psa9 - (purchase_total + fee)
         profit10 = psa10 - (purchase_total + fee)
@@ -936,7 +996,7 @@ with tab_submit:
                 psa9 = 0.0
                 psa10 = 0.0
                 if link and "pricecharting.com" in link.lower():
-                    prices = fetch_pricecharting_psa_prices(link)
+                    prices = fetch_pricecharting_prices(link)
                     psa9 = prices["psa9"]
                     psa10 = prices["psa10"]
 
@@ -1018,7 +1078,7 @@ with tab_update:
 
             sub_rows = open_df[open_df["submission_id"].astype(str) == str(pick)].copy()
 
-            st.caption("You can (1) add additional costs, or (2) mark returned date/grade.")
+            st.caption("Edit the table, then click Save updates. Rows with a returned date or grade will be marked RETURNED automatically.")
             edit_cols = [
                 "grading_row_id",
                 "inventory_id",
@@ -1037,11 +1097,10 @@ with tab_update:
 
             edited = st.data_editor(show, use_container_width=True, hide_index=True, num_rows="fixed")
 
-            c1, c2 = st.columns([1, 1])
-            save = c1.button("Save updates", type="primary", use_container_width=True)
-            mark_returned = c2.button("Mark rows with a grade/date as RETURNED", use_container_width=True)
+            # Single action: Save updates
+            save = st.button("Save updates", type="primary", use_container_width=True)
 
-            if save or mark_returned:
+            if save:
                 updated = sub_rows.copy()
 
                 ed_map = {str(r["grading_row_id"]): r for _, r in edited.iterrows()}
@@ -1057,20 +1116,26 @@ with tab_update:
                     updated.at[idx, "returned_date"] = safe_str(e.get("returned_date", "")).strip()
                     updated.at[idx, "received_grade"] = safe_str(e.get("received_grade", "")).strip()
 
-                    if mark_returned:
-                        if not is_blank(updated.at[idx, "returned_date"]) or not is_blank(updated.at[idx, "received_grade"]):
-                            updated.at[idx, "status"] = "RETURNED"
+                    # Auto-mark RETURNED if user entered either returned_date or received_grade
+                    if (not is_blank(updated.at[idx, "returned_date"])) or (not is_blank(updated.at[idx, "received_grade"])):
+                        updated.at[idx, "status"] = "RETURNED"
 
                     updated.at[idx, "updated_at"] = datetime.utcnow().isoformat()
 
+                    # If RETURNED, flip inventory back to ACTIVE + mark graded fields
                     if str(updated.at[idx, "status"]).upper() == "RETURNED":
                         inv_id = safe_str(updated.at[idx, "inventory_id"])
                         update_inventory_status(inv_id, STATUS_ACTIVE)
-                        mark_inventory_as_graded(inv_id, safe_str(updated.at[idx, "grading_company"]), safe_str(updated.at[idx, "received_grade"]))
+                        mark_inventory_as_graded(
+                            inv_id,
+                            safe_str(updated.at[idx, "grading_company"]),
+                            safe_str(updated.at[idx, "received_grade"]),
+                        )
 
                 update_grading_rows(updated)
                 st.success("Saved.")
                 refresh_all()
+
 
 # -------------------------
 # Summary
@@ -1096,7 +1161,7 @@ with tab_summary:
         )
         if need_mask.any():
             for idx, r in df[need_mask].iterrows():
-                prices = fetch_pricecharting_psa_prices(safe_str(r["reference_link"]))
+                prices = fetch_pricecharting_prices(safe_str(r["reference_link"]))
                 if df.at[idx, "psa9_price"] == 0.0:
                     df.at[idx, "psa9_price"] = prices["psa9"]
                 if df.at[idx, "psa10_price"] == 0.0:

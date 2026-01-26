@@ -1,5 +1,6 @@
 # pages/1_Dashboard.py
 import json
+import re
 from pathlib import Path
 from datetime import date
 
@@ -8,8 +9,13 @@ import numpy as np
 import streamlit as st
 import altair as alt
 
+import requests
+from bs4 import BeautifulSoup
+
 import gspread
 from google.oauth2.service_account import Credentials
+
+
 
 
 # =========================
@@ -139,6 +145,11 @@ def _ensure_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = new_cols
     return df
 
+
+
+
+
+
 def _col_lookup(df: pd.DataFrame) -> dict:
     """
     Map lower(base_col_name) -> actual column name (first occurrence wins).
@@ -219,6 +230,175 @@ def _normalize_card_type(val: str) -> str:
     # default
     return "Pokemon"
 
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def _fetch_pricecharting_prices(link: str) -> dict:
+    out = {"raw": 0.0, "psa9": 0.0, "psa10": 0.0}
+    if not link or "pricecharting.com" not in str(link).lower():
+        return out
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (CardTracker; +Streamlit)"}
+        r = requests.get(str(link).strip(), headers=headers, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+
+        nodes = soup.select(".price.js-price")
+        prices = []
+        for n in nodes:
+            t = n.get_text(" ", strip=True)
+            m = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", t)
+            prices.append(float(m.group(1).replace(",", "")) if m else 0.0)
+
+        if len(prices) >= 1:
+            out["raw"] = float(prices[0] or 0.0)   # slot 1
+        if len(prices) >= 4:
+            out["psa9"] = float(prices[3] or 0.0)  # slot 4
+        if len(prices) >= 6:
+            out["psa10"] = float(prices[5] or 0.0) # slot 6
+        return out
+    except Exception:
+        return out
+
+
+def _repull_market_values_to_inventory_sheet():
+    """
+    Runs on Dashboard Refresh:
+    - reads inventory sheet rows
+    - computes market_price/market_value from pricecharting:
+        - if status == GRADING OR not graded => raw
+        - if graded and grade contains 10 => psa10
+        - if graded and grade contains 9 => psa9
+        - else => raw
+    - writes back to inventory in ONE column update per market col (quota friendly)
+    """
+    ws = _open_ws(st.secrets.get("inventory_worksheet", "inventory"))
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        return 0
+
+    header = [h.strip() for h in values[0]]
+    rows = values[1:]
+    nrows = len(rows)
+
+    # helpers
+    def base(h): 
+        return h.split("__dup")[0] if "__dup" in h else h
+
+    def norm(h: str) -> str:
+        # makes: "Product Type" -> "product_type"
+        return re.sub(r"\s+", "_", (h or "").strip().lower())
+
+    def col_idx(name: str):
+        target = norm(name)
+        for i, h in enumerate(header):
+            if norm(base(h)) == target:
+                return i
+        return None
+
+
+    # ensure required headers exist (append if missing)
+    need = [
+        "reference_link",
+        "inventory_status",
+        "product_type",
+        "grading_company",
+        "grade",
+        "condition",
+        "market_price",
+        "market_value",
+        "market_price_updated_at",
+    ]
+
+    changed = False
+    for nm in need:
+        if col_idx(nm) is None:
+            header.append(nm)
+            changed = True
+    if changed:
+        ws.update("1:1", [header], value_input_option="USER_ENTERED")
+        # pad existing rows to new header length
+        for i in range(len(rows)):
+            if len(rows[i]) < len(header):
+                rows[i] = rows[i] + [""] * (len(header) - len(rows[i]))
+
+    # re-resolve col indices (after header update)
+    i_ref = col_idx("reference_link")
+    i_status = col_idx("inventory_status")
+    i_pt = col_idx("product_type")
+    i_comp = col_idx("grading_company")
+    i_grade = col_idx("grade")
+    i_cond = col_idx("condition")
+    i_mp = col_idx("market_price")
+    i_mv = col_idx("market_value")
+    i_mpu = col_idx("market_price_updated_at")
+
+
+    # repull should not rely on cached results if user explicitly pressed refresh
+    try:
+        _fetch_pricecharting_prices.clear()
+    except Exception:
+        pass
+
+
+    market_prices = []
+    market_updated_ats = []
+    now_iso = pd.Timestamp.utcnow().isoformat()
+    updated = 0
+
+    for r in rows:
+        link = (r[i_ref] if i_ref is not None and i_ref < len(r) else "").strip()
+        if "pricecharting.com" not in link.lower():
+            market_prices.append([0.0])
+            market_updated_ats.append([""])
+            continue
+
+        status = (r[i_status] if i_status is not None and i_status < len(r) else "").strip().upper()
+        pt = (r[i_pt] if i_pt is not None and i_pt < len(r) else "").strip().lower()
+        comp = (r[i_comp] if i_comp is not None and i_comp < len(r) else "").strip()
+        grade = (r[i_grade] if i_grade is not None and i_grade < len(r) else "").strip().upper()
+        cond = (r[i_cond] if i_cond is not None and i_cond < len(r) else "").strip().lower()
+
+        prices = _fetch_pricecharting_prices(link)
+
+        is_sealed = "sealed" in pt
+        is_grading = (status == "GRADING")
+        is_graded = ("graded" in pt) or bool(comp) or bool(grade) or ("graded" in cond)
+
+        mv = float(prices.get("raw", 0.0) or 0.0)  # default raw
+        if (not is_sealed) and (not is_grading) and is_graded:
+            if "10" in grade:
+                mv = float(prices.get("psa10", 0.0) or 0.0)
+            elif "9" in grade:
+                mv = float(prices.get("psa9", 0.0) or 0.0)
+
+        market_prices.append([mv])
+        market_updated_ats.append([now_iso])
+        updated += 1
+
+
+    # write market_price column in ONE call
+    def a1_col_letter(n: int) -> str:
+        letters = ""
+        while n:
+            n, r = divmod(n - 1, 26)
+            letters = chr(65 + r) + letters
+        return letters
+
+    mp_col_letter = a1_col_letter(i_mp + 1)
+    ws.update(f"{mp_col_letter}2:{mp_col_letter}{nrows+1}", market_prices, value_input_option="USER_ENTERED")
+
+    mv_col_letter = a1_col_letter(i_mv + 1)
+    ws.update(f"{mv_col_letter}2:{mv_col_letter}{nrows+1}", market_prices, value_input_option="USER_ENTERED")
+
+    mpu_col_letter = a1_col_letter(i_mpu + 1)
+    ws.update(f"{mpu_col_letter}2:{mpu_col_letter}{nrows+1}", market_updated_ats, value_input_option="USER_ENTERED")
+
+    return updated
+
+
+
+
+
+
 def _styler_table_header():
     # Column header background + bold
     return [
@@ -257,6 +437,14 @@ def load_sheet_df(worksheet_name: str) -> pd.DataFrame:
 top_left, top_right = st.columns([3, 1])
 with top_right:
     if st.button("🔄 Refresh from Sheets", use_container_width=True):
+        # 1) Repull + write market values to inventory sheet
+        try:
+            n = _repull_market_values_to_inventory_sheet()
+            st.success(f"Market values refreshed for {n} row(s). Reloading…")
+        except Exception as e:
+            st.warning(f"Market refresh ran into an issue: {e}. Reloading anyway…")
+
+        # 2) Clear caches and reload
         try:
             st.cache_data.clear()
         except Exception:
@@ -265,8 +453,8 @@ with top_right:
             st.cache_resource.clear()
         except Exception:
             pass
-        st.success("Refreshed. Re-running…")
         st.rerun()
+
 
 
 # =========================
@@ -300,6 +488,8 @@ if not inv.empty:
     inv_status_col = _pick_col(inv, "inventory_status", "inventory_status")
     inv_total_col = _pick_col(inv, "total_price", "total_price")
     inv_purchase_date_col = _pick_col(inv, "purchase_date", "purchase_date")
+    inv_ref_col = _pick_col(inv, "reference_link", "reference_link")
+
 
     inv_product_type_col = _pick_col(inv, "product_type", "product_type")
     inv_card_type_col = _pick_col(inv, "card_type", "card_type")
@@ -310,9 +500,10 @@ if not inv.empty:
     # Market price (optional cached)
     inv_market_col = _pick_col(inv, "market_price", None) or _pick_col(inv, "market_value", None)
 
-    for needed in [inv_id_col, inv_status_col, inv_total_col, inv_purchase_date_col]:
+    for needed in [inv_id_col, inv_status_col, inv_total_col, inv_purchase_date_col, inv_ref_col]:
         if needed not in inv.columns:
             inv[needed] = ""
+
 
     for needed in [inv_product_type_col, inv_card_type_col, inv_grade_col, inv_company_col, inv_condition_col]:
         if needed not in inv.columns:
@@ -322,9 +513,16 @@ if not inv.empty:
     inv[inv_total_col] = _to_num(inv[inv_total_col])
     inv["__purchase_dt"] = _to_dt(inv[inv_purchase_date_col])
 
+    # Base: read from sheet if present (market_price or market_value)
     inv["__market_price"] = 0.0
     if inv_market_col and inv_market_col in inv.columns:
         inv["__market_price"] = _to_num(inv[inv_market_col])
+
+    # If missing in sheet, pull from PriceCharting:
+    # - Raw uses slot 1 (.price.js-price index 1)
+    # - PSA9 uses slot 4
+    # - PSA10 uses slot 6
+
 
 else:
     inv_id_col = "inventory_id"
