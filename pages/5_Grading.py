@@ -210,7 +210,7 @@ def sync_returned_grades_to_inventory():
             return False
         col_idx_1based = inv_header_index[target] + 1
         a1 = gspread.utils.rowcol_to_a1(rownum, col_idx_1based)
-        inv_ws.update(a1, value, value_input_option="USER_ENTERED")
+        inv_ws.update(a1, [[value]], value_input_option="USER_ENTERED")
         return True
 
     def set_grd_cell(rownum: int, col_name: str, value):
@@ -226,7 +226,7 @@ def sync_returned_grades_to_inventory():
             return False
         col_idx_1based = grd_header_index[target] + 1
         a1 = gspread.utils.rowcol_to_a1(rownum, col_idx_1based)
-        grd_ws.update(a1, value, value_input_option="USER_ENTERED")
+        grd_ws.update(a1, [[value]], value_input_option="USER_ENTERED")
         return True
 
     # get_all_records loses row numbers, so rownum = df index + 2 (header row at 1)
@@ -800,7 +800,12 @@ def mark_inventory_as_graded(inventory_id: str, grading_company: str, grade: str
         if not target:
             return
         c = headers.index(target) + 1
-        inv_ws.update(f"{a1_col_letter(c)}{rownum}", value, value_input_option="USER_ENTERED")
+        inv_ws.update(
+            f"{a1_col_letter(c)}{rownum}",
+            [[value]],
+            value_input_option="USER_ENTERED",
+        )
+
 
     _set("product_type", "Graded Card")
     _set("grading_company", grading_company)
