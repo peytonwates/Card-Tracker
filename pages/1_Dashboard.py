@@ -577,6 +577,9 @@ if not txn.empty:
     else:
         txn["__sold_price"] = _to_num(txn[tx_sold_price_col])
 
+    # -----------------------------
+    # Fees
+    # -----------------------------
     if tx_fees_total_col and tx_fees_total_col in txn.columns:
         txn["__fees"] = _to_num(txn[tx_fees_total_col])
     elif tx_fees_col and tx_fees_col in txn.columns:
@@ -584,7 +587,31 @@ if not txn.empty:
     else:
         txn["__fees"] = 0.0
 
-    txn["__net"] = (txn["__sold_price"] - txn["__fees"]).fillna(0.0)
+    # -----------------------------
+    # NEW: status + net_proceeds alignment with Transactions page
+    # - Only include SOLD transactions
+    # - Prefer net_proceeds written by 3_Transactions.py (sold - fees + shipping_charged)
+    # -----------------------------
+    tx_status_col = _pick_col(txn, "status", None) or _pick_col(txn, "tx_status", None)
+    tx_net_proceeds_col = _pick_col(txn, "net_proceeds", None) or _pick_col(txn, "net", None)
+    tx_ship_charged_col = _pick_col(txn, "shipping_charged", None) or _pick_col(txn, "shipping", None)
+
+    # Only count SOLD rows (ignore LISTED / CANCELLED)
+    if tx_status_col and tx_status_col in txn.columns:
+        txn["__status"] = txn[tx_status_col].astype(str).str.upper().str.strip()
+        txn = txn[txn["__status"].eq("SOLD")].copy()
+
+    # Net: prefer the sheet's computed net_proceeds
+    if tx_net_proceeds_col and tx_net_proceeds_col in txn.columns:
+        txn["__net"] = _to_num(txn[tx_net_proceeds_col])
+    else:
+        # fallback if net_proceeds column doesn't exist yet
+        if tx_ship_charged_col and tx_ship_charged_col in txn.columns:
+            txn["__ship_charged"] = _to_num(txn[tx_ship_charged_col])
+        else:
+            txn["__ship_charged"] = 0.0
+        txn["__net"] = (txn["__sold_price"] - txn["__fees"] + txn["__ship_charged"]).fillna(0.0)
+
     txn["__sold_month"] = _month_start(txn["__sold_dt"])
 
     # normalize transaction card_type if it exists
@@ -592,6 +619,7 @@ if not txn.empty:
         txn["__txn_card_type"] = txn[tx_card_type_col].apply(_normalize_card_type)
     else:
         txn["__txn_card_type"] = ""
+
 
 else:
     tx_date_col = None
