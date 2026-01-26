@@ -614,7 +614,7 @@ with tab_bs:
 
         if inv_f.empty:
             st.info("No inventory in selected period.")
-            assets_df = pd.DataFrame(columns=["Inventory", "# of items", "Cost of Goods"])
+            assets_df = pd.DataFrame(columns=["Inventory", "# of items", "Cost of Goods", "Market Value"])
         else:
             inv_asof = inv_f.copy()
 
@@ -632,21 +632,30 @@ with tab_bs:
             )
             inv_asof["__cost"] = _to_num(inv_asof[inv_total_col])
 
+            # Market value source:
+            # - Use inventory.market_price/market_value if present
+            # - For GRADING items, still use that same raw market value (NOT PSA9/10)
+            # - If missing, market value = 0
+            inv_asof["__mv"] = 0.0
+            if "__market_price" in inv_asof.columns:
+                inv_asof["__mv"] = _to_num(inv_asof["__market_price"])
+
             rows = []
             for ct in ["Sports", "Pokemon"]:
                 sub = inv_asof[inv_asof["__card_type"].str.upper() == ct.upper()].copy()
                 if sub.empty:
                     continue
 
-                rows.append([ct, int(len(sub)), float(sub["__cost"].sum())])
+                rows.append([ct, int(len(sub)), float(sub["__cost"].sum()), float(sub["__mv"].sum())])
 
                 # Order like your screenshot
                 bucket_order = ["Cards", "Grading In-Process", "Graded Cards", "Sealed"]
                 for b in bucket_order:
                     sb = sub[sub["__bucket"] == b]
-                    rows.append([f"  {b}", int(len(sb)), float(sb["__cost"].sum())])
+                    rows.append([f"  {b}", int(len(sb)), float(sb["__cost"].sum()), float(sb["__mv"].sum())])
 
-            assets_df = pd.DataFrame(rows, columns=["Inventory", "# of items", "Cost of Goods"])
+            assets_df = pd.DataFrame(rows, columns=["Inventory", "# of items", "Cost of Goods", "Market Value"])
+
 
             # Totals row
             if not assets_df.empty:
@@ -657,26 +666,32 @@ with tab_bs:
                             "Inventory": "Totals",
                             "# of items": int(assets_df["# of items"].sum()),
                             "Cost of Goods": float(assets_df["Cost of Goods"].sum()),
+                            "Market Value": float(assets_df["Market Value"].sum()),
                         }])
                     ],
                     ignore_index=True
                 )
 
-        sty = _style_group_and_total_rows(assets_df, "Inventory").format({"Cost of Goods": "${:,.2f}"}).set_table_styles(_styler_table_header())
+
+        sty = (
+            _style_group_and_total_rows(assets_df, "Inventory")
+            .format({"Cost of Goods": "${:,.2f}", "Market Value": "${:,.2f}"})
+            .set_table_styles(_styler_table_header())
+        )
+
         st.dataframe(sty, use_container_width=True, hide_index=True)
 
         st.markdown("### Other Expenses")
 
         misc_total = float(misc_f["__amount"].sum()) if not misc_f.empty else 0.0
-        grading_total = float(grd_f["__grading_cost"].sum()) if not grd_f.empty else 0.0
 
         other_df = pd.DataFrame(
             [
                 ["Misc", int(len(misc_f)) if not misc_f.empty else 0, misc_total],
-                ["Grading Cost", int(len(grd_f)) if not grd_f.empty else 0, grading_total],
             ],
             columns=["Other Expenses", "# of lines", "Dollar Cost"],
         )
+
         other_df = pd.concat(
             [
                 other_df,
@@ -750,8 +765,11 @@ with tab_bs:
         # Expenses = inventory purchases + misc + grading (in selected window)
         inv_spend = float(inv_f[inv_total_col].sum()) if not inv_f.empty else 0.0
         misc_spend = float(misc_f["__amount"].sum()) if not misc_f.empty else 0.0
-        grading_spend = float(grd_f["__grading_cost"].sum()) if not grd_f.empty else 0.0
-        total_expenses = inv_spend + misc_spend + grading_spend
+
+        # Grading costs are embedded in inventory total_price (COGS) once incurred;
+        # do NOT also count them separately here.
+        total_expenses = inv_spend + misc_spend
+
 
         # Build per card_type (ONLY Sports/Pokemon)
         summary_rows = []
