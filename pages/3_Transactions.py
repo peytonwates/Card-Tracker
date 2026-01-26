@@ -181,7 +181,7 @@ HEADER_ALIASES = {
     "product_type": ["product_type", "Product Type"],
     "sealed_product_type": ["sealed_product_type", "Sealed Product Type"],
     "image_url": ["image_url", "Image URL", "image", "Image"],
-    "inventory_status": ["inventory_status", "Status", "inventoryStatus"],
+    "inventory_status": ["inventory_status", "Inventory Status", "inventoryStatus"],
     "listed_transaction_id": ["listed_transaction_id", "Listed Transaction ID"],
 
     # Inventory grading/market
@@ -193,7 +193,7 @@ HEADER_ALIASES = {
     # Transactions (old/new)
     "transaction_id": ["transaction_id", "Transaction ID"],
     "transaction_type": ["transaction_type", "Transaction Type", "listing_type"],
-    "status": ["status", "tx_status", "TX Status"],
+    "status": ["status", "TX Status", "tx_status", "Status"],
 
     # keep inputs
     "fees": ["fees", "platform_fees", "fee", "Fees"],
@@ -264,6 +264,9 @@ def internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
         "grading_fee_total": "Grading Fee",
         "all_in_cost": "All In Cost",
         "fees_total": "Fees Total",
+        "status": "TX Status",
+        "inventory_status": "Inventory Status",
+
     }
     return defaults.get(internal, internal)
 
