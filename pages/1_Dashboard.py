@@ -1133,11 +1133,12 @@ with tab_bs:
         # =========================================================
         # TOP TABLE (NEW): Listed Items overview
         #  - # of items
+        #  - List Price Total
         #  - Market Value of Listed Items
         # Uses holdings-as-of (inv_holdings) so SOLD items are excluded correctly
         # =========================================================
         if inv_holdings.empty:
-            listed_df = pd.DataFrame(columns=["Listed Items", "# of items", "Market Value"])
+            listed_df = pd.DataFrame(columns=["Listed Items", "# of items", "List Price Total", "Market Value"])
         else:
             inv_listed = inv_holdings.copy()
 
@@ -1145,24 +1146,41 @@ with tab_bs:
             inv_listed["__status_upper"] = inv_listed[inv_status_col].astype(str).str.upper().str.strip()
             inv_listed = inv_listed[inv_listed["__status_upper"].eq("LISTED")].copy()
 
+            # pick list_price column if it exists (supports future renames/dupes)
+            inv_list_price_col = _pick_col(inv_listed, "list_price", None) or _pick_col(inv_listed, "listed_price", None)
+
             if inv_listed.empty:
                 listed_df = pd.DataFrame([{
                     "Listed Items": "Totals",
                     "# of items": 0,
+                    "List Price Total": 0.0,
                     "Market Value": 0.0,
                 }])
             else:
                 inv_listed["__card_type"] = inv_listed[inv_card_type_col].apply(_normalize_card_type)
+
+                # Market value from cached inventory pricing
                 inv_listed["__mv"] = _to_num(inv_listed.get("__market_price", 0.0))
+
+                # List price (if missing, treat as 0)
+                if inv_list_price_col and inv_list_price_col in inv_listed.columns:
+                    inv_listed["__list_price"] = _to_num(inv_listed[inv_list_price_col])
+                else:
+                    inv_listed["__list_price"] = 0.0
 
                 rows = []
                 for ct in ["Sports", "Pokemon"]:
                     sub = inv_listed[inv_listed["__card_type"].str.upper() == ct.upper()].copy()
                     if sub.empty:
                         continue
-                    rows.append([ct, int(len(sub)), float(sub["__mv"].sum())])
+                    rows.append([
+                        ct,
+                        int(len(sub)),
+                        float(sub["__list_price"].sum()),
+                        float(sub["__mv"].sum())
+                    ])
 
-                listed_df = pd.DataFrame(rows, columns=["Listed Items", "# of items", "Market Value"])
+                listed_df = pd.DataFrame(rows, columns=["Listed Items", "# of items", "List Price Total", "Market Value"])
 
                 # totals
                 listed_df = pd.concat(
@@ -1171,6 +1189,7 @@ with tab_bs:
                         pd.DataFrame([{
                             "Listed Items": "Totals",
                             "# of items": int(len(inv_listed)),
+                            "List Price Total": float(inv_listed["__list_price"].sum()),
                             "Market Value": float(inv_listed["__mv"].sum()),
                         }])
                     ],
@@ -1179,10 +1198,11 @@ with tab_bs:
 
         sty_listed = (
             _style_group_and_total_rows(listed_df, "Listed Items")
-            .format({"Market Value": "${:,.2f}"})
+            .format({"List Price Total": "${:,.2f}", "Market Value": "${:,.2f}"})
             .set_table_styles(_styler_table_header())
         )
         st.dataframe(sty_listed, use_container_width=True, hide_index=True)
+
 
         # =========================================================
         # BOTTOM TABLE (KEEP AS-IS): Sales (Net proceeds in period)
