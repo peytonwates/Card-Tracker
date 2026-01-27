@@ -8,8 +8,13 @@
 # - Delete/Cancel listing                  -> inventory returns to ACTIVE (transaction kept as CANCELLED)
 # - Rate-limit safe reads (cache + single-read + backoff)
 #
-# Alignments/Fixes vs latest Inventory + Dashboard + Grading:
-# - Robust header normalization (prevents "Product Type" vs product_type duplicates)
+# NEW (2026-01): Bulk Listing Creator
+# - Select multiple ACTIVE inventory items
+# - Edit listing fields in a table (type/platform/notes/list date/list price)
+# - Create all listings in one shot (append_rows) + batch update inventory rows
+#
+# Alignments/Fixes:
+# - Robust header normalization (prevents duplicates)
 # - card_type normalized to ONLY Pokemon/Sports (never "Other")
 # - Writes fees_total so Dashboard net (sold_price - fees_total) matches Transactions net
 # ---------------------------------------------------------
@@ -220,10 +225,6 @@ HEADER_ALIASES = {
 
 
 def _norm_header(s: str) -> str:
-    """
-    Normalize header strings so:
-      "Product Type" == "product_type" == "product type"
-    """
     s = str(s or "").strip().lower()
     s = re.sub(r"\s+", "_", s)
     return s
@@ -236,23 +237,17 @@ def sheet_header_to_internal(h: str) -> str:
         for a in aliases:
             if _norm_header(a) == h_norm:
                 return internal
-    # fall back to normalized raw header (keeps stable if you add new fields)
     return _norm_header(h_raw) if h_norm else h_raw
 
 
 def internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
-    """
-    Prefer an existing alias header if present to avoid creating duplicates.
-    """
     aliases = HEADER_ALIASES.get(internal, [internal])
 
-    # Prefer exact existing match by normalized comparison
     existing_norm = {_norm_header(x): x for x in existing_headers}
     for a in aliases:
         if _norm_header(a) in existing_norm:
             return existing_norm[_norm_header(a)]
 
-    # reasonable defaults
     defaults = {
         "product_type": "Product Type",
         "sealed_product_type": "Sealed Product Type",
@@ -266,7 +261,6 @@ def internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
         "fees_total": "Fees Total",
         "status": "TX Status",
         "inventory_status": "Inventory Status",
-
     }
     return defaults.get(internal, internal)
 
@@ -303,21 +297,18 @@ def get_gspread_client():
         "https://www.googleapis.com/auth/drive",
     ]
 
-    # Cloud: TOML table
     if "gcp_service_account" in st.secrets and not isinstance(st.secrets["gcp_service_account"], str):
         sa = st.secrets["gcp_service_account"]
         sa_info = {k: sa[k] for k in sa.keys()}
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         return gspread.authorize(creds)
 
-    # Cloud: JSON string
     if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], str):
         sa_json_str = st.secrets["gcp_service_account"]
         sa_info = json.loads(sa_json_str)
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         return gspread.authorize(creds)
 
-    # Local dev: JSON file path
     if "service_account_json_path" in st.secrets:
         sa_rel = st.secrets["service_account_json_path"]
         sa_path = Path(sa_rel)
@@ -344,17 +335,10 @@ def _get_ws(spreadsheet_id: str, worksheet_name: str):
     return _with_backoff(lambda: sh.worksheet(worksheet_name))
 
 
-
 def _ensure_headers(ws, internal_headers: list[str]) -> list[str]:
-    """
-    Quota-safer header ensure:
-    - single read via get_all_values() (instead of row_values(1))
-    - only updates header row if missing columns exist
-    """
     values = _with_backoff(lambda: ws.get_all_values())
     first_row = values[0] if values else []
 
-    # Sheet is empty -> write header row once
     if not first_row:
         sheet_headers = [internal_to_sheet_header(h, []) for h in internal_headers]
         _with_backoff(lambda: ws.update("1:1", [sheet_headers], value_input_option="USER_ENTERED"))
@@ -374,7 +358,6 @@ def _ensure_headers(ws, internal_headers: list[str]) -> list[str]:
     return existing_sheet_headers
 
 
-
 @st.cache_data(ttl=45, show_spinner=False)
 def _read_sheet_values_cached(spreadsheet_id: str, worksheet_name: str) -> list[list[str]]:
     ws = _get_ws(spreadsheet_id, worksheet_name)
@@ -382,10 +365,6 @@ def _read_sheet_values_cached(spreadsheet_id: str, worksheet_name: str) -> list[
 
 
 def _coalesce_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    If df has duplicate column names (after alias normalization),
-    collapse them into a single column by taking first non-empty value per row.
-    """
     if df.columns.duplicated().any():
         new = pd.DataFrame(index=df.index)
         for col in pd.unique(df.columns):
@@ -400,10 +379,6 @@ def _coalesce_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _sheet_to_df(values: list[list[str]], internal_cols: list[str]) -> tuple[pd.DataFrame, list[str]]:
-    """
-    values includes header row.
-    Returns (df_internal, sheet_headers)
-    """
     if not values:
         return pd.DataFrame(columns=internal_cols), []
 
@@ -411,19 +386,13 @@ def _sheet_to_df(values: list[list[str]], internal_cols: list[str]) -> tuple[pd.
     rows = values[1:] if len(values) > 1 else []
 
     df = pd.DataFrame(rows, columns=sheet_headers)
-
-    # Normalize to internal names (may cause duplicates)
     df = df.rename(columns={h: sheet_header_to_internal(h) for h in df.columns})
-
-    # Coalesce duplicates created by alias normalization
     df = _coalesce_duplicate_columns(df)
 
-    # Ensure all internal cols exist
     for c in internal_cols:
         if c not in df.columns:
             df[c] = ""
 
-    # Keep only requested internal cols (in order)
     df = df[internal_cols].copy()
     return df, sheet_headers
 
@@ -454,7 +423,6 @@ def load_inventory_df(force_refresh: bool = False) -> pd.DataFrame:
     df, _headers = _sheet_to_df(values, INV_COLUMNS)
     df = _coerce_numeric(df, NUMERIC_INV)
 
-    # Default inventory_status if blank
     if "inventory_status" in df.columns:
         df["inventory_status"] = df["inventory_status"].replace("", STATUS_ACTIVE).fillna(STATUS_ACTIVE)
 
@@ -510,7 +478,6 @@ def load_grading_df(force_refresh: bool = False) -> pd.DataFrame:
 
     df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
 
-    # prefer updated_at_utc then updated_at for ordering
     sort_col = "updated_at_utc" if "updated_at_utc" in df.columns else "updated_at"
     if sort_col in df.columns:
         df[sort_col] = pd.to_datetime(df[sort_col], errors="coerce")
@@ -530,10 +497,6 @@ def _safe_str(x) -> str:
 
 
 def _normalize_card_type(val: str) -> str:
-    """
-    ONLY Pokemon or Sports. Never show 'Other'.
-    Default unknown/blank to Pokemon (matches Dashboard fix).
-    """
     s = _safe_str(val).strip().lower()
     if s == "sports" or "sport" in s:
         return "Sports"
@@ -627,6 +590,31 @@ def _append_row(ws, sheet_headers: list[str], row_internal: dict):
     _with_backoff(lambda: ws.append_row(ordered, value_input_option="USER_ENTERED"))
 
 
+def _append_rows(ws, sheet_headers: list[str], rows_internal: list[dict]):
+    """
+    Append multiple rows in one call (quota friendly).
+    """
+    if not rows_internal:
+        return
+    header_to_internal = {h: sheet_header_to_internal(h) for h in sheet_headers}
+    batch = []
+    for row_internal in rows_internal:
+        ordered = []
+        for sheet_h in sheet_headers:
+            internal = header_to_internal.get(sheet_h, sheet_h)
+            v = row_internal.get(internal, "")
+            if isinstance(v, (pd.Series, pd.DataFrame)):
+                v = ""
+            ordered.append(v)
+        batch.append(ordered)
+
+    def _do():
+        # gspread supports append_rows on Worksheet
+        return ws.append_rows(batch, value_input_option="USER_ENTERED")
+
+    _with_backoff(_do)
+
+
 def _update_row(ws, sheet_headers: list[str], rownum: int, row_internal: dict):
     header_to_internal = {h: sheet_header_to_internal(h) for h in sheet_headers}
     values = []
@@ -642,18 +630,34 @@ def _update_row(ws, sheet_headers: list[str], rownum: int, row_internal: dict):
     _with_backoff(lambda: ws.update(rng, [values], value_input_option="USER_ENTERED"))
 
 
+def _batch_update_rows(ws, sheet_headers: list[str], updates: list[tuple[int, dict]]):
+    """
+    Batch update multiple full rows in one API call (quota friendly).
+    updates = [(rownum, row_internal_dict), ...]
+    """
+    if not updates:
+        return
+
+    header_to_internal = {h: sheet_header_to_internal(h) for h in sheet_headers}
+    last_col_letter = gspread.utils.rowcol_to_a1(1, len(sheet_headers)).split("1")[0]
+
+    data = []
+    for rownum, row_internal in updates:
+        row_values = []
+        for sheet_h in sheet_headers:
+            internal = header_to_internal.get(sheet_h, sheet_h)
+            v = row_internal.get(internal, "")
+            if isinstance(v, (pd.Series, pd.DataFrame)):
+                v = ""
+            row_values.append(v)
+
+        rng = f"A{rownum}:{last_col_letter}{rownum}"
+        data.append({"range": rng, "values": [row_values]})
+
+    _with_backoff(lambda: ws.batch_update(data, value_input_option="USER_ENTERED"))
+
+
 def _compute_net_and_profit(all_in_cost: float, sold_price: float, fees: float, shipping_charged: float) -> tuple[float, float]:
-    """
-    Transactions page definition (kept):
-      net_proceeds = sold_price - fees + shipping_charged
-      profit      = net_proceeds - all_in_cost
-
-    Dashboard definition (current):
-      net = sold_price - fees_total
-
-    To align:
-      fees_total = fees - shipping_charged  => sold_price - fees_total == sold_price - fees + shipping_charged
-    """
     sold_price = float(sold_price or 0.0)
     fees = float(fees or 0.0)
     shipping_charged = float(shipping_charged or 0.0)
@@ -703,7 +707,7 @@ def scrape_image_url(reference_link: str) -> str:
 
 
 # =========================================================
-# UI HELPERS (UI unchanged)
+# UI HELPERS
 # =========================================================
 
 def _money(x) -> str:
@@ -738,7 +742,6 @@ def _tx_label(r: pd.Series) -> str:
     return f"{tx_id} — {ttype} — {inv_id} — {set_name} — {name}"
 
 
-
 # =========================================================
 # PAGE
 # =========================================================
@@ -771,227 +774,483 @@ with tab_create:
     else:
         inv_available["__label"] = inv_available.apply(_inv_label, axis=1)
 
-        col_left, col_right = st.columns([1, 3])
-
-        with col_right:
-            selected_label = st.selectbox(
-                "Select item from Inventory (ACTIVE only)",
-                options=inv_available["__label"].tolist(),
-                index=0,
-            )
-
-        selected_row = inv_available[inv_available["__label"] == selected_label].iloc[0]
-        inv_id = str(selected_row.get("inventory_id", "")).strip()
-
-        # pull grading info (fee/company/grade) from grading sheet
-        gr_info = _lookup_grading_for_inventory(gr_df, inv_id)
-
-        # Image + quick identification info
-        with col_left:
-            img_url = str(selected_row.get("image_url", "")).strip()
-            if not img_url:
-                img_url = scrape_image_url(str(selected_row.get("reference_link", "")).strip())
-            if img_url:
-                st.image(img_url, use_container_width=True)
-            else:
-                st.caption("No image found.")
-
-        st.markdown("#### Purchase details")
-        p1, p2, p3 = st.columns(3)
-        p1.write(f"**Purchase date:** {selected_row.get('purchase_date', '')}")
-        p2.write(f"**Purchased from:** {selected_row.get('purchased_from', '')}")
-        p3.write(f"**Total cost:** {_money(selected_row.get('total_price', 0.0))}")
+        mode = st.radio(
+            "Create mode",
+            options=["Single", "Bulk (mass listings)"],
+            index=0,
+            horizontal=True,
+        )
 
         st.markdown("---")
 
-        # Transaction form (UI unchanged)
-        with st.form("create_tx_form", clear_on_submit=False):
-            c1, c2, c3 = st.columns([1.2, 1.2, 2.0])
+        # -----------------------------------------
+        # BULK MODE
+        # -----------------------------------------
+        if mode.startswith("Bulk"):
+            st.markdown("### Bulk listing creator")
 
-            with c1:
-                tx_type = st.selectbox("Transaction type*", TX_TYPES, index=0)
+            # select multiple items
+            selected_labels = st.multiselect(
+                "Select ACTIVE items to list",
+                options=inv_available["__label"].tolist(),
+                default=[],
+            )
 
-            with c2:
-                platform = st.text_input(
-                    "Platform*",
-                    value="eBay" if tx_type in ["Auction", "Buy It Now"] else "Trade In",
-                    placeholder="eBay, Whatnot, LCS, Trade-in shop, etc.",
+            if not selected_labels:
+                st.info("Select one or more items above to build your listings table.")
+            else:
+                chosen_df = inv_available[inv_available["__label"].isin(selected_labels)].copy()
+                chosen_df = chosen_df.sort_values(by=["year", "set_name", "card_name", "inventory_id"], na_position="last")
+
+                # Build a table for editing listing fields
+                editor = pd.DataFrame({
+                    "inventory_id": chosen_df["inventory_id"].astype(str).str.strip(),
+                    "year": chosen_df.get("year", ""),
+                    "set_name": chosen_df.get("set_name", ""),
+                    "card_name": chosen_df.get("card_name", ""),
+                    "variant": chosen_df.get("variant", ""),
+                    "total_cost": chosen_df.get("total_price", 0.0),
+
+                    # editable fields
+                    "transaction_type": ["Buy It Now"] * len(chosen_df),  # default
+                    "platform": ["eBay"] * len(chosen_df),
+                    "list_date": [date.today()] * len(chosen_df),
+                    "list_price": [0.0] * len(chosen_df),
+                    "notes": [""] * len(chosen_df),
+                })
+
+                st.caption("Edit the fields below, then click **Create Listings**. (This will mark inventory items as LISTED.)")
+
+                edited = st.data_editor(
+                    editor,
+                    use_container_width=True,
+                    hide_index=True,
+                    num_rows="fixed",
+                    column_config={
+                        "inventory_id": st.column_config.TextColumn("Inventory ID", disabled=True),
+                        "year": st.column_config.TextColumn("Year", disabled=True),
+                        "set_name": st.column_config.TextColumn("Set", disabled=True),
+                        "card_name": st.column_config.TextColumn("Card", disabled=True),
+                        "variant": st.column_config.TextColumn("Variant", disabled=True),
+                        "total_cost": st.column_config.NumberColumn("Cost", format="$%.2f", disabled=True),
+
+                        "transaction_type": st.column_config.SelectboxColumn(
+                            "Transaction Type",
+                            options=["Auction", "Buy It Now"],
+                            required=True,
+                        ),
+                        "platform": st.column_config.TextColumn("Platform", required=True),
+                        "list_date": st.column_config.DateColumn("List Date", required=True),
+                        "list_price": st.column_config.NumberColumn("List Price", min_value=0.0, step=1.0, format="$%.2f", required=True),
+                        "notes": st.column_config.TextColumn("Notes"),
+                    },
+                    key="bulk_listing_editor",
                 )
 
-            with c3:
-                notes = st.text_input("Notes (optional)", value="", placeholder="Anything helpful...")
+                # Validate + create
+                colA, colB = st.columns([1, 2])
+                with colA:
+                    create_bulk = st.button("✅ Create Listings", type="primary", use_container_width=True)
+                with colB:
+                    st.caption("Tip: set list_price on each row. Any row with missing platform or list_price <= 0 will be rejected.")
 
-            if tx_type in ["Auction", "Buy It Now"]:
-                l1, l2, l3 = st.columns(3)
-                with l1:
-                    list_date = st.date_input("List date*", value=date.today())
-                with l2:
-                    list_price = st.number_input("List price*", min_value=0.0, step=1.0, format="%.2f")
-                with l3:
-                    st.caption("Sale fields get filled in later under 'Mark Sold / Update Listing'.")
+                if create_bulk:
+                    # basic validation
+                    problems = []
+                    rows_to_create = []
 
-                sold_date = ""
-                sold_price = 0.0
-                fees = 0.0
-                shipping_charged = 0.0
+                    for i, r in edited.iterrows():
+                        inv_id = str(r.get("inventory_id", "")).strip()
+                        ttype = str(r.get("transaction_type", "")).strip()
+                        platform = str(r.get("platform", "")).strip()
+                        list_date = r.get("list_date", None)
+                        list_price = float(r.get("list_price", 0.0) or 0.0)
+                        notes = str(r.get("notes", "")).strip()
 
-            else:
-                l1, l2, l3, l4 = st.columns([1.2, 1.2, 1.2, 1.2])
-                with l1:
-                    sold_date = st.date_input("Trade date*", value=date.today())
-                with l2:
-                    sold_price = st.number_input("Trade-in amount (sold price)*", min_value=0.0, step=1.0, format="%.2f")
-                with l3:
-                    fees = st.number_input("Fees (optional)", min_value=0.0, step=1.0, format="%.2f")
-                with l4:
-                    shipping_charged = st.number_input("Shipping charged (optional)", min_value=0.0, step=1.0, format="%.2f")
+                        if not inv_id:
+                            problems.append(f"Row {i+1}: missing inventory_id.")
+                            continue
+                        if ttype not in ["Auction", "Buy It Now"]:
+                            problems.append(f"Row {i+1} (Inv {inv_id}): transaction_type must be Auction or Buy It Now.")
+                            continue
+                        if not platform:
+                            problems.append(f"Row {i+1} (Inv {inv_id}): platform is required.")
+                            continue
+                        if list_date in [None, ""]:
+                            problems.append(f"Row {i+1} (Inv {inv_id}): list_date is required.")
+                            continue
+                        if list_price <= 0:
+                            problems.append(f"Row {i+1} (Inv {inv_id}): list_price must be > 0.")
+                            continue
 
-                list_date = ""
-                list_price = 0.0
+                        rows_to_create.append({
+                            "inventory_id": inv_id,
+                            "transaction_type": ttype,
+                            "platform": platform,
+                            "list_date": list_date,
+                            "list_price": list_price,
+                            "notes": notes,
+                        })
 
-            submit = st.form_submit_button("Save", type="primary", use_container_width=True)
+                    if problems:
+                        st.error("Fix these issues and try again:\n- " + "\n- ".join(problems))
+                        st.stop()
 
-        if submit:
-            if not platform.strip():
-                st.error("Platform is required.")
-            else:
-                spreadsheet_id = st.secrets["spreadsheet_id"]
-                inv_ws_name = st.secrets.get("inventory_worksheet", INVENTORY_WS_DEFAULT)
-                tx_ws_name = st.secrets.get("transactions_worksheet", TRANSACTIONS_WS_DEFAULT)
+                    # Safety: ensure still ACTIVE
+                    active_set = set(inv_available["inventory_id"].astype(str).str.strip().tolist())
+                    bad = [x["inventory_id"] for x in rows_to_create if x["inventory_id"] not in active_set]
+                    if bad:
+                        st.error(
+                            "Some selected items are no longer ACTIVE (maybe listed in another session). "
+                            f"Remove these and try again: {', '.join(bad)}"
+                        )
+                        st.stop()
 
-                inv_ws = _get_ws(spreadsheet_id, inv_ws_name)
-                tx_ws = _get_ws(spreadsheet_id, tx_ws_name)
+                    # Build TX rows + Inventory updates
+                    spreadsheet_id = st.secrets["spreadsheet_id"]
+                    inv_ws_name = st.secrets.get("inventory_worksheet", INVENTORY_WS_DEFAULT)
+                    tx_ws_name = st.secrets.get("transactions_worksheet", TRANSACTIONS_WS_DEFAULT)
 
-                inv_sheet_headers = _ensure_headers(inv_ws, INV_COLUMNS)
-                tx_sheet_headers = _ensure_headers(tx_ws, TX_COLUMNS)
+                    inv_ws = _get_ws(spreadsheet_id, inv_ws_name)
+                    tx_ws = _get_ws(spreadsheet_id, tx_ws_name)
 
-                inv_values = _with_backoff(lambda: inv_ws.get_all_values())
-                tx_values = _with_backoff(lambda: tx_ws.get_all_values())
+                    inv_sheet_headers = _ensure_headers(inv_ws, INV_COLUMNS)
+                    tx_sheet_headers = _ensure_headers(tx_ws, TX_COLUMNS)
 
-                inv_header = inv_values[0] if inv_values else inv_sheet_headers
-                inv_id_col_idx = next((i for i, h in enumerate(inv_header, start=1) if sheet_header_to_internal(h) == "inventory_id"), None)
-                if inv_id_col_idx is None:
-                    st.error("Could not find 'inventory_id' column in the inventory sheet header.")
-                    st.stop()
+                    inv_values = _with_backoff(lambda: inv_ws.get_all_values())
+                    inv_header = inv_values[0] if inv_values else inv_sheet_headers
+                    inv_id_col_idx = next((i for i, h in enumerate(inv_header, start=1) if sheet_header_to_internal(h) == "inventory_id"), None)
+                    if inv_id_col_idx is None:
+                        st.error("Could not find 'inventory_id' column in the inventory sheet header.")
+                        st.stop()
 
-                # Ensure inventory has an image_url (optional write back)
-                img_url_final = str(selected_row.get("image_url", "")).strip()
-                if not img_url_final:
-                    img_url_final = scrape_image_url(str(selected_row.get("reference_link", "")).strip())
+                    # rownum map (one pass)
+                    inv_ids = [x["inventory_id"] for x in rows_to_create]
+                    inv_rownums = _find_rownum_by_id(inv_values, inv_id_col_idx, inv_ids)
 
-                purchase_total = float(selected_row.get("total_price", 0.0) or 0.0)
-                grading_fee_total = float(gr_info.get("grading_fee_total", 0.0) or 0.0)
-                all_in_cost = float(round(purchase_total + grading_fee_total, 2))
+                    # Build lookup from inv_df for snapshots (fast)
+                    inv_map = inv_df.set_index("inventory_id", drop=False).to_dict("index")
 
-                tx_id = str(uuid.uuid4())
-                now_iso = pd.Timestamp.utcnow().isoformat()
+                    now_iso = pd.Timestamp.utcnow().isoformat()
+                    tx_rows = []
+                    inv_updates = []
 
-                # Align card_type to Dashboard (Pokemon/Sports only)
-                card_type_norm = _normalize_card_type(selected_row.get("card_type", ""))
+                    for x in rows_to_create:
+                        inv_id = x["inventory_id"]
+                        inv_rec = inv_map.get(inv_id, {})
 
-                if tx_type == "Trade In":
-                    net, profit = _compute_net_and_profit(
-                        all_in_cost=all_in_cost,
-                        sold_price=sold_price,
-                        fees=fees,
-                        shipping_charged=shipping_charged,
+                        tx_id = str(uuid.uuid4())
+
+                        # grading info (fee/company/grade) from grading sheet
+                        gr_info = _lookup_grading_for_inventory(gr_df, inv_id)
+
+                        # Prefer existing image_url; avoid scraping N items in bulk
+                        img_url_final = str(inv_rec.get("image_url", "")).strip()
+
+                        purchase_total = float(inv_rec.get("total_price", 0.0) or 0.0)
+                        grading_fee_total = float(gr_info.get("grading_fee_total", 0.0) or 0.0)
+                        all_in_cost = float(round(purchase_total + grading_fee_total, 2))
+
+                        card_type_norm = _normalize_card_type(inv_rec.get("card_type", ""))
+
+                        tx_row = {
+                            "transaction_id": tx_id,
+                            "inventory_id": inv_id,
+                            "transaction_type": x["transaction_type"],
+                            "platform": str(x["platform"]).strip(),
+                            "list_date": str(x["list_date"]) if x.get("list_date") else "",
+                            "list_price": float(x["list_price"] or 0.0),
+
+                            # sale fields blank
+                            "sold_date": "",
+                            "sold_price": 0.0,
+                            "fees": 0.0,
+                            "shipping_charged": 0.0,
+                            "fees_total": 0.0,
+                            "net_proceeds": 0.0,
+                            "profit": 0.0,
+
+                            "notes": str(x.get("notes", "")).strip(),
+                            "status": TX_STATUS_LISTED,
+                            "created_at": now_iso,
+                            "updated_at": now_iso,
+
+                            # snapshots
+                            "product_type": str(inv_rec.get("product_type", "")).strip(),
+                            "sealed_product_type": str(inv_rec.get("sealed_product_type", "")).strip(),
+                            "card_type": card_type_norm,
+                            "brand_or_league": str(inv_rec.get("brand_or_league", "")).strip(),
+                            "set_name": str(inv_rec.get("set_name", "")).strip(),
+                            "year": str(inv_rec.get("year", "")).strip(),
+                            "card_name": str(inv_rec.get("card_name", "")).strip(),
+                            "card_number": str(inv_rec.get("card_number", "")).strip(),
+                            "variant": str(inv_rec.get("variant", "")).strip(),
+                            "card_subtype": str(inv_rec.get("card_subtype", "")).strip(),
+                            "reference_link": str(inv_rec.get("reference_link", "")).strip(),
+                            "image_url": img_url_final,
+                            "purchase_date": str(inv_rec.get("purchase_date", "")).strip(),
+                            "purchased_from": str(inv_rec.get("purchased_from", "")).strip(),
+
+                            "purchase_total": float(purchase_total),
+                            "grading_fee_total": float(grading_fee_total),
+                            "all_in_cost": float(all_in_cost),
+
+                            "grading_company": str(gr_info.get("grading_company", "")).strip(),
+                            "grade": str(gr_info.get("grade", "")).strip(),
+                            "condition": str(inv_rec.get("condition", "")).strip(),
+                        }
+                        tx_rows.append(tx_row)
+
+                        # Inventory update (status + listed_transaction_id; keep other fields as-is)
+                        rownum = inv_rownums.get(inv_id)
+                        if not rownum:
+                            continue
+
+                        row_vals = inv_values[rownum - 1] if len(inv_values) >= rownum else []
+                        if len(row_vals) < len(inv_header):
+                            row_vals = row_vals + [""] * (len(inv_header) - len(row_vals))
+                        row_dict_sheet = dict(zip(inv_header, row_vals))
+                        row_internal = {sheet_header_to_internal(k): v for k, v in row_dict_sheet.items()}
+                        row_internal = _coalesce_duplicate_columns(pd.DataFrame([row_internal])).iloc[0].to_dict()
+
+                        row_internal["inventory_status"] = STATUS_LISTED
+                        row_internal["listed_transaction_id"] = tx_id
+
+                        # If image_url missing AND we already have one in inv_rec, write it back
+                        if "image_url" in row_internal and (not str(row_internal.get("image_url", "")).strip()) and img_url_final:
+                            row_internal["image_url"] = img_url_final
+
+                        inv_updates.append((rownum, row_internal))
+
+                    if not tx_rows:
+                        st.error("No valid rows to create (unexpected).")
+                        st.stop()
+
+                    # Write: append all tx rows, then update inventory in batch
+                    _append_rows(tx_ws, tx_sheet_headers, tx_rows)
+                    _batch_update_rows(inv_ws, inv_sheet_headers, inv_updates)
+
+                    # clear caches
+                    st.session_state.pop("inv_df_cache_tx", None)
+                    st.session_state.pop("tx_df_cache", None)
+                    st.session_state.pop("gr_df_cache_tx", None)
+                    _read_sheet_values_cached.clear()
+
+                    st.success(f"Created {len(tx_rows)} listing(s). Inventory marked LISTED.")
+                    st.rerun()
+
+        # -----------------------------------------
+        # SINGLE MODE (your existing UI/flow)
+        # -----------------------------------------
+        else:
+            inv_available["__label"] = inv_available.apply(_inv_label, axis=1)
+
+            col_left, col_right = st.columns([1, 3])
+
+            with col_right:
+                selected_label = st.selectbox(
+                    "Select item from Inventory (ACTIVE only)",
+                    options=inv_available["__label"].tolist(),
+                    index=0,
+                )
+
+            selected_row = inv_available[inv_available["__label"] == selected_label].iloc[0]
+            inv_id = str(selected_row.get("inventory_id", "")).strip()
+
+            gr_info = _lookup_grading_for_inventory(gr_df, inv_id)
+
+            with col_left:
+                img_url = str(selected_row.get("image_url", "")).strip()
+                if not img_url:
+                    img_url = scrape_image_url(str(selected_row.get("reference_link", "")).strip())
+                if img_url:
+                    st.image(img_url, use_container_width=True)
+                else:
+                    st.caption("No image found.")
+
+            st.markdown("#### Purchase details")
+            p1, p2, p3 = st.columns(3)
+            p1.write(f"**Purchase date:** {selected_row.get('purchase_date', '')}")
+            p2.write(f"**Purchased from:** {selected_row.get('purchased_from', '')}")
+            p3.write(f"**Total cost:** {_money(selected_row.get('total_price', 0.0))}")
+
+            st.markdown("---")
+
+            with st.form("create_tx_form", clear_on_submit=False):
+                c1, c2, c3 = st.columns([1.2, 1.2, 2.0])
+
+                with c1:
+                    tx_type = st.selectbox("Transaction type*", TX_TYPES, index=0)
+
+                with c2:
+                    platform = st.text_input(
+                        "Platform*",
+                        value="eBay" if tx_type in ["Auction", "Buy It Now"] else "Trade In",
+                        placeholder="eBay, Whatnot, LCS, Trade-in shop, etc.",
                     )
-                    fees_total = _compute_fees_total_for_dashboard(fees, shipping_charged)
-                    tx_status = TX_STATUS_SOLD
+
+                with c3:
+                    notes = st.text_input("Notes (optional)", value="", placeholder="Anything helpful...")
+
+                if tx_type in ["Auction", "Buy It Now"]:
+                    l1, l2, l3 = st.columns(3)
+                    with l1:
+                        list_date = st.date_input("List date*", value=date.today())
+                    with l2:
+                        list_price = st.number_input("List price*", min_value=0.0, step=1.0, format="%.2f")
+                    with l3:
+                        st.caption("Sale fields get filled in later under 'Mark Sold / Update Listing'.")
+
+                    sold_date = ""
+                    sold_price = 0.0
+                    fees = 0.0
+                    shipping_charged = 0.0
+
                 else:
-                    net, profit = 0.0, 0.0
-                    fees_total = 0.0
-                    tx_status = TX_STATUS_LISTED
+                    l1, l2, l3, l4 = st.columns([1.2, 1.2, 1.2, 1.2])
+                    with l1:
+                        sold_date = st.date_input("Trade date*", value=date.today())
+                    with l2:
+                        sold_price = st.number_input("Trade-in amount (sold price)*", min_value=0.0, step=1.0, format="%.2f")
+                    with l3:
+                        fees = st.number_input("Fees (optional)", min_value=0.0, step=1.0, format="%.2f")
+                    with l4:
+                        shipping_charged = st.number_input("Shipping charged (optional)", min_value=0.0, step=1.0, format="%.2f")
 
-                tx_row = {
-                    "transaction_id": tx_id,
-                    "inventory_id": inv_id,
-                    "transaction_type": tx_type,
-                    "platform": platform.strip(),
-                    "list_date": str(list_date) if list_date else "",
-                    "list_price": float(list_price or 0.0),
-                    "sold_date": str(sold_date) if sold_date else "",
-                    "sold_price": float(sold_price or 0.0),
-                    "fees": float(fees or 0.0),
-                    "shipping_charged": float(shipping_charged or 0.0),
-                    "fees_total": float(fees_total),
-                    "net_proceeds": float(net),
-                    "profit": float(profit),
-                    "notes": notes.strip(),
-                    "status": tx_status,
-                    "created_at": now_iso,
-                    "updated_at": now_iso,
+                    list_date = ""
+                    list_price = 0.0
 
-                    # snapshots
-                    "product_type": str(selected_row.get("product_type", "")).strip(),
-                    "sealed_product_type": str(selected_row.get("sealed_product_type", "")).strip(),
-                    "card_type": card_type_norm,
-                    "brand_or_league": str(selected_row.get("brand_or_league", "")).strip(),
-                    "set_name": str(selected_row.get("set_name", "")).strip(),
-                    "year": str(selected_row.get("year", "")).strip(),
-                    "card_name": str(selected_row.get("card_name", "")).strip(),
-                    "card_number": str(selected_row.get("card_number", "")).strip(),
-                    "variant": str(selected_row.get("variant", "")).strip(),
-                    "card_subtype": str(selected_row.get("card_subtype", "")).strip(),
-                    "reference_link": str(selected_row.get("reference_link", "")).strip(),
-                    "image_url": img_url_final,
-                    "purchase_date": str(selected_row.get("purchase_date", "")).strip(),
-                    "purchased_from": str(selected_row.get("purchased_from", "")).strip(),
+                submit = st.form_submit_button("Save", type="primary", use_container_width=True)
 
-                    # cost basis snapshots
-                    "purchase_total": float(purchase_total),
-                    "grading_fee_total": float(grading_fee_total),
-                    "all_in_cost": float(all_in_cost),
-
-                    # grading snapshots
-                    "grading_company": str(gr_info.get("grading_company", "")).strip(),
-                    "grade": str(gr_info.get("grade", "")).strip(),
-
-                    # condition snapshot
-                    "condition": str(selected_row.get("condition", "")).strip(),
-                }
-
-                _append_row(tx_ws, tx_sheet_headers, tx_row)
-
-                # Update inventory status + listed_transaction_id (and image_url if missing)
-                inv_rownum = _find_rownum_by_id(inv_values, inv_id_col_idx, [inv_id]).get(inv_id)
-                if not inv_rownum:
-                    st.warning("Transaction saved, but could not locate inventory row to update status.")
+            if submit:
+                if not platform.strip():
+                    st.error("Platform is required.")
                 else:
-                    row_vals = inv_values[inv_rownum - 1] if len(inv_values) >= inv_rownum else []
-                    if len(row_vals) < len(inv_header):
-                        row_vals = row_vals + [""] * (len(inv_header) - len(row_vals))
-                    row_dict_sheet = dict(zip(inv_header, row_vals))
-                    row_internal = {sheet_header_to_internal(k): v for k, v in row_dict_sheet.items()}
-                    row_internal = _coalesce_duplicate_columns(pd.DataFrame([row_internal])).iloc[0].to_dict()
+                    spreadsheet_id = st.secrets["spreadsheet_id"]
+                    inv_ws_name = st.secrets.get("inventory_worksheet", INVENTORY_WS_DEFAULT)
+                    tx_ws_name = st.secrets.get("transactions_worksheet", TRANSACTIONS_WS_DEFAULT)
+
+                    inv_ws = _get_ws(spreadsheet_id, inv_ws_name)
+                    tx_ws = _get_ws(spreadsheet_id, tx_ws_name)
+
+                    inv_sheet_headers = _ensure_headers(inv_ws, INV_COLUMNS)
+                    tx_sheet_headers = _ensure_headers(tx_ws, TX_COLUMNS)
+
+                    inv_values = _with_backoff(lambda: inv_ws.get_all_values())
+
+                    inv_header = inv_values[0] if inv_values else inv_sheet_headers
+                    inv_id_col_idx = next((i for i, h in enumerate(inv_header, start=1) if sheet_header_to_internal(h) == "inventory_id"), None)
+                    if inv_id_col_idx is None:
+                        st.error("Could not find 'inventory_id' column in the inventory sheet header.")
+                        st.stop()
+
+                    img_url_final = str(selected_row.get("image_url", "")).strip()
+                    if not img_url_final:
+                        img_url_final = scrape_image_url(str(selected_row.get("reference_link", "")).strip())
+
+                    purchase_total = float(selected_row.get("total_price", 0.0) or 0.0)
+                    grading_fee_total = float(gr_info.get("grading_fee_total", 0.0) or 0.0)
+                    all_in_cost = float(round(purchase_total + grading_fee_total, 2))
+
+                    tx_id = str(uuid.uuid4())
+                    now_iso = pd.Timestamp.utcnow().isoformat()
+
+                    card_type_norm = _normalize_card_type(selected_row.get("card_type", ""))
 
                     if tx_type == "Trade In":
-                        row_internal["inventory_status"] = STATUS_SOLD
+                        net, profit = _compute_net_and_profit(
+                            all_in_cost=all_in_cost,
+                            sold_price=sold_price,
+                            fees=fees,
+                            shipping_charged=shipping_charged,
+                        )
+                        fees_total = _compute_fees_total_for_dashboard(fees, shipping_charged)
+                        tx_status = TX_STATUS_SOLD
                     else:
-                        row_internal["inventory_status"] = STATUS_LISTED
+                        net, profit = 0.0, 0.0
+                        fees_total = 0.0
+                        tx_status = TX_STATUS_LISTED
 
-                    row_internal["listed_transaction_id"] = tx_id
+                    tx_row = {
+                        "transaction_id": tx_id,
+                        "inventory_id": inv_id,
+                        "transaction_type": tx_type,
+                        "platform": platform.strip(),
+                        "list_date": str(list_date) if list_date else "",
+                        "list_price": float(list_price or 0.0),
+                        "sold_date": str(sold_date) if sold_date else "",
+                        "sold_price": float(sold_price or 0.0),
+                        "fees": float(fees or 0.0),
+                        "shipping_charged": float(shipping_charged or 0.0),
+                        "fees_total": float(fees_total),
+                        "net_proceeds": float(net),
+                        "profit": float(profit),
+                        "notes": notes.strip(),
+                        "status": tx_status,
+                        "created_at": now_iso,
+                        "updated_at": now_iso,
 
-                    if "image_url" in row_internal and (not str(row_internal.get("image_url", "")).strip()):
-                        row_internal["image_url"] = img_url_final
+                        "product_type": str(selected_row.get("product_type", "")).strip(),
+                        "sealed_product_type": str(selected_row.get("sealed_product_type", "")).strip(),
+                        "card_type": card_type_norm,
+                        "brand_or_league": str(selected_row.get("brand_or_league", "")).strip(),
+                        "set_name": str(selected_row.get("set_name", "")).strip(),
+                        "year": str(selected_row.get("year", "")).strip(),
+                        "card_name": str(selected_row.get("card_name", "")).strip(),
+                        "card_number": str(selected_row.get("card_number", "")).strip(),
+                        "variant": str(selected_row.get("variant", "")).strip(),
+                        "card_subtype": str(selected_row.get("card_subtype", "")).strip(),
+                        "reference_link": str(selected_row.get("reference_link", "")).strip(),
+                        "image_url": img_url_final,
+                        "purchase_date": str(selected_row.get("purchase_date", "")).strip(),
+                        "purchased_from": str(selected_row.get("purchased_from", "")).strip(),
 
-                    _update_row(inv_ws, inv_sheet_headers, inv_rownum, row_internal)
+                        "purchase_total": float(purchase_total),
+                        "grading_fee_total": float(grading_fee_total),
+                        "all_in_cost": float(all_in_cost),
 
-                # clear caches
-                st.session_state.pop("inv_df_cache_tx", None)
-                st.session_state.pop("tx_df_cache", None)
-                st.session_state.pop("gr_df_cache_tx", None)
-                _read_sheet_values_cached.clear()
+                        "grading_company": str(gr_info.get("grading_company", "")).strip(),
+                        "grade": str(gr_info.get("grade", "")).strip(),
 
-                if tx_type == "Trade In":
-                    st.success("Trade In recorded and inventory marked SOLD.")
-                else:
-                    st.success("Listing created and inventory marked LISTED.")
+                        "condition": str(selected_row.get("condition", "")).strip(),
+                    }
 
-                # IMPORTANT: tx_df was loaded earlier in this run.
-                # Force a rerun so Tab 2 reloads the fresh transactions sheet.
-                st.rerun()
+                    _append_row(tx_ws, tx_sheet_headers, tx_row)
 
+                    inv_rownum = _find_rownum_by_id(inv_values, inv_id_col_idx, [inv_id]).get(inv_id)
+                    if not inv_rownum:
+                        st.warning("Transaction saved, but could not locate inventory row to update status.")
+                    else:
+                        row_vals = inv_values[inv_rownum - 1] if len(inv_values) >= inv_rownum else []
+                        if len(row_vals) < len(inv_header):
+                            row_vals = row_vals + [""] * (len(inv_header) - len(row_vals))
+                        row_dict_sheet = dict(zip(inv_header, row_vals))
+                        row_internal = {sheet_header_to_internal(k): v for k, v in row_dict_sheet.items()}
+                        row_internal = _coalesce_duplicate_columns(pd.DataFrame([row_internal])).iloc[0].to_dict()
+
+                        if tx_type == "Trade In":
+                            row_internal["inventory_status"] = STATUS_SOLD
+                        else:
+                            row_internal["inventory_status"] = STATUS_LISTED
+
+                        row_internal["listed_transaction_id"] = tx_id
+
+                        if "image_url" in row_internal and (not str(row_internal.get("image_url", "")).strip()):
+                            row_internal["image_url"] = img_url_final
+
+                        _update_row(inv_ws, inv_sheet_headers, inv_rownum, row_internal)
+
+                    st.session_state.pop("inv_df_cache_tx", None)
+                    st.session_state.pop("tx_df_cache", None)
+                    st.session_state.pop("gr_df_cache_tx", None)
+                    _read_sheet_values_cached.clear()
+
+                    if tx_type == "Trade In":
+                        st.success("Trade In recorded and inventory marked SOLD.")
+                    else:
+                        st.success("Listing created and inventory marked LISTED.")
+
+                    st.rerun()
 
 
 # =========================================================
@@ -1123,7 +1382,6 @@ with tab_update:
                     st.success("Listing cancelled. Item returned to ACTIVE inventory.")
                     st.rerun()
 
-
                 if mark_btn:
                     all_in_cost = float(tx_internal.get("all_in_cost", 0.0) or 0.0)
                     if all_in_cost <= 0:
@@ -1168,7 +1426,6 @@ with tab_update:
                     _read_sheet_values_cached.clear()
                     st.success("Marked sold. Inventory updated to SOLD.")
                     st.rerun()
-
 
 
 # =========================================================
