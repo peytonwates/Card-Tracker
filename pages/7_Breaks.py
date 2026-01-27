@@ -201,7 +201,6 @@ def load_sheet_df(worksheet_name: str) -> pd.DataFrame:
 
 
 def _append_row(ws, header: list[str], row_dict: dict):
-    # write ordered by sheet header
     ordered = []
     for h in header:
         key = h.split("__dup")[0] if "__dup" in h else h
@@ -227,7 +226,6 @@ def _update_row_by_id(ws, id_col_name: str, row_id: str, updates: dict):
     except ValueError:
         return False
 
-    # find row number in sheet (1-based), starting from row 2
     target_rownum = None
     for i, r in enumerate(values[1:], start=2):
         if id_idx < len(r) and str(r[id_idx]).strip() == str(row_id).strip():
@@ -356,13 +354,6 @@ def _normalize_card_type(val: str) -> str:
     return "Pokemon"
 
 
-def _compute_total(purchase_price, shipping, tax):
-    try:
-        return round(float(purchase_price or 0) + float(shipping or 0) + float(tax or 0), 2)
-    except Exception:
-        return 0.0
-
-
 def _append_inventory_row(row_internal: dict):
     ws = _open_ws(INV_WS)
     sheet_headers = _ensure_inventory_headers(ws)
@@ -422,7 +413,6 @@ BREAK_CARDS_COLUMNS = [
 
 
 def _ensure_headers(ws, needed_cols: list[str]) -> list[str]:
-    # quota-safe + tolerant of blank sheets
     values = _with_backoff(lambda: ws.get_all_values())
     if not values:
         _with_backoff(lambda: ws.append_row(needed_cols, value_input_option="USER_ENTERED"))
@@ -441,7 +431,7 @@ def _ensure_headers(ws, needed_cols: list[str]) -> list[str]:
 
 
 # =========================================================
-# SportscardsPro / PriceCharting box pulling (like Inventory "Pull details")
+# Shared scraping helpers (Inventory-style)
 # =========================================================
 SPORT_TOKENS = {
     "football": "Football",
@@ -483,7 +473,7 @@ def _find_best_title(soup: BeautifulSoup) -> str:
 
 def _find_best_image(soup: BeautifulSoup) -> str:
     """
-    Prefer real product photos when possible.
+    Inventory-style: prefer real product images when present.
     """
     if soup is None:
         return ""
@@ -504,20 +494,17 @@ def _find_best_image(soup: BeautifulSoup) -> str:
 
 def _find_pricecharting_main_image(soup: BeautifulSoup) -> str:
     """
-    Match the Inventory page behavior:
-    PriceCharting often exposes the true photo under 'More Photos' as storage.googleapis.com.
-    Prefer that if present.
+    PriceCharting often exposes true photo under 'More Photos' as storage.googleapis.com.
+    Prefer that if present (same as Inventory page approach).
     """
     if soup is None:
         return ""
 
     candidates = []
-
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
         if not href:
             continue
-
         if href.startswith("//"):
             href = "https:" + href
 
@@ -529,6 +516,7 @@ def _find_pricecharting_main_image(soup: BeautifulSoup) -> str:
                 return href
             candidates.append(href)
 
+    # if no explicit "Main Image", use first storage image
     return candidates[0] if candidates else ""
 
 
@@ -548,6 +536,7 @@ def _parse_set_slug_generic(set_slug: str) -> dict:
     """
     Example:
       football-cards-2025-panini-donruss
+      pokemon-surging-sparks
     """
     tokens = [t for t in (set_slug or "").split("-") if t]
     year = ""
@@ -577,7 +566,6 @@ def _clean_box_title(title: str) -> str:
     if not title:
         return ""
     cleaned = title
-    # common suffixes
     cleaned = cleaned.replace("| Sports Cards Pro", "").replace("| Sportscardspro", "")
     cleaned = cleaned.replace("| PriceCharting", "").replace("| Pricecharting", "")
     cleaned = cleaned.replace(" - Sports Cards Pro", "").replace(" - Sportscardspro", "")
@@ -585,12 +573,43 @@ def _clean_box_title(title: str) -> str:
     return cleaned.strip()
 
 
+def _looks_like_single_card_slug(card_slug: str) -> bool:
+    if not card_slug:
+        return False
+    return bool(re.search(r"-(\d+[A-Za-z0-9]*)$", card_slug))
+
+
+def _parse_pricecharting_title(title: str):
+    """
+    Inventory-style: parse "Name #123" and a simple variant heuristic.
+    """
+    if not title:
+        return {"card_name": "", "card_number": "", "variant": ""}
+
+    num = ""
+    m = re.search(r"#\s*([A-Za-z0-9]+)", title)
+    if m:
+        num = m.group(1).strip()
+
+    name_part = title.split("#")[0].strip() if "#" in title else title.strip()
+    for sep in [" - ", " – "]:
+        if sep in name_part:
+            name_part = name_part.split(sep)[0].strip()
+
+    variant = ""
+    tokens = name_part.split()
+    if tokens and tokens[-1].lower() in {"ex", "gx", "v", "vmax", "silver", "holo"}:
+        variant = tokens[-1]
+        name_part = " ".join(tokens[:-1]).strip()
+
+    return {"card_name": name_part, "card_number": num, "variant": variant}
+
+
+# =========================================================
+# Box pulling (SportscardsPro / PriceCharting)
+# =========================================================
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def fetch_box_details(url: str) -> dict:
-    """
-    Paste a SportscardsPro OR PriceCharting box link and click Pull details.
-    This mirrors the Inventory page behavior (best title + best image selection).
-    """
     out = {
         "image_url": "",
         "reference_link": (url or "").strip(),
@@ -620,7 +639,6 @@ def fetch_box_details(url: str) -> dict:
 
         page_title = _find_best_title(soup)
 
-        # Prefer PriceCharting main image when applicable (like Inventory)
         if "pricecharting.com" in host:
             image_url = _find_pricecharting_main_image(soup) or _find_best_image(soup)
         else:
@@ -649,7 +667,6 @@ def fetch_box_details(url: str) -> dict:
 
     out["box_type"] = _infer_sealed_type_from_slug_or_title(item_slug or "", out["box_name"])
 
-    # fallback inference
     lowered = (url + " " + page_title).lower()
     if not out["card_type"]:
         if "pokemon" in lowered:
@@ -660,6 +677,109 @@ def fetch_box_details(url: str) -> dict:
 
     out["card_type"] = _normalize_card_type(out["card_type"])
     return out
+
+
+# =========================================================
+# Card pulling (Inventory-style Pull details for a single card link)
+# =========================================================
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def fetch_card_details_and_image(url: str) -> dict:
+    """
+    Mirrors Inventory behavior:
+    - best title
+    - best image (prefer PriceCharting main image storage.googleapis.com)
+    - parse PriceCharting slug/title for card name/number/variant + set/year when possible
+    """
+    result = {
+        "image_url": "",
+        "card_name": "",
+        "card_number": "",
+        "variant": "",
+        "card_subtype": "",
+        "reference_link": (url or "").strip(),
+        "card_type": "",
+        "brand_or_league": "",
+        "set_name": "",
+        "year": "",
+    }
+
+    if not url or not str(url).strip():
+        return result
+
+    url = str(url).strip()
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+
+    soup = None
+    page_title = ""
+    image_url = ""
+
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (CardTracker; +Streamlit)"}
+        r = requests.get(url, headers=headers, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+        page_title = _find_best_title(soup)
+
+        if "pricecharting.com" in host:
+            image_url = _find_pricecharting_main_image(soup) or _find_best_image(soup)
+        else:
+            image_url = _find_best_image(soup)
+
+        if image_url:
+            image_url = urljoin(url, image_url)
+
+    except Exception:
+        soup = None
+        page_title = ""
+        image_url = ""
+
+    result["image_url"] = image_url
+
+    # Try PriceCharting parse for set + item
+    parts = [p for p in (path or "").split("/") if p]
+    set_slug, item_slug = None, None
+    if len(parts) >= 3 and parts[0].lower() == "game":
+        set_slug, item_slug = parts[1], parts[2]
+
+    if "pricecharting.com" in host and set_slug:
+        result.update(_parse_set_slug_generic(set_slug))
+
+        # If it "looks like a single card slug", treat as a card and parse title
+        if item_slug and _looks_like_single_card_slug(item_slug):
+            result.update(_parse_pricecharting_title(page_title))
+
+            # fallback card_number from slug tail
+            if not result["card_number"] and item_slug:
+                m = re.search(r"-(\d+[A-Za-z0-9]*)$", item_slug)
+                if m:
+                    result["card_number"] = m.group(1)
+
+            # fallback card_name from slug
+            if not result["card_name"] and item_slug:
+                cleaned = re.sub(r"-(\d+[A-Za-z0-9]*)$", "", item_slug)
+                result["card_name"] = _title_case_from_slug(cleaned)
+
+        else:
+            # Not clearly a single card; still return title as name
+            if page_title and not result["card_name"]:
+                result["card_name"] = page_title
+
+        return result
+
+    # Non-PriceCharting fallback:
+    if page_title:
+        result["card_name"] = page_title
+
+    lowered = (url + " " + page_title).lower()
+    if "pokemon" in lowered:
+        result["card_type"] = "Pokemon"
+        result["brand_or_league"] = "Pokemon TCG"
+    elif any(tok in lowered for tok in ["prizm", "optic", "select", "donruss", "panini", "topps"]):
+        result["card_type"] = "Sports"
+
+    return result
 
 
 # =========================================================
@@ -700,8 +820,6 @@ for c in BREAK_CARDS_COLUMNS:
 break_cards_df["created_at_dt"] = _to_dt(break_cards_df["created_at"])
 break_cards_df["pushed_to_inventory"] = break_cards_df["pushed_to_inventory"].astype(str).fillna("")
 
-
-# Convenience views
 open_breaks = breaks_df[breaks_df["status"].astype(str).str.upper().eq("OPEN")].copy()
 open_breaks = open_breaks.sort_values(
     by=[c for c in ["purchase_date_dt", "created_at_dt"] if c in open_breaks.columns],
@@ -743,7 +861,6 @@ with tab_breaks:
     st.subheader("Create a Break (Box Opening)")
     st.caption("Paste a SportsCardsPro or PriceCharting box link and click Pull details to auto-fill the box fields.")
 
-    # --- Pull details row (outside form) ---
     link_c1, link_c2 = st.columns([4, 1])
     with link_c1:
         break_reference_link = st.text_input(
@@ -858,7 +975,6 @@ with tab_breaks:
 
                 _append_row(ws_breaks, breaks_headers, row)
 
-                # clear prefill for next entry
                 st.session_state["break_prefill"] = {}
                 for k in ["break_box_name", "break_card_type", "break_brand_or_league", "break_set_name", "break_year", "break_box_type", "break_image_url"]:
                     st.session_state.pop(k, None)
@@ -921,27 +1037,83 @@ with tab_cards:
         bc = break_cards_df[break_cards_df["break_id"].astype(str).str.strip().eq(break_id)].copy()
         bc = bc.sort_values("created_at_dt", na_position="last")
 
+        # =====================================================
+        # NEW: Inventory-style "Pull details" for CARD link
+        # =====================================================
+        st.markdown("#### Pull card details (optional)")
+        st.caption("Paste a PriceCharting link for the single card and click Pull details to auto-fill fields (and image), like the Inventory page.")
+
+        card_link_c1, card_link_c2 = st.columns([4, 1])
+        with card_link_c1:
+            card_reference_link = st.text_input(
+                "Card reference link",
+                key=f"break_card_ref_link_input__{break_id}",
+                placeholder="https://www.pricecharting.com/game/pokemon-surging-sparks/pikachu-123",
+            )
+        with card_link_c2:
+            pull_card = st.button("Pull details", use_container_width=True, key=f"pull_break_card__{break_id}")
+
+        if pull_card:
+            details = fetch_card_details_and_image(card_reference_link)
+            st.session_state["break_card_prefill"] = details
+            st.success("Pulled card details. Review/adjust below, then Add Card.")
+            st.rerun()
+
+        card_prefill = st.session_state.get("break_card_prefill", {}) or {}
+        card_img = (card_prefill.get("image_url") or "").strip()
+        if card_img:
+            try:
+                st.image(card_img, width=160)
+            except Exception:
+                st.caption("Image unavailable")
+
         st.markdown("#### Add a card")
         with st.form("add_break_card_form", clear_on_submit=True):
             c1, c2, c3 = st.columns([2.0, 1.0, 1.0])
             with c1:
-                card_name = st.text_input("Card name*", placeholder="Pikachu / Jayden Daniels / etc.")
+                card_name = st.text_input(
+                    "Card name*",
+                    value=(card_prefill.get("card_name", "") or "").strip(),
+                    placeholder="Pikachu / Jayden Daniels / etc."
+                )
             with c2:
-                card_number = st.text_input("Card # (optional)", placeholder="332")
+                card_number = st.text_input(
+                    "Card # (optional)",
+                    value=(card_prefill.get("card_number", "") or "").strip(),
+                    placeholder="332"
+                )
             with c3:
                 condition = st.selectbox("Condition*", CONDITION_OPTIONS, index=0)
 
             c4, c5, c6 = st.columns([1.0, 1.2, 2.0])
             with c4:
-                variant = st.text_input("Variant (optional)", placeholder="Silver, Holo, Parallel, Insert…")
+                variant = st.text_input(
+                    "Variant (optional)",
+                    value=(card_prefill.get("variant", "") or "").strip(),
+                    placeholder="Silver, Holo, Parallel, Insert…"
+                )
             with c5:
-                card_subtype = st.text_input("Card subtype (optional)", placeholder="Rookie, Insert, Parallel…")
+                card_subtype = st.text_input(
+                    "Card subtype (optional)",
+                    value=(card_prefill.get("card_subtype", "") or "").strip(),
+                    placeholder="Rookie, Insert, Parallel…"
+                )
             with c6:
-                card_ref = st.text_input("Card reference link (optional)", placeholder="(optional) PriceCharting/SCP link for the single card")
+                # default to pulled link if available; else whatever they typed above
+                default_ref = (card_prefill.get("reference_link") or card_reference_link or "").strip()
+                card_ref = st.text_input(
+                    "Card reference link (optional)",
+                    value=default_ref,
+                    placeholder="(optional) PriceCharting/SCP link for the single card"
+                )
 
             c7, c8 = st.columns([1.0, 2.0])
             with c7:
-                image_url = st.text_input("Image URL (optional)", placeholder="(optional)")
+                image_url = st.text_input(
+                    "Image URL (optional)",
+                    value=(card_img or "").strip(),
+                    placeholder="(optional)"
+                )
             with c8:
                 notes = st.text_area("Notes (optional)", height=80)
 
@@ -966,6 +1138,9 @@ with tab_cards:
                         "inventory_id": "",
                     }
                     _append_row(ws_break_cards, break_cards_headers, row)
+
+                    # clear the prefill after successful add (so next entry is fresh)
+                    st.session_state["break_card_prefill"] = {}
                     st.success("Card added to break.")
                     st.rerun()
 
