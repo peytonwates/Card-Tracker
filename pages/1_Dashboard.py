@@ -1124,11 +1124,69 @@ with tab_bs:
         st.dataframe(sty2, use_container_width=True, hide_index=True)
 
     # -------------------------
+    # -------------------------
     # SALES + SUMMARY (right side)
     # -------------------------
     with right:
         st.markdown("### Sales")
 
+        # =========================================================
+        # TOP TABLE (NEW): Listed Items overview
+        #  - # of items
+        #  - Market Value of Listed Items
+        # Uses holdings-as-of (inv_holdings) so SOLD items are excluded correctly
+        # =========================================================
+        if inv_holdings.empty:
+            listed_df = pd.DataFrame(columns=["Listed Items", "# of items", "Market Value"])
+        else:
+            inv_listed = inv_holdings.copy()
+
+            # normalize status + card_type
+            inv_listed["__status_upper"] = inv_listed[inv_status_col].astype(str).str.upper().str.strip()
+            inv_listed = inv_listed[inv_listed["__status_upper"].eq("LISTED")].copy()
+
+            if inv_listed.empty:
+                listed_df = pd.DataFrame([{
+                    "Listed Items": "Totals",
+                    "# of items": 0,
+                    "Market Value": 0.0,
+                }])
+            else:
+                inv_listed["__card_type"] = inv_listed[inv_card_type_col].apply(_normalize_card_type)
+                inv_listed["__mv"] = _to_num(inv_listed.get("__market_price", 0.0))
+
+                rows = []
+                for ct in ["Sports", "Pokemon"]:
+                    sub = inv_listed[inv_listed["__card_type"].str.upper() == ct.upper()].copy()
+                    if sub.empty:
+                        continue
+                    rows.append([ct, int(len(sub)), float(sub["__mv"].sum())])
+
+                listed_df = pd.DataFrame(rows, columns=["Listed Items", "# of items", "Market Value"])
+
+                # totals
+                listed_df = pd.concat(
+                    [
+                        listed_df,
+                        pd.DataFrame([{
+                            "Listed Items": "Totals",
+                            "# of items": int(len(inv_listed)),
+                            "Market Value": float(inv_listed["__mv"].sum()),
+                        }])
+                    ],
+                    ignore_index=True
+                )
+
+        sty_listed = (
+            _style_group_and_total_rows(listed_df, "Listed Items")
+            .format({"Market Value": "${:,.2f}"})
+            .set_table_styles(_styler_table_header())
+        )
+        st.dataframe(sty_listed, use_container_width=True, hide_index=True)
+
+        # =========================================================
+        # BOTTOM TABLE (KEEP AS-IS): Sales (Net proceeds in period)
+        # =========================================================
         if txn_f.empty:
             st.info("No sales in selected period.")
             sales_df = pd.DataFrame(columns=["Sales", "# of Sales", "Dollar Sales"])
@@ -1184,11 +1242,8 @@ with tab_bs:
         )
         st.dataframe(sty3, use_container_width=True, hide_index=True)
 
-
-        sty3 = _style_group_and_total_rows(sales_df, "Sales").format({"Dollar Sales": "${:,.2f}"}).set_table_styles(_styler_table_header())
-        st.dataframe(sty3, use_container_width=True, hide_index=True)
-
         st.markdown("### Summary")
+
 
         # Expenses = inventory purchases + misc + grading (in selected window)
         # Inventory spend should include unsynced grading cost (RETURNED or in-flight)
