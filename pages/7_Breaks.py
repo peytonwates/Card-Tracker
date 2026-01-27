@@ -1,28 +1,40 @@
 # pages/7_Breaks.py
 import json
+import re
 import uuid
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
+from urllib.parse import urlparse, urljoin
 
-import numpy as np
 import pandas as pd
+import numpy as np
 import streamlit as st
 
+import requests
+from bs4 import BeautifulSoup
+
 import gspread
-from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
 
 
-# =========================
+# =========================================================
 # Page config
-# =========================
+# =========================================================
 st.set_page_config(page_title="Breaks", layout="wide")
 st.title("Breaks")
 
 
-# =========================
-# Google Sheets client (same pattern as your other pages)
-# =========================
+# =========================================================
+# CONFIG (worksheets)
+# =========================================================
+INV_WS = st.secrets.get("inventory_worksheet", "inventory")
+BREAKS_WS = st.secrets.get("breaks_worksheet", "breaks")              # you already created this tab
+BREAK_CARDS_WS = st.secrets.get("break_cards_worksheet", "break_cards")  # CREATE THIS TAB in the sheet
+
+
+# =========================================================
+# Google Sheets client (same pattern as other pages)
+# =========================================================
 @st.cache_resource
 def get_gspread_client():
     scopes = [
@@ -59,34 +71,31 @@ def get_gspread_client():
     raise KeyError('Missing secrets: add "gcp_service_account" (Cloud) or "service_account_json_path" (local).')
 
 
-def _open_spreadsheet():
+def _open_ws(ws_name: str):
     client = get_gspread_client()
-    return client.open_by_key(st.secrets["spreadsheet_id"])
+    sh = client.open_by_key(st.secrets["spreadsheet_id"])
+    return sh.worksheet(ws_name)
 
 
-def _ensure_ws(ws_name: str, rows: int = 2000, cols: int = 40):
-    sh = _open_spreadsheet()
-    try:
-        return sh.worksheet(ws_name)
-    except WorksheetNotFound:
-        return sh.add_worksheet(title=ws_name, rows=str(rows), cols=str(cols))
-
-
-# =========================
-# Helpers
-# =========================
+# =========================================================
+# Small helpers
+# =========================================================
 def _safe_str(x) -> str:
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return ""
     return str(x)
 
 
-def _to_dt(s):
-    return pd.to_datetime(s, errors="coerce")
+def _to_dt(x):
+    return pd.to_datetime(x, errors="coerce")
 
 
-def _to_num(s):
-    return pd.to_numeric(s, errors="coerce").fillna(0.0)
+def _to_num(x):
+    return pd.to_numeric(x, errors="coerce").fillna(0.0)
+
+
+def _now_iso_utc():
+    return pd.Timestamp.utcnow().isoformat()
 
 
 def _ensure_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -103,45 +112,117 @@ def _ensure_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
         else:
             seen[b] += 1
             new_cols.append(f"{b}__dup{seen[b]}")
-    out = df.copy()
-    out.columns = new_cols
-    return out
+    df = df.copy()
+    df.columns = new_cols
+    return df
 
 
-def _normalize_card_type(val: str) -> str:
-    s = _safe_str(val).strip().lower()
-    if s == "sports" or "sport" in s:
-        return "Sports"
-    # default anything else -> Pokemon
-    return "Pokemon"
+@st.cache_data(show_spinner=False, ttl=60 * 10)
+def load_sheet_df(worksheet_name: str) -> pd.DataFrame:
+    """
+    Robust sheet read that tolerates:
+    - duplicate headers
+    - blank headers
+    - ragged rows
+    """
+    ws = _open_ws(worksheet_name)
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame()
 
+    header = [str(h or "").strip() for h in values[0]]
+    rows = values[1:] if len(values) > 1 else []
 
-def _now_iso_local():
-    return datetime.now().isoformat(timespec="seconds")
-
-
-def _a1_col_letter(n: int) -> str:
-    letters = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        letters = chr(65 + r) + letters
-    return letters
-
-
-def _col_index(header, name: str):
-    name = str(name).strip()
+    fixed = []
+    seen = {}
     for i, h in enumerate(header):
-        if str(h).strip() == name:
-            return i
-    return None
+        name = h if h else f"col_{i+1}"
+        if name not in seen:
+            seen[name] = 0
+            fixed.append(name)
+        else:
+            seen[name] += 1
+            fixed.append(f"{name}__dup{seen[name]}")
+
+    width = len(fixed)
+    norm_rows = []
+    for r in rows:
+        r = list(r)
+        if len(r) < width:
+            r = r + [""] * (width - len(r))
+        elif len(r) > width:
+            r = r[:width]
+        norm_rows.append(r)
+
+    return pd.DataFrame(norm_rows, columns=fixed)
 
 
-# =========================
-# Inventory schema (MATCH 2_Inventory.py DEFAULT_COLUMNS)
-# =========================
-STATUS_ACTIVE = "ACTIVE"
+def _append_row(ws, header: list[str], row_dict: dict):
+    # write ordered by sheet header
+    ordered = []
+    for h in header:
+        key = h.split("__dup")[0] if "__dup" in h else h
+        v = row_dict.get(key, row_dict.get(h, ""))
+        if pd.isna(v):
+            v = ""
+        ordered.append(v)
+    ws.append_row(ordered, value_input_option="USER_ENTERED")
 
-INV_DEFAULT_COLUMNS = [
+
+def _update_row_by_id(ws, id_col_name: str, row_id: str, updates: dict):
+    """
+    Updates a single row where id_col_name == row_id.
+    This reads the whole id column once (OK for your scale).
+    """
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        return False
+
+    header = [h.strip() for h in values[0]]
+    try:
+        id_idx = header.index(id_col_name)
+    except ValueError:
+        return False
+
+    # find row number in sheet (1-based), starting from row 2
+    target_rownum = None
+    for i, r in enumerate(values[1:], start=2):
+        if id_idx < len(r) and str(r[id_idx]).strip() == str(row_id).strip():
+            target_rownum = i
+            break
+
+    if not target_rownum:
+        return False
+
+    # build new row values (only for keys present)
+    row = values[target_rownum - 1]
+    # pad row to header length
+    if len(row) < len(header):
+        row = row + [""] * (len(header) - len(row))
+    for k, v in updates.items():
+        if k in header:
+            row[header.index(k)] = v
+
+    last_col_letter = gspread.utils.rowcol_to_a1(1, len(header)).split("1")[0]
+    ws.update(f"A{target_rownum}:{last_col_letter}{target_rownum}", [row], value_input_option="USER_ENTERED")
+    return True
+
+
+# =========================================================
+# Inventory header rules (match 2_Inventory.py)
+# =========================================================
+PRODUCT_TYPE_OPTIONS = ["Card", "Sealed", "Graded Card"]
+CARD_TYPE_OPTIONS = ["Pokemon", "Sports"]
+
+CONDITION_OPTIONS = [
+    "Near Mint",
+    "Lightly Played",
+    "Moderately Played",
+    "Heavily Played",
+    "Damaged",
+]
+
+DEFAULT_INV_COLUMNS = [
     "inventory_id",
     "image_url",
     "product_type",
@@ -173,20 +254,21 @@ INV_DEFAULT_COLUMNS = [
     "market_price_updated_at",
 ]
 
-# match your Inventory header aliasing pattern (Product Type / Sealed Product Type)
-HEADER_ALIASES = {
+INV_HEADER_ALIASES = {
     "product_type": ["product_type", "Product Type"],
     "sealed_product_type": ["sealed_product_type", "Sealed Product Type"],
 }
 
-def sheet_header_to_internal(header: str) -> str:
-    for internal, aliases in HEADER_ALIASES.items():
+
+def _sheet_header_to_internal(header: str) -> str:
+    for internal, aliases in INV_HEADER_ALIASES.items():
         if header in aliases:
             return internal
     return header
 
-def internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
-    aliases = HEADER_ALIASES.get(internal, [internal])
+
+def _internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
+    aliases = INV_HEADER_ALIASES.get(internal, [internal])
     for a in aliases:
         if a in existing_headers:
             return a
@@ -197,207 +279,50 @@ def internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
     return internal
 
 
-# =========================
-# Breaks sheet schemas
-# =========================
-BREAKS_HEADERS = [
-    "break_id",
-    "purchase_date",
-    "purchased_from",
-    "reference_link",     # PriceCharting link for the box
-    "card_type",          # Pokemon / Sports
-    "brand_or_league",    # Pokemon TCG / Football / etc (optional)
-    "set_name",
-    "year",
-    "box_name",
-    "box_type",           # Hobby / Blaster / ETB / etc (optional)
-    "qty_boxes",
-    "purchase_price",     # per box
-    "shipping",
-    "tax",
-    "total_price",        # qty * (purchase_price+shipping+tax) OR explicit
-    "notes",
-    "status",             # OPEN / FINALIZED
-    "created_at",
-    "finalized_at",
-    "cards_count",        # populated on finalize
-    "cost_per_card",      # populated on finalize
-]
+def _ensure_inventory_headers(ws_inv) -> list[str]:
+    first_row = ws_inv.row_values(1)
+    if not first_row:
+        sheet_headers = []
+        for internal in DEFAULT_INV_COLUMNS:
+            if internal == "product_type":
+                sheet_headers.append("Product Type")
+            elif internal == "sealed_product_type":
+                sheet_headers.append("Sealed Product Type")
+            else:
+                sheet_headers.append(internal)
+        ws_inv.append_row(sheet_headers)
+        return sheet_headers
 
-BREAK_CARDS_HEADERS = [
-    "break_card_id",
-    "break_id",
-    "card_type",          # Pokemon / Sports
-    "product_type",       # Card / Graded Card / Sealed (but for break cards normally Card)
-    "brand_or_league",
-    "set_name",
-    "year",
-    "card_name",
-    "card_number",
-    "variant",
-    "card_subtype",
-    "grading_company",
-    "grade",
-    "condition",
-    "reference_link",
-    "quantity",
-    "notes",
-    "created_at",
-    "exported_to_inventory",  # YES/NO
-    "inventory_ids",          # comma list once exported
-]
+    existing = first_row
+    existing_internal = set(_sheet_header_to_internal(h) for h in existing)
+    missing_internal = [h for h in DEFAULT_INV_COLUMNS if h not in existing_internal]
+    if missing_internal:
+        additions = [_internal_to_sheet_header(h, existing) for h in missing_internal]
+        new_headers = existing + additions
+        ws_inv.update("1:1", [new_headers])
+        return new_headers
+
+    return existing
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 10)
-def load_sheet_df(worksheet_name: str) -> pd.DataFrame:
-    ws = _ensure_ws(worksheet_name)
-    values = ws.get_all_values()
-    if not values:
-        return pd.DataFrame()
-
-    header = [str(h or "").strip() for h in values[0]]
-    rows = values[1:] if len(values) > 1 else []
-
-    # make unique
-    fixed = []
-    seen = {}
-    for i, h in enumerate(header):
-        name = h if h else f"col_{i+1}"
-        if name not in seen:
-            seen[name] = 0
-            fixed.append(name)
-        else:
-            seen[name] += 1
-            fixed.append(f"{name}__dup{seen[name]}")
-
-    width = len(fixed)
-    norm_rows = []
-    for r in rows:
-        r = list(r)
-        if len(r) < width:
-            r = r + [""] * (width - len(r))
-        elif len(r) > width:
-            r = r[:width]
-        norm_rows.append(r)
-
-    df = pd.DataFrame(norm_rows, columns=fixed)
-    df = _ensure_unique_columns(df)
-    return df
+def _normalize_card_type(val: str) -> str:
+    s = _safe_str(val).strip().lower()
+    if s == "sports" or "sport" in s:
+        return "Sports"
+    return "Pokemon"
 
 
-def _ensure_headers(ws, required_headers):
-    values = ws.get_all_values()
-    header = []
-    if values and len(values) >= 1:
-        header = [str(h or "").strip() for h in values[0]]
-    if not header:
-        header = []
-
-    existing = {h.strip(): i for i, h in enumerate(header) if str(h or "").strip() != ""}
-    changed = False
-    for h in required_headers:
-        if h not in existing:
-            header.append(h)
-            changed = True
-
-    if changed:
-        ws.update("1:1", [header], value_input_option="USER_ENTERED")
-
-    return header
-
-
-def _append_row(ws, header, row_dict: dict):
-    row = []
-    for h in header:
-        row.append(row_dict.get(h, ""))
-    ws.append_row(row, value_input_option="USER_ENTERED")
-
-
-def _find_row_by_id(ws, id_col_name: str, id_value: str):
-    values = ws.get_all_values()
-    if not values or len(values) < 2:
-        return None
-    header = [str(h or "").strip() for h in values[0]]
-    idx = _col_index(header, id_col_name)
-    if idx is None:
-        return None
-    for r_i, row in enumerate(values[1:], start=2):
-        v = row[idx] if idx < len(row) else ""
-        if str(v).strip() == str(id_value).strip():
-            return r_i
-    return None
-
-
-# =========================
-# Worksheet names
-# =========================
-INV_WS = st.secrets.get("inventory_worksheet", "inventory")
-BRK_WS = st.secrets.get("breaks_worksheet", "breaks")
-BRK_CARDS_WS = st.secrets.get("break_cards_worksheet", "break_cards")
-
-ws_inv = _ensure_ws(INV_WS)
-ws_breaks = _ensure_ws(BRK_WS)
-ws_break_cards = _ensure_ws(BRK_CARDS_WS)
-
-# ensure headers
-inv_sheet_headers = _ensure_headers(ws_inv, [internal_to_sheet_header(c, ws_inv.row_values(1) or []) for c in INV_DEFAULT_COLUMNS])
-breaks_headers = _ensure_headers(ws_breaks, BREAKS_HEADERS)
-break_cards_headers = _ensure_headers(ws_break_cards, BREAK_CARDS_HEADERS)
-
-
-def _coerce_breaks(df: pd.DataFrame) -> pd.DataFrame:
-    # ALWAYS return with purchase_date_dt present (fixes your KeyError)
-    if df is None or df.empty:
-        out = pd.DataFrame(columns=BREAKS_HEADERS + ["purchase_date_dt"])
-        return out
-
-    out = df.copy()
-    for c in BREAKS_HEADERS:
-        if c not in out.columns:
-            out[c] = ""
-
-    out["qty_boxes"] = _to_num(out["qty_boxes"])
-    out["purchase_price"] = _to_num(out["purchase_price"])
-    out["shipping"] = _to_num(out["shipping"])
-    out["tax"] = _to_num(out["tax"])
-    out["total_price"] = _to_num(out["total_price"])
-    out["cards_count"] = _to_num(out["cards_count"])
-    out["cost_per_card"] = _to_num(out["cost_per_card"])
-
-    out["status"] = out["status"].astype(str).str.upper().replace("", "OPEN").fillna("OPEN")
-    out["purchase_date_dt"] = _to_dt(out["purchase_date"])  # ✅ always created when non-empty
-    return out
-
-
-def _coerce_break_cards(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=BREAK_CARDS_HEADERS)
-
-    out = df.copy()
-    for c in BREAK_CARDS_HEADERS:
-        if c not in out.columns:
-            out[c] = ""
-
-    out["quantity"] = _to_num(out["quantity"]).replace(0, 1)
-    out["exported_to_inventory"] = out["exported_to_inventory"].astype(str).str.upper().replace("", "NO").fillna("NO")
-    out["card_type"] = out["card_type"].apply(_normalize_card_type)
-    return out
+def _compute_total(purchase_price, shipping, tax):
+    try:
+        return round(float(purchase_price or 0) + float(shipping or 0) + float(tax or 0), 2)
+    except Exception:
+        return 0.0
 
 
 def _append_inventory_row(row_internal: dict):
-    """
-    Append row to inventory using the *existing sheet headers* and alias mapping
-    so we don't create mismatched columns.
-    """
-    ws = ws_inv
-    sheet_headers = ws.row_values(1) or []
-    if not sheet_headers:
-        # create headers if sheet is empty
-        sheet_headers = [internal_to_sheet_header(c, []) for c in INV_DEFAULT_COLUMNS]
-        ws.append_row(sheet_headers)
-
-    # Map sheet header -> internal field name
-    header_to_internal = {h: sheet_header_to_internal(h) for h in sheet_headers}
+    ws = _open_ws(INV_WS)
+    sheet_headers = _ensure_inventory_headers(ws)
+    header_to_internal = {h: _sheet_header_to_internal(h) for h in sheet_headers}
 
     ordered = []
     for sheet_h in sheet_headers:
@@ -407,254 +332,397 @@ def _append_inventory_row(row_internal: dict):
     ws.append_row(ordered, value_input_option="USER_ENTERED")
 
 
-def _export_break_to_inventory(break_id: str):
+# =========================================================
+# Breaks + Break Cards sheet headers
+# =========================================================
+BREAKS_COLUMNS = [
+    "break_id",
+    "purchase_date",
+    "purchased_from",
+    "reference_link",
+    "image_url",
+    "card_type",
+    "brand_or_league",
+    "set_name",
+    "year",
+    "box_name",
+    "box_type",
+    "qty_boxes",
+    "purchase_price",  # per box
+    "shipping",        # total
+    "tax",             # total
+    "total_price",     # all-in total for the break
+    "notes",
+    "status",          # OPEN / FINALIZED
+    "cards_count",
+    "cost_per_card",
+    "created_at",
+    "finalized_at",
+]
+
+BREAK_CARDS_COLUMNS = [
+    "break_card_id",
+    "break_id",
+    "card_name",
+    "card_number",
+    "variant",
+    "card_subtype",
+    "condition",
+    "reference_link",
+    "image_url",
+    "notes",
+    "created_at",
+    "pushed_to_inventory",  # YES/blank
+    "inventory_id",         # populated when pushed
+]
+
+
+def _ensure_headers(ws, needed_cols: list[str]) -> list[str]:
+    values = ws.get_all_values()
+    if not values:
+        ws.append_row(needed_cols)
+        return needed_cols
+
+    header = [h.strip() for h in values[0]]
+    existing_set = set(header)
+
+    missing = [c for c in needed_cols if c not in existing_set]
+    if missing:
+        new_header = header + missing
+        ws.update("1:1", [new_header], value_input_option="USER_ENTERED")
+        return new_header
+
+    return header
+
+
+# =========================================================
+# SportscardsPro / PriceCharting box pulling
+# =========================================================
+SPORT_TOKENS = {
+    "football": "Football",
+    "basketball": "Basketball",
+    "baseball": "Baseball",
+    "hockey": "Hockey",
+    "soccer": "Soccer",
+    "golf": "Golf",
+    "ufc": "UFC",
+    "wrestling": "Wrestling",
+}
+
+SEALED_TYPE_KEYWORDS = {
+    "mega-box": "Mega Box",
+    "blaster": "Blaster",
+    "hobby-box": "Hobby Box",
+    "hobby": "Hobby Box",
+    "fat-pack": "Fat Pack",
+    "value-pack": "Value Pack",
+    "tin": "Tin",
+    "booster-box": "Booster Box",
+    "booster-bundle": "Booster Bundle",
+    "elite-trainer-box": "Elite Trainer Box",
+    "etb": "Elite Trainer Box",
+}
+
+
+def _find_best_title(soup: BeautifulSoup) -> str:
+    og = soup.find("meta", property="og:title")
+    if og and og.get("content"):
+        return og["content"].strip()
+    h1 = soup.find("h1")
+    if h1 and h1.get_text(strip=True):
+        return h1.get_text(" ", strip=True)
+    if soup.title and soup.title.string:
+        return soup.title.string.strip()
+    return ""
+
+
+def _find_best_image(soup: BeautifulSoup) -> str:
+    og = soup.find("meta", property="og:image")
+    if og and og.get("content"):
+        return og["content"].strip()
+    tw = soup.find("meta", attrs={"name": "twitter:image"})
+    if tw and tw.get("content"):
+        return tw["content"].strip()
+    img = soup.find("img")
+    if img and img.get("src"):
+        return img["src"].strip()
+    return ""
+
+
+def _title_case_from_slug(slug: str) -> str:
+    return " ".join([w for w in (slug or "").replace("-", " ").split() if w]).title()
+
+
+def _infer_sealed_type_from_slug_or_title(slug: str, title: str) -> str:
+    t = ((slug or "") + " " + (title or "")).lower()
+    for k, v in SEALED_TYPE_KEYWORDS.items():
+        if k in t:
+            return v
+    return ""
+
+
+def _parse_set_slug_generic(set_slug: str) -> dict:
     """
-    Export all NON-exported break cards for this break_id to inventory,
-    allocating break total cost evenly across total card units (sum of quantities).
+    Example:
+      football-cards-2025-panini-donruss
     """
-    # reload fresh to avoid stale cached state during export
-    try:
-        st.cache_data.clear()
-    except Exception:
-        pass
+    tokens = [t for t in (set_slug or "").split("-") if t]
+    year = ""
+    for t in tokens:
+        if re.fullmatch(r"(19|20)\d{2}", t):
+            year = t
+            break
 
-    bdf = _coerce_breaks(load_sheet_df(BRK_WS))
-    cdf = _coerce_break_cards(load_sheet_df(BRK_CARDS_WS))
+    if tokens and tokens[0].lower() == "pokemon":
+        set_name = _title_case_from_slug("-".join(tokens[1:])) if len(tokens) > 1 else ""
+        return {"card_type": "Pokemon", "brand_or_league": "Pokemon TCG", "year": year, "set_name": set_name}
 
-    b = bdf[bdf["break_id"].astype(str).str.strip().eq(str(break_id).strip())]
-    if b.empty:
-        raise ValueError("Break not found.")
-    b = b.iloc[0].to_dict()
+    sport_token = tokens[0].lower() if tokens else ""
+    if sport_token in SPORT_TOKENS:
+        brand_or_league = SPORT_TOKENS[sport_token]
+        cleaned = tokens[:]
+        if len(cleaned) > 1 and cleaned[1].lower() == "cards":
+            cleaned = [cleaned[0]] + cleaned[2:]
+        cleaned_no_year = [t for t in cleaned[1:] if t != year]
+        set_name = _title_case_from_slug("-".join(cleaned_no_year)) if cleaned_no_year else ""
+        return {"card_type": "Sports", "brand_or_league": brand_or_league, "year": year, "set_name": set_name}
 
-    if str(b.get("status", "")).upper().strip() != "OPEN":
-        raise ValueError("This break is not OPEN (already finalized).")
+    return {"card_type": "", "brand_or_league": "", "year": year, "set_name": _title_case_from_slug(set_slug or "")}
 
-    cards = cdf[
-        cdf["break_id"].astype(str).str.strip().eq(str(break_id).strip())
-        & cdf["exported_to_inventory"].astype(str).str.upper().ne("YES")
-    ].copy()
 
-    if cards.empty:
-        raise ValueError("No un-exported cards found for this break.")
-
-    cards["quantity"] = _to_num(cards["quantity"]).replace(0, 1)
-    total_units = int(cards["quantity"].sum())
-    if total_units <= 0:
-        raise ValueError("Total card quantity is 0.")
-
-    total_cost = float(_to_num(pd.Series([b.get("total_price", 0.0)])).iloc[0])
-    if total_cost <= 0:
-        raise ValueError("Break total_price must be > 0.")
-
-    cost_per_card = total_cost / float(total_units)
-
-    purchase_date = _safe_str(b.get("purchase_date", "")).strip()
-    purchased_from = _safe_str(b.get("purchased_from", "")).strip() or "Break"
-    box_name = _safe_str(b.get("box_name", "")).strip()
-    box_link = _safe_str(b.get("reference_link", "")).strip()
-
-    created_inventory_ids_by_break_card_id = {}
-
-    for _, r in cards.iterrows():
-        break_card_id = _safe_str(r.get("break_card_id", "")).strip()
-        qty = int(_to_num(pd.Series([r.get("quantity", 1)])).iloc[0] or 1)
-        qty = max(qty, 1)
-
-        inv_ids = []
-        for _k in range(qty):
-            inventory_id = str(uuid.uuid4())[:8]
-            inv_ids.append(inventory_id)
-
-            card_type = _normalize_card_type(r.get("card_type", "Pokemon"))
-            brand = _safe_str(r.get("brand_or_league", "")).strip()
-            if not brand and card_type == "Pokemon":
-                brand = "Pokemon TCG"
-
-            product_type = _safe_str(r.get("product_type", "Card")).strip() or "Card"
-            if product_type not in ["Card", "Sealed", "Graded Card"]:
-                product_type = "Card"
-
-            sealed_product_type = ""
-            grading_company = ""
-            grade = ""
-            condition = _safe_str(r.get("condition", "")).strip()
-
-            if product_type == "Sealed":
-                # If you ever use sealed here
-                sealed_product_type = _safe_str(r.get("card_name", "")).strip()
-                condition = "Sealed"
-            elif product_type == "Graded Card":
-                grading_company = _safe_str(r.get("grading_company", "")).strip()
-                grade = _safe_str(r.get("grade", "")).strip()
-                condition = "Graded"
-            else:
-                # raw Card
-                if not condition:
-                    condition = "Near Mint"
-
-            notes = _safe_str(r.get("notes", "")).strip()
-            notes_prefix = f"Break {break_id}"
-            if box_name:
-                notes_prefix += f" | {box_name}"
-            if notes:
-                notes_prefix += f" | {notes}"
-
-            inv_row = {
-                "inventory_id": inventory_id,
-                "image_url": "",  # Inventory page can fill later; keeping schema clean
-                "product_type": product_type,
-                "sealed_product_type": sealed_product_type,
-                "card_type": card_type,
-                "brand_or_league": brand,
-                "set_name": _safe_str(r.get("set_name", "")).strip(),
-                "year": _safe_str(r.get("year", "")).strip(),
-                "card_name": _safe_str(r.get("card_name", "")).strip(),
-                "card_number": _safe_str(r.get("card_number", "")).strip(),
-                "variant": _safe_str(r.get("variant", "")).strip(),
-                "card_subtype": _safe_str(r.get("card_subtype", "")).strip(),
-                "grading_company": grading_company,
-                "grade": grade,
-                "reference_link": _safe_str(r.get("reference_link", "")).strip(),
-                "purchase_date": purchase_date,
-                "purchased_from": purchased_from,
-                "purchase_price": round(cost_per_card, 2),
-                "shipping": 0.0,
-                "tax": 0.0,
-                "total_price": round(cost_per_card, 2),
-                "condition": condition,
-                "notes": notes_prefix,
-                "created_at": pd.Timestamp.utcnow().isoformat(),
-                "inventory_status": STATUS_ACTIVE,
-                "listed_transaction_id": "",
-                "market_price": 0.0,
-                "market_value": 0.0,
-                "market_price_updated_at": "",
-            }
-
-            # If the break has a box link and the card doesn't, keep the card link blank;
-            # inventory rows represent the cards, not the sealed box.
-            _append_inventory_row(inv_row)
-
-        if break_card_id:
-            created_inventory_ids_by_break_card_id[break_card_id] = inv_ids
-
-    # Update break_cards exported_to_inventory + inventory_ids
-    values = ws_break_cards.get_all_values()
-    if values and len(values) >= 2:
-        header = [str(h or "").strip() for h in values[0]]
-        idx_break_card_id = _col_index(header, "break_card_id")
-        idx_exported = _col_index(header, "exported_to_inventory")
-        idx_inv_ids = _col_index(header, "inventory_ids")
-
-        updates = []
-        for sheet_row_num, row in enumerate(values[1:], start=2):
-            if idx_break_card_id is None or idx_break_card_id >= len(row):
-                continue
-            bc_id = str(row[idx_break_card_id]).strip()
-            if bc_id in created_inventory_ids_by_break_card_id:
-                inv_ids_str = ", ".join(created_inventory_ids_by_break_card_id[bc_id])
-
-                if idx_exported is not None:
-                    col_letter = _a1_col_letter(idx_exported + 1)
-                    updates.append({"range": f"{col_letter}{sheet_row_num}", "values": [["YES"]]})
-                if idx_inv_ids is not None:
-                    col_letter = _a1_col_letter(idx_inv_ids + 1)
-                    updates.append({"range": f"{col_letter}{sheet_row_num}", "values": [[inv_ids_str]]})
-
-        if updates:
-            ws_break_cards.batch_update(updates, value_input_option="USER_ENTERED")
-
-    # Update breaks row: finalize
-    br_row = _find_row_by_id(ws_breaks, "break_id", break_id)
-    if br_row is not None:
-        values = ws_breaks.get_all_values()
-        header = [str(h or "").strip() for h in values[0]] if values else breaks_headers
-
-        def _upd(col_name, val):
-            idx = _col_index(header, col_name)
-            if idx is None:
-                return None
-            col_letter = _a1_col_letter(idx + 1)
-            return {"range": f"{col_letter}{br_row}", "values": [[val]]}
-
-        payload = []
-        payload.append(_upd("status", "FINALIZED"))
-        payload.append(_upd("finalized_at", _now_iso_local()))
-        payload.append(_upd("cards_count", total_units))
-        payload.append(_upd("cost_per_card", round(cost_per_card, 4)))
-        payload = [p for p in payload if p is not None]
-        if payload:
-            ws_breaks.batch_update(payload, value_input_option="USER_ENTERED")
-
-    return {
-        "total_units": total_units,
-        "total_cost": total_cost,
-        "cost_per_card": cost_per_card,
-        "rows_added_to_inventory": total_units,
-        "box_link": box_link,
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def fetch_box_details(url: str) -> dict:
+    out = {
+        "image_url": "",
+        "reference_link": (url or "").strip(),
+        "card_type": "",
+        "brand_or_league": "",
+        "set_name": "",
+        "year": "",
+        "box_name": "",
+        "box_type": "",
     }
+    if not url or not str(url).strip():
+        return out
+
+    url = str(url).strip()
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+
+    soup = None
+    page_title = ""
+    image_url = ""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (CardTracker; +Streamlit)"}
+        r = requests.get(url, headers=headers, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+        page_title = _find_best_title(soup)
+        image_url = _find_best_image(soup)
+        if image_url:
+            image_url = urljoin(url, image_url)
+    except Exception:
+        soup = None
+        page_title = ""
+        image_url = ""
+
+    out["image_url"] = image_url
+
+    parts = [p for p in (path or "").split("/") if p]
+    set_slug, item_slug = None, None
+    if len(parts) >= 3 and parts[0].lower() == "game":
+        set_slug, item_slug = parts[1], parts[2]
+
+    if set_slug:
+        out.update(_parse_set_slug_generic(set_slug))
+
+    if page_title:
+        cleaned = page_title.replace("| Sports Cards Pro", "").replace("| PriceCharting", "").strip()
+        out["box_name"] = cleaned
+
+    out["box_type"] = _infer_sealed_type_from_slug_or_title(item_slug or "", out["box_name"])
+
+    # fallback inference
+    lowered = (url + " " + page_title).lower()
+    if not out["card_type"]:
+        if "pokemon" in lowered:
+            out["card_type"] = "Pokemon"
+            out["brand_or_league"] = out["brand_or_league"] or "Pokemon TCG"
+        elif "sportscardspro.com" in host:
+            out["card_type"] = "Sports"
+
+    # lock to only Pokemon/Sports
+    out["card_type"] = _normalize_card_type(out["card_type"])
+
+    return out
 
 
-# =========================
-# Load + normalize
-# =========================
-breaks_df = _coerce_breaks(load_sheet_df(BRK_WS))
-break_cards_df = _coerce_break_cards(load_sheet_df(BRK_CARDS_WS))
+# =========================================================
+# Load sheets
+# =========================================================
+ws_breaks = _open_ws(BREAKS_WS)
+ws_break_cards = _open_ws(BREAK_CARDS_WS)  # NOTE: you must create this tab in Sheets
 
+breaks_headers = _ensure_headers(ws_breaks, BREAKS_COLUMNS)
+break_cards_headers = _ensure_headers(ws_break_cards, BREAK_CARDS_COLUMNS)
+
+breaks_df = load_sheet_df(BREAKS_WS)
+break_cards_df = load_sheet_df(BREAK_CARDS_WS)
+
+breaks_df = _ensure_unique_columns(breaks_df)
+break_cards_df = _ensure_unique_columns(break_cards_df)
+
+# Normalize breaks df
+if breaks_df.empty:
+    breaks_df = pd.DataFrame(columns=BREAKS_COLUMNS)
+
+for c in BREAKS_COLUMNS:
+    if c not in breaks_df.columns:
+        breaks_df[c] = ""
+
+breaks_df["purchase_date_dt"] = _to_dt(breaks_df["purchase_date"])
+breaks_df["created_at_dt"] = _to_dt(breaks_df["created_at"])
+breaks_df["status"] = breaks_df["status"].replace("", "OPEN").fillna("OPEN").astype(str)
+
+# Normalize break cards df
+if break_cards_df.empty:
+    break_cards_df = pd.DataFrame(columns=BREAK_CARDS_COLUMNS)
+
+for c in BREAK_CARDS_COLUMNS:
+    if c not in break_cards_df.columns:
+        break_cards_df[c] = ""
+
+break_cards_df["created_at_dt"] = _to_dt(break_cards_df["created_at"])
+break_cards_df["pushed_to_inventory"] = break_cards_df["pushed_to_inventory"].astype(str).fillna("")
+
+
+# Convenience views (fixes your KeyError by ensuring the dt columns always exist)
 open_breaks = breaks_df[breaks_df["status"].astype(str).str.upper().eq("OPEN")].copy()
+open_breaks = open_breaks.sort_values(
+    by=[c for c in ["purchase_date_dt", "created_at_dt"] if c in open_breaks.columns],
+    ascending=[False, False][: len([c for c in ["purchase_date_dt", "created_at_dt"] if c in open_breaks.columns])],
+    na_position="last",
+)
 
-# ✅ safe sort (purchase_date_dt always exists now, but keep this defensive)
-sort_cols = [c for c in ["purchase_date_dt", "created_at"] if c in open_breaks.columns]
-if sort_cols:
-    open_breaks = open_breaks.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+finalized_breaks = breaks_df[breaks_df["status"].astype(str).str.upper().eq("FINALIZED")].copy()
+finalized_breaks = finalized_breaks.sort_values(
+    by=[c for c in ["finalized_at", "purchase_date_dt", "created_at_dt"] if c in finalized_breaks.columns],
+    ascending=False,
+    na_position="last",
+)
 
 
-# =========================
-# UI
-# =========================
-tab1, tab2 = st.tabs(["Breaks", "Break Cards → Inventory"])
+# =========================================================
+# Refresh button
+# =========================================================
+top_left, top_right = st.columns([3, 1])
+with top_right:
+    if st.button("🔄 Refresh from Sheets", use_container_width=True):
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.rerun()
 
-with tab1:
+
+# =========================================================
+# UI Tabs
+# =========================================================
+tab_breaks, tab_cards = st.tabs(["Breaks (Boxes)", "Cards in Break"])
+
+
+# ---------------------------------------------------------
+# TAB 1: Breaks
+# ---------------------------------------------------------
+with tab_breaks:
     st.subheader("Create a Break (Box Opening)")
+    st.caption("Paste a SportsCardsPro or PriceCharting box link and click Pull details to auto-fill the box fields.")
+
+    # --- Pull details row (outside form) ---
+    link_c1, link_c2 = st.columns([4, 1])
+    with link_c1:
+        break_reference_link = st.text_input(
+            "Box reference link (recommended)",
+            key="break_ref_link_input",
+            placeholder="https://www.sportscardspro.com/game/football-cards-2025-panini-donruss/mega-box",
+        )
+    with link_c2:
+        pull_box = st.button("Pull details", use_container_width=True)
+
+    if pull_box:
+        details = fetch_box_details(break_reference_link)
+        st.session_state["break_prefill"] = details
+
+        st.session_state["break_box_name"] = details.get("box_name", "")
+        st.session_state["break_card_type"] = details.get("card_type", "Pokemon") or "Pokemon"
+        st.session_state["break_brand_or_league"] = details.get("brand_or_league", "")
+        st.session_state["break_set_name"] = details.get("set_name", "")
+        st.session_state["break_year"] = details.get("year", "")
+        st.session_state["break_box_type"] = details.get("box_type", "")
+        st.session_state["break_image_url"] = details.get("image_url", "")
+
+        st.success("Pulled details. Review/edit below, then Add Break.")
+        st.rerun()
+
+    prefill = st.session_state.get("break_prefill", {}) or {}
+    img = st.session_state.get("break_image_url", "") or prefill.get("image_url", "")
+    if img:
+        try:
+            st.image(img, width=160)
+        except Exception:
+            st.caption("Image unavailable")
 
     with st.form("create_break_form", clear_on_submit=True):
-        c1, c2, c3 = st.columns([1, 1, 1])
+        c1, c2, c3, c4 = st.columns([1.1, 1.0, 1.0, 1.2])
         with c1:
-            purchase_date = st.date_input("Purchase Date", value=date.today())
+            purchase_date = st.date_input("Purchase Date*", value=date.today())
         with c2:
-            qty_boxes = st.number_input("# of Boxes", min_value=1, max_value=999, value=1, step=1)
+            qty_boxes = st.number_input("# of Boxes*", min_value=1, max_value=999, value=1, step=1)
         with c3:
-            purchase_price = st.number_input("Purchase Price (per box)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
-
-        c4, c5, c6 = st.columns([1.3, 1.0, 1.0])
+            purchase_price = st.number_input("Purchase Price (per box)*", min_value=0.0, value=0.0, step=1.0, format="%.2f")
         with c4:
-            box_name = st.text_input("Box Name (e.g., 2024 Prizm Blaster)")
-        with c5:
-            set_name = st.text_input("Set Name (optional)")
-        with c6:
-            year = st.text_input("Year (optional)")
-
-        c7, c8, c9 = st.columns([1, 1, 2])
-        with c7:
-            card_type = st.selectbox("Card Type", options=["Pokemon", "Sports"], index=0)
-        with c8:
-            brand_or_league = st.text_input("Brand / League (optional)", value=("Pokemon TCG" if card_type == "Pokemon" else ""))
-        with c9:
             purchased_from = st.text_input("Purchased From*", placeholder="Walmart, Target, LCS, Whatnot, etc.")
 
-        c10, c11 = st.columns([1, 2])
+        c5, c6, c7 = st.columns([2.0, 1.2, 1.0])
+        with c5:
+            box_name = st.text_input("Box Name*", value=st.session_state.get("break_box_name", ""))
+        with c6:
+            set_name = st.text_input("Set Name (optional)", value=st.session_state.get("break_set_name", ""))
+        with c7:
+            year = st.text_input("Year (optional)", value=st.session_state.get("break_year", ""))
+
+        c8, c9, c10 = st.columns([1.0, 1.4, 1.6])
+        with c8:
+            ct_default = st.session_state.get("break_card_type", "Pokemon")
+            ct_default = "Sports" if str(ct_default).strip().lower() == "sports" else "Pokemon"
+            card_type = st.selectbox("Card Type*", options=["Pokemon", "Sports"], index=(1 if ct_default == "Sports" else 0))
+        with c9:
+            default_brand = st.session_state.get("break_brand_or_league", "")
+            if not default_brand and card_type == "Pokemon":
+                default_brand = "Pokemon TCG"
+            brand_or_league = st.text_input("Brand / League (optional)", value=default_brand)
         with c10:
+            box_type = st.text_input("Box Type (optional)", value=st.session_state.get("break_box_type", ""), placeholder="Mega Box / Blaster / Hobby / ETB / etc.")
+
+        c11, c12 = st.columns([1.0, 2.0])
+        with c11:
             shipping = st.number_input("Shipping (total)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
             tax = st.number_input("Tax (total)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
-        with c11:
-            reference_link = st.text_input("PriceCharting Link for Box (optional)")
-            box_type = st.text_input("Box Type (optional)", placeholder="Hobby / Blaster / ETB / Booster Box / etc.")
+        with c12:
+            reference_link = st.text_input("Reference link (auto)", value=(break_reference_link or "").strip())
             notes = st.text_area("Notes (optional)", height=92)
 
-        submitted = st.form_submit_button("Add Break", use_container_width=True)
+        submitted = st.form_submit_button("Add Break", type="primary", use_container_width=True)
         if submitted:
+            missing = []
             if not purchased_from.strip():
-                st.error("Purchased From is required.")
+                missing.append("Purchased From")
+            if not box_name.strip():
+                missing.append("Box Name")
+
+            if missing:
+                st.error("Missing required fields: " + ", ".join(missing))
             else:
                 break_id = str(uuid.uuid4())[:8]
                 total_price = float(qty_boxes) * float(purchase_price) + float(shipping) + float(tax)
@@ -664,6 +732,7 @@ with tab1:
                     "purchase_date": purchase_date.isoformat(),
                     "purchased_from": purchased_from.strip(),
                     "reference_link": reference_link.strip(),
+                    "image_url": img or "",
                     "card_type": _normalize_card_type(card_type),
                     "brand_or_league": brand_or_league.strip(),
                     "set_name": set_name.strip(),
@@ -674,181 +743,228 @@ with tab1:
                     "purchase_price": float(purchase_price),
                     "shipping": float(shipping),
                     "tax": float(tax),
-                    "total_price": round(total_price, 2),
+                    "total_price": round(float(total_price), 2),
                     "notes": notes.strip(),
                     "status": "OPEN",
-                    "created_at": _now_iso_local(),
-                    "finalized_at": "",
                     "cards_count": "",
                     "cost_per_card": "",
+                    "created_at": _now_iso_utc(),
+                    "finalized_at": "",
                 }
+
                 _append_row(ws_breaks, breaks_headers, row)
+
+                # clear prefill for next entry
+                st.session_state["break_prefill"] = {}
+                for k in ["break_box_name", "break_card_type", "break_brand_or_league", "break_set_name", "break_year", "break_box_type", "break_image_url"]:
+                    st.session_state.pop(k, None)
+
                 st.success(f"Break created: {break_id}")
                 st.rerun()
 
     st.markdown("---")
-    st.subheader("Your Breaks")
-
-    if breaks_df.empty:
-        st.info("No breaks yet. Create one above.")
+    st.markdown("### Open Breaks")
+    if open_breaks.empty:
+        st.info("No OPEN breaks yet.")
     else:
-        view = breaks_df.copy()
-        if "purchase_date_dt" in view.columns:
-            view = view.sort_values(["purchase_date_dt", "created_at"], ascending=[False, False], na_position="last")
+        view = open_breaks[[
+            "break_id", "purchase_date", "box_name", "box_type", "card_type", "set_name", "year",
+            "qty_boxes", "total_price", "purchased_from", "reference_link"
+        ]].copy()
+        st.dataframe(view, use_container_width=True, hide_index=True)
 
-        show_cols = [
-            "break_id", "status", "purchase_date", "box_name", "qty_boxes",
-            "purchase_price", "shipping", "tax", "total_price",
-            "cards_count", "cost_per_card", "finalized_at"
-        ]
-        show_cols = [c for c in show_cols if c in view.columns]
-        st.dataframe(view[show_cols], use_container_width=True, hide_index=True)
+    st.markdown("### Finalized Breaks")
+    if finalized_breaks.empty:
+        st.caption("None yet.")
+    else:
+        view = finalized_breaks[[
+            "break_id", "purchase_date", "box_name", "card_type", "cards_count", "cost_per_card", "total_price", "finalized_at"
+        ]].copy()
+        st.dataframe(view, use_container_width=True, hide_index=True)
 
 
-with tab2:
+# ---------------------------------------------------------
+# TAB 2: Cards in Break
+# ---------------------------------------------------------
+with tab_cards:
     st.subheader("Add Cards from a Break")
+    st.caption("Select an OPEN break, enter each card you pulled, then finalize to push them into Inventory.")
 
     if open_breaks.empty:
-        st.info("No OPEN breaks found. Create a break first.")
+        st.info("Create an OPEN break first (Breaks tab).")
     else:
+        # break selector
         options = []
+        open_map = {}
         for _, r in open_breaks.iterrows():
             bid = _safe_str(r.get("break_id", "")).strip()
-            label = f"{bid} — {r.get('box_name','')}".strip()
-            options.append((label, bid))
+            label = f"{bid} — {_safe_str(r.get('box_name','')).strip()} ({_safe_str(r.get('purchase_date','')).strip()})"
+            options.append(label)
+            open_map[label] = r.to_dict()
 
-        labels = [o[0] for o in options]
-        label_choice = st.selectbox("Select an OPEN Break", options=labels, index=0)
-        break_id = dict(options).get(label_choice)
+        choice = st.selectbox("Select OPEN break", options=options, index=0)
+        br = open_map.get(choice, {}) or {}
 
-        brow = open_breaks[open_breaks["break_id"].astype(str).str.strip().eq(str(break_id).strip())]
-        b = brow.iloc[0].to_dict() if len(brow) else {}
+        break_id = _safe_str(br.get("break_id", "")).strip()
+        break_card_type = _normalize_card_type(br.get("card_type", "Pokemon"))
+        break_brand = _safe_str(br.get("brand_or_league", "")).strip()
+        break_set = _safe_str(br.get("set_name", "")).strip()
+        break_year = _safe_str(br.get("year", "")).strip()
+        break_purchase_date = _safe_str(br.get("purchase_date", "")).strip()
+        break_purchased_from = _safe_str(br.get("purchased_from", "")).strip()
+        break_box_name = _safe_str(br.get("box_name", "")).strip()
+        break_total_price = float(pd.to_numeric(br.get("total_price", 0), errors="coerce") or 0.0)
 
-        total_cost = float(_to_num(pd.Series([b.get("total_price", 0.0)])).iloc[0])
-        st.caption(f"Break Total Cost: ${total_cost:,.2f}")
+        # cards already added for this break
+        bc = break_cards_df[break_cards_df["break_id"].astype(str).str.strip().eq(break_id)].copy()
+        bc = bc.sort_values("created_at_dt", na_position="last")
 
-        cards_for_break = break_cards_df[
-            break_cards_df["break_id"].astype(str).str.strip().eq(str(break_id).strip())
-        ].copy()
-
-        # estimate cost per card based on un-exported units
-        units_unexported = 0
-        if not cards_for_break.empty:
-            tmp = cards_for_break.copy()
-            tmp["quantity"] = _to_num(tmp["quantity"]).replace(0, 1)
-            tmp = tmp[tmp["exported_to_inventory"].astype(str).str.upper().ne("YES")]
-            units_unexported = int(tmp["quantity"].sum())
-
-        if units_unexported > 0 and total_cost > 0:
-            st.caption(f"Un-exported card units entered: {units_unexported} → Estimated cost per card: ${total_cost/units_unexported:,.2f}")
-        else:
-            st.caption("Un-exported card units entered: 0")
-
-        st.markdown("### Add Card(s) from this Break")
-
+        st.markdown("#### Add a card")
         with st.form("add_break_card_form", clear_on_submit=True):
-            c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+            c1, c2, c3 = st.columns([2.0, 1.0, 1.0])
             with c1:
-                card_type = st.selectbox("Card Type*", options=["Pokemon", "Sports"], index=0)
+                card_name = st.text_input("Card name*", placeholder="Pikachu / Jayden Daniels / etc.")
             with c2:
-                product_type = st.selectbox("Product Type*", options=["Card", "Graded Card", "Sealed"], index=0)
+                card_number = st.text_input("Card # (optional)", placeholder="332")
             with c3:
-                quantity = st.number_input("Quantity*", min_value=1, max_value=999, value=1, step=1)
+                condition = st.selectbox("Condition*", CONDITION_OPTIONS, index=0)
+
+            c4, c5, c6 = st.columns([1.0, 1.2, 2.0])
             with c4:
-                condition = st.text_input("Condition (raw cards)", value="Near Mint")
-
-            c5, c6, c7 = st.columns([1, 1, 1])
+                variant = st.text_input("Variant (optional)", placeholder="Silver, Holo, Parallel, Insert…")
             with c5:
-                brand_or_league = st.text_input("Brand / League", value=("Pokemon TCG" if card_type == "Pokemon" else _safe_str(b.get("brand_or_league","")).strip()))
+                card_subtype = st.text_input("Card subtype (optional)", placeholder="Rookie, Insert, Parallel…")
             with c6:
-                set_name = st.text_input("Set Name", value=_safe_str(b.get("set_name", "")).strip())
+                card_ref = st.text_input("Card reference link (optional)", placeholder="(optional) PriceCharting/SCP link for the single card")
+
+            c7, c8 = st.columns([1.0, 2.0])
             with c7:
-                year = st.text_input("Year", value=_safe_str(b.get("year", "")).strip())
-
-            c8, c9, c10 = st.columns([1.6, 1.0, 1.4])
+                image_url = st.text_input("Image URL (optional)", placeholder="(optional)")
             with c8:
-                card_name = st.text_input("Card Name*")
-            with c9:
-                card_number = st.text_input("Card # (optional)")
-            with c10:
-                variant = st.text_input("Variant (optional)")
+                notes = st.text_area("Notes (optional)", height=80)
 
-            c11, c12, c13 = st.columns([1, 1, 2])
-            with c11:
-                card_subtype = st.text_input("Card Subtype (optional)", placeholder="Rookie, Insert, Parallel, etc.")
-            with c12:
-                grading_company = st.text_input("Grading Company (if graded)", placeholder="PSA / CGC / Beckett")
-                grade = st.text_input("Grade (if graded)", placeholder="10 / 9 / etc.")
-            with c13:
-                reference_link = st.text_input("PriceCharting Link for CARD (optional)")
-
-            notes = st.text_area("Notes (optional)", height=70)
-
-            submitted = st.form_submit_button("Add Card Line", use_container_width=True)
-            if submitted:
+            add_btn = st.form_submit_button("Add Card", type="primary", use_container_width=True)
+            if add_btn:
                 if not card_name.strip():
-                    st.error("Card Name is required.")
+                    st.error("Card name is required.")
                 else:
-                    bc_id = str(uuid.uuid4())[:8]
                     row = {
-                        "break_card_id": bc_id,
-                        "break_id": str(break_id).strip(),
-                        "card_type": _normalize_card_type(card_type),
-                        "product_type": product_type,
-                        "brand_or_league": brand_or_league.strip(),
-                        "set_name": set_name.strip(),
-                        "year": year.strip(),
+                        "break_card_id": str(uuid.uuid4())[:10],
+                        "break_id": break_id,
                         "card_name": card_name.strip(),
                         "card_number": card_number.strip(),
                         "variant": variant.strip(),
                         "card_subtype": card_subtype.strip(),
-                        "grading_company": grading_company.strip(),
-                        "grade": grade.strip(),
                         "condition": condition.strip(),
-                        "reference_link": reference_link.strip(),
-                        "quantity": int(quantity),
-                        "notes": notes.strip(),
-                        "created_at": _now_iso_local(),
-                        "exported_to_inventory": "NO",
-                        "inventory_ids": "",
+                        "reference_link": (card_ref or "").strip(),
+                        "image_url": (image_url or "").strip(),
+                        "notes": (notes or "").strip(),
+                        "created_at": _now_iso_utc(),
+                        "pushed_to_inventory": "",
+                        "inventory_id": "",
                     }
                     _append_row(ws_break_cards, break_cards_headers, row)
-                    st.success("Added.")
+                    st.success("Card added to break.")
                     st.rerun()
 
         st.markdown("---")
-        st.markdown("### Cards Entered for this Break")
-
-        if cards_for_break.empty:
+        st.markdown("#### Cards entered for this break")
+        if bc.empty:
             st.info("No cards entered yet.")
         else:
-            show_cols = [
-                "break_card_id", "card_type", "set_name", "year",
-                "card_name", "card_number", "variant", "quantity",
-                "exported_to_inventory", "inventory_ids"
-            ]
-            show_cols = [c for c in show_cols if c in cards_for_break.columns]
-            st.dataframe(cards_for_break[show_cols].copy(), use_container_width=True, hide_index=True)
+            show = bc[[
+                "break_card_id", "card_name", "card_number", "variant", "card_subtype",
+                "condition", "reference_link", "pushed_to_inventory", "inventory_id"
+            ]].copy()
+            st.dataframe(show, use_container_width=True, hide_index=True)
 
         st.markdown("---")
-        st.subheader("Finalize: Add these cards to Inventory")
+        st.markdown("#### Finalize Break → Push to Inventory")
+        st.caption("Finalize will evenly distribute the Break total cost across all cards (that have not been pushed yet).")
 
-        colA, colB = st.columns([1, 2])
-        with colA:
-            do_export = st.button("✅ Finalize Break → Add to Inventory", use_container_width=True)
-        with colB:
-            st.caption(
-                "Allocates the break’s total cost evenly across ALL un-exported card units (sum of Quantity). "
-                "Then creates one inventory row per unit and marks the break as FINALIZED."
-            )
+        # count cards not yet pushed
+        not_pushed = bc[bc["pushed_to_inventory"].astype(str).str.upper().ne("YES")].copy()
+        n_cards = int(len(not_pushed))
+        est_cpp = (break_total_price / n_cards) if n_cards > 0 else 0.0
 
-        if do_export:
-            try:
-                result = _export_break_to_inventory(str(break_id).strip())
-                st.success(
-                    f"Export complete. Added {result['rows_added_to_inventory']} inventory row(s). "
-                    f"Cost/card: ${result['cost_per_card']:,.2f}"
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Break Total Cost", f"${break_total_price:,.2f}")
+        k2.metric("Cards not pushed", f"{n_cards:,}")
+        k3.metric("Est. cost per card", f"${est_cpp:,.2f}" if n_cards else "$0.00")
+
+        finalize = st.button("✅ Finalize + Add Cards to Inventory", type="primary", use_container_width=True, disabled=(n_cards == 0))
+        if finalize:
+            if n_cards == 0:
+                st.warning("No cards to push (all cards already pushed, or none entered).")
+            else:
+                cost_per_card = round(float(break_total_price) / float(n_cards), 2)
+
+                pushed_ids = []
+                for _, row in not_pushed.iterrows():
+                    inv_id = str(uuid.uuid4())[:8]
+
+                    # Build inventory row matching your Inventory sheet structure
+                    inv_row = {
+                        "inventory_id": inv_id,
+                        "image_url": _safe_str(row.get("image_url", "")).strip(),
+                        "product_type": "Card",
+                        "sealed_product_type": "",
+                        "card_type": break_card_type,
+                        "brand_or_league": break_brand if break_brand else ("Pokemon TCG" if break_card_type == "Pokemon" else ""),
+                        "set_name": break_set,
+                        "year": break_year,
+                        "card_name": _safe_str(row.get("card_name", "")).strip(),
+                        "card_number": _safe_str(row.get("card_number", "")).strip(),
+                        "variant": _safe_str(row.get("variant", "")).strip(),
+                        "card_subtype": _safe_str(row.get("card_subtype", "")).strip(),
+                        "grading_company": "",
+                        "grade": "",
+                        "reference_link": _safe_str(row.get("reference_link", "")).strip(),
+                        "purchase_date": break_purchase_date or str(date.today()),
+                        "purchased_from": break_purchased_from or f"Break {break_id}",
+                        "purchase_price": float(cost_per_card),
+                        "shipping": 0.0,
+                        "tax": 0.0,
+                        "total_price": float(cost_per_card),
+                        "condition": _safe_str(row.get("condition", "Near Mint")).strip(),
+                        "notes": ("From break "
+                                  f"{break_id} — {break_box_name}. "
+                                  + _safe_str(row.get("notes", "")).strip()).strip(),
+                        "created_at": _now_iso_utc(),
+                        "inventory_status": "ACTIVE",
+                        "listed_transaction_id": "",
+                        "market_price": 0.0,
+                        "market_value": 0.0,
+                        "market_price_updated_at": "",
+                    }
+
+                    _append_inventory_row(inv_row)
+
+                    # Mark break_card row as pushed + store inv id
+                    _update_row_by_id(
+                        ws_break_cards,
+                        id_col_name="break_card_id",
+                        row_id=_safe_str(row.get("break_card_id", "")).strip(),
+                        updates={
+                            "pushed_to_inventory": "YES",
+                            "inventory_id": inv_id,
+                        },
+                    )
+
+                    pushed_ids.append(inv_id)
+
+                # Update break header (status + counts)
+                _update_row_by_id(
+                    ws_breaks,
+                    id_col_name="break_id",
+                    row_id=break_id,
+                    updates={
+                        "status": "FINALIZED",
+                        "cards_count": str(n_cards),
+                        "cost_per_card": str(cost_per_card),
+                        "finalized_at": _now_iso_utc(),
+                    },
                 )
+
+                st.success(f"Finalized break {break_id}. Added {len(pushed_ids)} card(s) to Inventory.")
                 st.rerun()
-            except Exception as e:
-                st.error(f"Export failed: {e}")
