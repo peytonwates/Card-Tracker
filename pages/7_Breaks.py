@@ -1,6 +1,7 @@
 # pages/7_Breaks.py
 import json
 import re
+import time
 import uuid
 from datetime import date
 from pathlib import Path
@@ -28,8 +29,36 @@ st.title("Breaks")
 # CONFIG (worksheets)
 # =========================================================
 INV_WS = st.secrets.get("inventory_worksheet", "inventory")
-BREAKS_WS = st.secrets.get("breaks_worksheet", "breaks")              # you already created this tab
-BREAK_CARDS_WS = st.secrets.get("break_cards_worksheet", "break_cards")  # CREATE THIS TAB in the sheet
+BREAKS_WS = st.secrets.get("breaks_worksheet", "breaks")                  # you already created this tab
+BREAK_CARDS_WS = st.secrets.get("break_cards_worksheet", "break_cards")   # CREATE THIS TAB in the sheet
+
+
+# =========================================================
+# Quota-safe helpers (BACKOFF like Transactions page)
+# =========================================================
+def _is_quota_429(e: Exception) -> bool:
+    try:
+        return (
+            isinstance(e, gspread.exceptions.APIError)
+            and getattr(e, "response", None) is not None
+            and e.response.status_code == 429
+        )
+    except Exception:
+        return False
+
+
+def _with_backoff(fn, tries: int = 6, base_sleep: float = 0.8):
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if _is_quota_429(e):
+                time.sleep(base_sleep * (2 ** i))
+                continue
+            raise
+    raise last
 
 
 # =========================================================
@@ -71,10 +100,26 @@ def get_gspread_client():
     raise KeyError('Missing secrets: add "gcp_service_account" (Cloud) or "service_account_json_path" (local).')
 
 
-def _open_ws(ws_name: str):
+@st.cache_resource
+def _get_spreadsheet(spreadsheet_id: str):
     client = get_gspread_client()
-    sh = client.open_by_key(st.secrets["spreadsheet_id"])
-    return sh.worksheet(ws_name)
+    return _with_backoff(lambda: client.open_by_key(spreadsheet_id))
+
+
+@st.cache_resource
+def _get_ws(spreadsheet_id: str, ws_name: str):
+    sh = _get_spreadsheet(spreadsheet_id)
+    return _with_backoff(lambda: sh.worksheet(ws_name))
+
+
+def _open_ws(ws_name: str):
+    return _get_ws(st.secrets["spreadsheet_id"], ws_name)
+
+
+@st.cache_data(show_spinner=False, ttl=45)
+def _read_sheet_values_cached(spreadsheet_id: str, ws_name: str) -> list[list[str]]:
+    ws = _get_ws(spreadsheet_id, ws_name)
+    return _with_backoff(lambda: ws.get_all_values())
 
 
 # =========================================================
@@ -88,10 +133,6 @@ def _safe_str(x) -> str:
 
 def _to_dt(x):
     return pd.to_datetime(x, errors="coerce")
-
-
-def _to_num(x):
-    return pd.to_numeric(x, errors="coerce").fillna(0.0)
 
 
 def _now_iso_utc():
@@ -124,9 +165,11 @@ def load_sheet_df(worksheet_name: str) -> pd.DataFrame:
     - duplicate headers
     - blank headers
     - ragged rows
+    And is quota-safe via cached reads + backoff.
     """
-    ws = _open_ws(worksheet_name)
-    values = ws.get_all_values()
+    spreadsheet_id = st.secrets["spreadsheet_id"]
+    values = _read_sheet_values_cached(spreadsheet_id, worksheet_name)
+
     if not values:
         return pd.DataFrame()
 
@@ -166,15 +209,15 @@ def _append_row(ws, header: list[str], row_dict: dict):
         if pd.isna(v):
             v = ""
         ordered.append(v)
-    ws.append_row(ordered, value_input_option="USER_ENTERED")
+    _with_backoff(lambda: ws.append_row(ordered, value_input_option="USER_ENTERED"))
 
 
 def _update_row_by_id(ws, id_col_name: str, row_id: str, updates: dict):
     """
     Updates a single row where id_col_name == row_id.
-    This reads the whole id column once (OK for your scale).
+    Uses quota-safe get_all_values.
     """
-    values = ws.get_all_values()
+    values = _with_backoff(lambda: ws.get_all_values())
     if not values or len(values) < 2:
         return False
 
@@ -194,17 +237,16 @@ def _update_row_by_id(ws, id_col_name: str, row_id: str, updates: dict):
     if not target_rownum:
         return False
 
-    # build new row values (only for keys present)
     row = values[target_rownum - 1]
-    # pad row to header length
     if len(row) < len(header):
         row = row + [""] * (len(header) - len(row))
+
     for k, v in updates.items():
         if k in header:
             row[header.index(k)] = v
 
     last_col_letter = gspread.utils.rowcol_to_a1(1, len(header)).split("1")[0]
-    ws.update(f"A{target_rownum}:{last_col_letter}{target_rownum}", [row], value_input_option="USER_ENTERED")
+    _with_backoff(lambda: ws.update(f"A{target_rownum}:{last_col_letter}{target_rownum}", [row], value_input_option="USER_ENTERED"))
     return True
 
 
@@ -280,7 +322,7 @@ def _internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str
 
 
 def _ensure_inventory_headers(ws_inv) -> list[str]:
-    first_row = ws_inv.row_values(1)
+    first_row = _with_backoff(lambda: ws_inv.row_values(1))
     if not first_row:
         sheet_headers = []
         for internal in DEFAULT_INV_COLUMNS:
@@ -290,7 +332,7 @@ def _ensure_inventory_headers(ws_inv) -> list[str]:
                 sheet_headers.append("Sealed Product Type")
             else:
                 sheet_headers.append(internal)
-        ws_inv.append_row(sheet_headers)
+        _with_backoff(lambda: ws_inv.append_row(sheet_headers, value_input_option="USER_ENTERED"))
         return sheet_headers
 
     existing = first_row
@@ -299,7 +341,7 @@ def _ensure_inventory_headers(ws_inv) -> list[str]:
     if missing_internal:
         additions = [_internal_to_sheet_header(h, existing) for h in missing_internal]
         new_headers = existing + additions
-        ws_inv.update("1:1", [new_headers])
+        _with_backoff(lambda: ws_inv.update("1:1", [new_headers], value_input_option="USER_ENTERED"))
         return new_headers
 
     return existing
@@ -309,6 +351,8 @@ def _normalize_card_type(val: str) -> str:
     s = _safe_str(val).strip().lower()
     if s == "sports" or "sport" in s:
         return "Sports"
+    if s == "pokemon" or "pok" in s:
+        return "Pokemon"
     return "Pokemon"
 
 
@@ -329,7 +373,7 @@ def _append_inventory_row(row_internal: dict):
         internal = header_to_internal.get(sheet_h, sheet_h)
         ordered.append(row_internal.get(internal, ""))
 
-    ws.append_row(ordered, value_input_option="USER_ENTERED")
+    _with_backoff(lambda: ws.append_row(ordered, value_input_option="USER_ENTERED"))
 
 
 # =========================================================
@@ -378,9 +422,10 @@ BREAK_CARDS_COLUMNS = [
 
 
 def _ensure_headers(ws, needed_cols: list[str]) -> list[str]:
-    values = ws.get_all_values()
+    # quota-safe + tolerant of blank sheets
+    values = _with_backoff(lambda: ws.get_all_values())
     if not values:
-        ws.append_row(needed_cols)
+        _with_backoff(lambda: ws.append_row(needed_cols, value_input_option="USER_ENTERED"))
         return needed_cols
 
     header = [h.strip() for h in values[0]]
@@ -389,14 +434,14 @@ def _ensure_headers(ws, needed_cols: list[str]) -> list[str]:
     missing = [c for c in needed_cols if c not in existing_set]
     if missing:
         new_header = header + missing
-        ws.update("1:1", [new_header], value_input_option="USER_ENTERED")
+        _with_backoff(lambda: ws.update("1:1", [new_header], value_input_option="USER_ENTERED"))
         return new_header
 
     return header
 
 
 # =========================================================
-# SportscardsPro / PriceCharting box pulling
+# SportscardsPro / PriceCharting box pulling (like Inventory "Pull details")
 # =========================================================
 SPORT_TOKENS = {
     "football": "Football",
@@ -437,16 +482,54 @@ def _find_best_title(soup: BeautifulSoup) -> str:
 
 
 def _find_best_image(soup: BeautifulSoup) -> str:
-    og = soup.find("meta", property="og:image")
-    if og and og.get("content"):
-        return og["content"].strip()
-    tw = soup.find("meta", attrs={"name": "twitter:image"})
-    if tw and tw.get("content"):
-        return tw["content"].strip()
+    """
+    Prefer real product photos when possible.
+    """
+    if soup is None:
+        return ""
+
+    for meta in [
+        soup.find("meta", property="og:image"),
+        soup.find("meta", attrs={"name": "twitter:image"}),
+    ]:
+        if meta and meta.get("content"):
+            return meta["content"].strip()
+
     img = soup.find("img")
     if img and img.get("src"):
         return img["src"].strip()
+
     return ""
+
+
+def _find_pricecharting_main_image(soup: BeautifulSoup) -> str:
+    """
+    Match the Inventory page behavior:
+    PriceCharting often exposes the true photo under 'More Photos' as storage.googleapis.com.
+    Prefer that if present.
+    """
+    if soup is None:
+        return ""
+
+    candidates = []
+
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+
+        if href.startswith("//"):
+            href = "https:" + href
+
+        if "storage.googleapis.com" in href and "images.pricecharting.com" in href:
+            label = ""
+            if a.parent:
+                label = " ".join(a.parent.stripped_strings)
+            if "main image" in (label or "").lower():
+                return href
+            candidates.append(href)
+
+    return candidates[0] if candidates else ""
 
 
 def _title_case_from_slug(slug: str) -> str:
@@ -490,8 +573,24 @@ def _parse_set_slug_generic(set_slug: str) -> dict:
     return {"card_type": "", "brand_or_league": "", "year": year, "set_name": _title_case_from_slug(set_slug or "")}
 
 
+def _clean_box_title(title: str) -> str:
+    if not title:
+        return ""
+    cleaned = title
+    # common suffixes
+    cleaned = cleaned.replace("| Sports Cards Pro", "").replace("| Sportscardspro", "")
+    cleaned = cleaned.replace("| PriceCharting", "").replace("| Pricecharting", "")
+    cleaned = cleaned.replace(" - Sports Cards Pro", "").replace(" - Sportscardspro", "")
+    cleaned = cleaned.replace(" - PriceCharting", "").replace(" - Pricecharting", "")
+    return cleaned.strip()
+
+
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def fetch_box_details(url: str) -> dict:
+    """
+    Paste a SportscardsPro OR PriceCharting box link and click Pull details.
+    This mirrors the Inventory page behavior (best title + best image selection).
+    """
     out = {
         "image_url": "",
         "reference_link": (url or "").strip(),
@@ -518,10 +617,18 @@ def fetch_box_details(url: str) -> dict:
         r = requests.get(url, headers=headers, timeout=12)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
+
         page_title = _find_best_title(soup)
-        image_url = _find_best_image(soup)
+
+        # Prefer PriceCharting main image when applicable (like Inventory)
+        if "pricecharting.com" in host:
+            image_url = _find_pricecharting_main_image(soup) or _find_best_image(soup)
+        else:
+            image_url = _find_best_image(soup)
+
         if image_url:
             image_url = urljoin(url, image_url)
+
     except Exception:
         soup = None
         page_title = ""
@@ -538,8 +645,7 @@ def fetch_box_details(url: str) -> dict:
         out.update(_parse_set_slug_generic(set_slug))
 
     if page_title:
-        cleaned = page_title.replace("| Sports Cards Pro", "").replace("| PriceCharting", "").strip()
-        out["box_name"] = cleaned
+        out["box_name"] = _clean_box_title(page_title)
 
     out["box_type"] = _infer_sealed_type_from_slug_or_title(item_slug or "", out["box_name"])
 
@@ -552,9 +658,7 @@ def fetch_box_details(url: str) -> dict:
         elif "sportscardspro.com" in host:
             out["card_type"] = "Sports"
 
-    # lock to only Pokemon/Sports
     out["card_type"] = _normalize_card_type(out["card_type"])
-
     return out
 
 
@@ -597,7 +701,7 @@ break_cards_df["created_at_dt"] = _to_dt(break_cards_df["created_at"])
 break_cards_df["pushed_to_inventory"] = break_cards_df["pushed_to_inventory"].astype(str).fillna("")
 
 
-# Convenience views (fixes your KeyError by ensuring the dt columns always exist)
+# Convenience views
 open_breaks = breaks_df[breaks_df["status"].astype(str).str.upper().eq("OPEN")].copy()
 open_breaks = open_breaks.sort_values(
     by=[c for c in ["purchase_date_dt", "created_at_dt"] if c in open_breaks.columns],
@@ -793,7 +897,6 @@ with tab_cards:
     if open_breaks.empty:
         st.info("Create an OPEN break first (Breaks tab).")
     else:
-        # break selector
         options = []
         open_map = {}
         for _, r in open_breaks.iterrows():
@@ -815,7 +918,6 @@ with tab_cards:
         break_box_name = _safe_str(br.get("box_name", "")).strip()
         break_total_price = float(pd.to_numeric(br.get("total_price", 0), errors="coerce") or 0.0)
 
-        # cards already added for this break
         bc = break_cards_df[break_cards_df["break_id"].astype(str).str.strip().eq(break_id)].copy()
         bc = bc.sort_values("created_at_dt", na_position="last")
 
@@ -882,7 +984,6 @@ with tab_cards:
         st.markdown("#### Finalize Break → Push to Inventory")
         st.caption("Finalize will evenly distribute the Break total cost across all cards (that have not been pushed yet).")
 
-        # count cards not yet pushed
         not_pushed = bc[bc["pushed_to_inventory"].astype(str).str.upper().ne("YES")].copy()
         n_cards = int(len(not_pushed))
         est_cpp = (break_total_price / n_cards) if n_cards > 0 else 0.0
@@ -903,7 +1004,6 @@ with tab_cards:
                 for _, row in not_pushed.iterrows():
                     inv_id = str(uuid.uuid4())[:8]
 
-                    # Build inventory row matching your Inventory sheet structure
                     inv_row = {
                         "inventory_id": inv_id,
                         "image_url": _safe_str(row.get("image_url", "")).strip(),
@@ -940,7 +1040,6 @@ with tab_cards:
 
                     _append_inventory_row(inv_row)
 
-                    # Mark break_card row as pushed + store inv id
                     _update_row_by_id(
                         ws_break_cards,
                         id_col_name="break_card_id",
@@ -953,7 +1052,6 @@ with tab_cards:
 
                     pushed_ids.append(inv_id)
 
-                # Update break header (status + counts)
                 _update_row_by_id(
                     ws_breaks,
                     id_col_name="break_id",
