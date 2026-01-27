@@ -965,16 +965,18 @@ with tab_new:
         st.info("No inventory yet — add your first item above.")
 
 # ---------------------------
+# ---------------------------
 # TAB 2: Inventory List
 # ---------------------------
 with tab_list:
     st.subheader("Inventory List")
 
-    df = st.session_state[INVENTORY_STATE_KEY].copy()
-    if df.empty:
+    df_all = st.session_state[INVENTORY_STATE_KEY].copy()
+    if df_all.empty:
         st.info("No inventory yet. Add items in the New Inventory tab.")
     else:
-        status_options = sorted(df["inventory_status"].dropna().unique().tolist())
+        # ---- filters (keep your existing filters) ----
+        status_options = sorted(df_all["inventory_status"].dropna().unique().tolist())
         default_status = [s for s in [STATUS_ACTIVE, STATUS_LISTED] if s in status_options]
         if not default_status and status_options:
             default_status = [status_options[0]]
@@ -984,17 +986,17 @@ with tab_list:
         with f1:
             status_filter = st.multiselect("Status", status_options, default=default_status)
         with f2:
-            product_filter = st.multiselect("Product Type", sorted(df["product_type"].dropna().unique().tolist()), default=[])
+            product_filter = st.multiselect("Product Type", sorted(df_all["product_type"].dropna().unique().tolist()), default=[])
         with f3:
-            type_filter = st.multiselect("Card Type", sorted(df["card_type"].dropna().unique().tolist()), default=[])
+            type_filter = st.multiselect("Card Type", sorted(df_all["card_type"].dropna().unique().tolist()), default=[])
         with f4:
-            league_filter = st.multiselect("Brand/League", sorted(df["brand_or_league"].dropna().unique().tolist()), default=[])
+            league_filter = st.multiselect("Brand/League", sorted(df_all["brand_or_league"].dropna().unique().tolist()), default=[])
         with f5:
-            set_filter = st.multiselect("Set", sorted(df["set_name"].dropna().unique().tolist()), default=[])
+            set_filter = st.multiselect("Set", sorted(df_all["set_name"].dropna().unique().tolist()), default=[])
         with f6:
             search = st.text_input("Search (name/set/notes/id)", placeholder="Type to filter…")
 
-        filtered = df.copy()
+        filtered = df_all.copy()
         if status_filter:
             filtered = filtered[filtered["inventory_status"].isin(status_filter)]
         if product_filter:
@@ -1024,23 +1026,118 @@ with tab_list:
                 )
             ]
 
-        st.caption(f"Showing {len(filtered):,} of {len(df):,} items")
+        st.caption(f"Showing {len(filtered):,} of {len(df_all):,} items")
 
-        display = filtered.copy()
+        # ---- compute Est Profit (market_price - total_price) ----
+        # ensure numeric (defensive)
+        for c in ["purchase_price", "shipping", "tax", "total_price", "market_price", "market_value"]:
+            if c in filtered.columns:
+                filtered[c] = pd.to_numeric(filtered[c], errors="coerce").fillna(0.0)
+
+        if "total_price" not in filtered.columns:
+            filtered["total_price"] = 0.0
+        if "market_price" not in filtered.columns:
+            filtered["market_price"] = 0.0
+
+        filtered["est_profit"] = (filtered["market_price"] - filtered["total_price"]).round(2)
+
+        # enforce condition invariants for display
+        filtered = filtered.copy()
+        filtered.loc[filtered["product_type"] == "Sealed", "condition"] = "Sealed"
+        filtered.loc[filtered["product_type"] == "Graded Card", "condition"] = "Graded"
+
+        # ---- Build compact editor view ----
+        show_cols = [
+            "inventory_id",
+            "image_url",
+            "purchase_price",
+            "shipping",
+            "tax",
+            "condition",
+            "inventory_status",
+            "market_price",
+            "est_profit",
+        ]
+        for c in show_cols:
+            if c not in filtered.columns:
+                filtered[c] = ""
+
+        display = filtered[show_cols].copy()
         display.insert(0, "delete", False)
 
-        display.loc[display["product_type"] == "Sealed", "condition"] = "Sealed"
-        display.loc[display["product_type"] == "Graded Card", "condition"] = "Graded"
+        # ---- Make rows/images larger (CSS) ----
+        # Note: Streamlit table internals can change; this is best-effort but works in most recent builds.
+        st.markdown(
+            """
+            <style>
+              /* Increase row height + image size inside Streamlit Data Editor */
+              div[data-testid="stDataFrame"] img {
+                height: 70px !important;
+                object-fit: contain !important;
+              }
+              div[data-testid="stDataFrame"] [role="row"] {
+                min-height: 78px !important;
+              }
+              div[data-testid="stDataFrame"] [role="gridcell"] {
+                align-items: center !important;
+              }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
 
         edited = st.data_editor(
             display,
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
+            height=720,  # bigger viewport so rows feel larger
             column_config={
                 "delete": st.column_config.CheckboxColumn("Delete", help="Check to delete this row"),
-                "image_url": st.column_config.ImageColumn("Image", width="small"),
-                "reference_link": st.column_config.LinkColumn("Reference link"),
+                "inventory_id": st.column_config.TextColumn("Inventory ID", disabled=True),
+                "image_url": st.column_config.ImageColumn("Image", width="medium"),
+                "purchase_price": st.column_config.NumberColumn("Purchase Price", format="$%.2f"),
+                "shipping": st.column_config.NumberColumn("Shipping", format="$%.2f"),
+                "tax": st.column_config.NumberColumn("Tax", format="$%.2f"),
+                "condition": st.column_config.TextColumn("Condition"),
+                "inventory_status": st.column_config.TextColumn("Status"),
+                "market_price": st.column_config.NumberColumn("Market Price", format="$%.2f"),
+                "est_profit": st.column_config.NumberColumn("Est Profit", format="$%.2f", disabled=True),
+            },
+            disabled=["est_profit"],  # keep computed
+        )
+
+        # ---- Profit/Loss highlighted view (read-only, styled) ----
+        # We show this right below so you still get the green/red rows you asked for.
+        view = edited.drop(columns=["delete"], errors="ignore").copy()
+        # re-coerce
+        for c in ["purchase_price", "shipping", "tax", "market_price", "est_profit"]:
+            if c in view.columns:
+                view[c] = pd.to_numeric(view[c], errors="coerce").fillna(0.0)
+
+        def _row_color(r):
+            try:
+                v = float(r.get("est_profit", 0.0) or 0.0)
+            except Exception:
+                v = 0.0
+            if v > 0:
+                return ["background-color: #e8f5e9"] * len(r)  # light green
+            if v < 0:
+                return ["background-color: #ffebee"] * len(r)  # light red
+            return [""] * len(r)
+
+        st.markdown("##### Profit / Loss highlight (preview)")
+        st.dataframe(
+            view.style.apply(_row_color, axis=1),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "image_url": st.column_config.ImageColumn("Image", width="medium"),
+                "purchase_price": st.column_config.NumberColumn("Purchase Price", format="$%.2f"),
+                "shipping": st.column_config.NumberColumn("Shipping", format="$%.2f"),
+                "tax": st.column_config.NumberColumn("Tax", format="$%.2f"),
+                "market_price": st.column_config.NumberColumn("Market Price", format="$%.2f"),
+                "est_profit": st.column_config.NumberColumn("Est Profit", format="$%.2f"),
             },
         )
 
@@ -1059,32 +1156,60 @@ with tab_list:
             )
 
         if apply_btn:
-            edited_rows = edited.drop(columns=["delete"], errors="ignore").copy()
-
-            for c in ["purchase_price", "shipping", "tax", "market_price", "market_value"]:
-                if c in edited_rows.columns:
-                    edited_rows[c] = pd.to_numeric(edited_rows[c], errors="coerce").fillna(0.0)
-
-            if set(["purchase_price", "shipping", "tax"]).issubset(edited_rows.columns):
-                edited_rows["total_price"] = (edited_rows["purchase_price"] + edited_rows["shipping"] + edited_rows["tax"]).round(2)
-
-            # ✅ ADD THIS RIGHT HERE (after numeric cleanup, before sheet update)
-            if "market_price" in edited_rows.columns and "market_value" in edited_rows.columns:
-                edited_rows["market_value"] = edited_rows["market_price"]
-
-            edited_rows.loc[edited_rows["product_type"] == "Sealed", "condition"] = "Sealed"
-            edited_rows.loc[edited_rows["product_type"] == "Sealed", ["variant", "card_subtype", "card_number", "grading_company", "grade"]] = ""
-
-            edited_rows.loc[edited_rows["product_type"] == "Graded Card", "condition"] = "Graded"
-            edited_rows.loc[edited_rows["product_type"] == "Graded Card", "sealed_product_type"] = ""
-
+            # ---- deletions ----
             delete_ids = edited.loc[edited["delete"] == True, "inventory_id"].astype(str).tolist()
-            # If it's a normal Card, clear sealed + grading fields
-            edited_rows.loc[edited_rows["product_type"] == "Card", ["sealed_product_type", "grading_company", "grade"]] = ""
 
+            # ---- merge edits back into full df so we don't wipe other columns ----
+            edited_core = edited.drop(columns=["delete"], errors="ignore").copy()
 
+            # numeric cleanup on edited columns
+            for c in ["purchase_price", "shipping", "tax", "market_price"]:
+                if c in edited_core.columns:
+                    edited_core[c] = pd.to_numeric(edited_core[c], errors="coerce").fillna(0.0)
 
-            sheets_update_rows(edited_rows)
+            # start from full df and apply updates for the rows that are in the filtered view
+            updated_full = df_all.copy()
+            updated_full["inventory_id"] = updated_full["inventory_id"].astype(str)
+
+            edited_core["inventory_id"] = edited_core["inventory_id"].astype(str)
+
+            # columns user is allowed to change in this compact view
+            updatable_cols = ["purchase_price", "shipping", "tax", "condition", "inventory_status", "market_price"]
+            updatable_cols = [c for c in updatable_cols if c in edited_core.columns and c in updated_full.columns]
+
+            # update row-by-row by inventory_id
+            edit_map = edited_core.set_index("inventory_id")[updatable_cols]
+            updated_full = updated_full.set_index("inventory_id")
+            # Only apply to ids present in edit_map (i.e., currently filtered rows)
+            for col in updatable_cols:
+                updated_full.loc[edit_map.index, col] = edit_map[col]
+
+            updated_full = updated_full.reset_index()
+
+            # recompute total_price if possible
+            if set(["purchase_price", "shipping", "tax"]).issubset(updated_full.columns):
+                updated_full["total_price"] = (
+                    pd.to_numeric(updated_full["purchase_price"], errors="coerce").fillna(0.0)
+                    + pd.to_numeric(updated_full["shipping"], errors="coerce").fillna(0.0)
+                    + pd.to_numeric(updated_full["tax"], errors="coerce").fillna(0.0)
+                ).round(2)
+
+            # keep market_value synced (your existing rule)
+            if "market_price" in updated_full.columns and "market_value" in updated_full.columns:
+                updated_full["market_value"] = updated_full["market_price"]
+
+            # enforce condition invariants
+            updated_full["condition"] = updated_full["condition"].astype(str)
+            updated_full.loc[updated_full["product_type"] == "Sealed", "condition"] = "Sealed"
+            updated_full.loc[updated_full["product_type"] == "Graded Card", "condition"] = "Graded"
+
+            # clear fields based on product_type rules (kept from your existing logic)
+            updated_full.loc[updated_full["product_type"] == "Sealed", ["variant", "card_subtype", "card_number", "grading_company", "grade"]] = ""
+            updated_full.loc[updated_full["product_type"] == "Graded Card", "sealed_product_type"] = ""
+            updated_full.loc[updated_full["product_type"] == "Card", ["sealed_product_type", "grading_company", "grade"]] = ""
+
+            # write updates + deletes
+            sheets_update_rows(updated_full)
 
             if delete_ids:
                 sheets_delete_rows_by_ids(delete_ids)
@@ -1093,6 +1218,7 @@ with tab_list:
             refresh_inventory_from_sheets()
             if not delete_ids:
                 st.success("Changes saved.")
+
 
 # ---------------------------
 # TAB 3: Inventory Summary
