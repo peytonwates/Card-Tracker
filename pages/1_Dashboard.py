@@ -80,7 +80,48 @@ def _to_dt(s):
     return pd.to_datetime(s, errors="coerce")
 
 def _to_num(s):
-    return pd.to_numeric(s, errors="coerce").fillna(0.0)
+    """
+    Robust numeric parser:
+    - handles currency strings like "$1,234.56"
+    - handles negatives like "(12.34)" or "-12.34"
+    - leaves real numerics alone
+    """
+    if isinstance(s, pd.Series):
+        x = s.copy()
+        # if already numeric, just coerce
+        if pd.api.types.is_numeric_dtype(x):
+            return pd.to_numeric(x, errors="coerce").fillna(0.0)
+
+        x = x.astype(str).str.strip()
+
+        # convert (123.45) => -123.45
+        x = x.str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+
+        # remove $ and commas and spaces
+        x = x.str.replace(r"[\$,]", "", regex=True)
+
+        # handle blanks / "nan"
+        x = x.replace({"": "0", "nan": "0", "None": "0"})
+
+        return pd.to_numeric(x, errors="coerce").fillna(0.0)
+
+    # scalar
+    try:
+        if s is None:
+            return 0.0
+        if isinstance(s, (int, float, np.number)):
+            return float(s) if not (isinstance(s, float) and np.isnan(s)) else 0.0
+        t = str(s).strip()
+        if t.startswith("(") and t.endswith(")"):
+            t = "-" + t[1:-1]
+        t = re.sub(r"[\$,]", "", t)
+        if t in {"", "nan", "None"}:
+            return 0.0
+        v = pd.to_numeric(t, errors="coerce")
+        return float(v) if pd.notna(v) else 0.0
+    except Exception:
+        return 0.0
+
 
 def _month_start(dt_series):
     d = _to_dt(dt_series)
