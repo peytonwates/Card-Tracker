@@ -259,9 +259,9 @@ def _fetch_market_prices(link: str) -> dict:
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
 
-        # --------
-        # PriceCharting parse (kept from your existing logic)
-        # --------
+        # -------------------------
+        # PriceCharting parse
+        # -------------------------
         if "pricecharting.com" in u:
             nodes = soup.select(".price.js-price")
             prices = []
@@ -279,33 +279,65 @@ def _fetch_market_prices(link: str) -> dict:
                 out["psa10"] = float(prices[5] or 0.0)
             return out
 
-        # --------
-        # SportsCardsPro parse (regex from full page text)
-        # Typical lines:
-        #   Ungraded $129.99
-        #   Grade 9 $219.73
-        #   PSA 10 $653.75
-        # --------
+        # -------------------------
+        # SportsCardsPro parse (robust)
+        # Works even when formatting isn't "Ungraded $123.45" on one line.
+        # -------------------------
         text = soup.get_text("\n", strip=True)
 
-        def _money(pattern: str) -> float:
+        def _money_from_text(label_patterns):
+            """
+            Find a label like 'Ungraded' or 'PSA 10' and then capture the closest $ value on the same
+            line or within the next couple of lines.
+            """
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            # precompile $ amount pattern
+            dollar_pat = re.compile(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+
+            label_res = [re.compile(p, flags=re.IGNORECASE) for p in label_patterns]
+
+            for i, ln in enumerate(lines):
+                if any(rx.search(ln) for rx in label_res):
+                    # try same line
+                    m = dollar_pat.search(ln)
+                    if m:
+                        return float(m.group(1).replace(",", ""))
+                    # try next 1-3 lines
+                    for j in range(1, 4):
+                        if i + j < len(lines):
+                            m2 = dollar_pat.search(lines[i + j])
+                            if m2:
+                                return float(m2.group(1).replace(",", ""))
+            return 0.0
+
+        # First try direct flexible regex over full text (fast path)
+        def _money_regex(pattern: str) -> float:
             m = re.search(pattern, text, flags=re.IGNORECASE)
             if not m:
                 return 0.0
             return float(m.group(1).replace(",", ""))
 
-        out["raw"] = _money(r"Ungraded\s*\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-        out["psa10"] = _money(r"PSA\s*10\s*\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+        # Flexible patterns (allow "Ungraded", "Raw", etc with extra words between)
+        raw_val = _money_regex(r"(?:Ungraded|Raw)\b[^$]{0,50}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+        psa10_val = _money_regex(r"PSA\s*10\b[^$]{0,50}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+        psa9_val = _money_regex(r"(?:PSA\s*9|Grade\s*9)\b[^$]{0,50}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
 
-        psa9_val = _money(r"PSA\s*9\s*\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+        # If any missing, fallback to label-nearby scan (handles awkward formatting)
+        if raw_val <= 0:
+            raw_val = _money_from_text([r"\bUngraded\b", r"\bRaw\b"])
+        if psa10_val <= 0:
+            psa10_val = _money_from_text([r"\bPSA\s*10\b"])
         if psa9_val <= 0:
-            psa9_val = _money(r"Grade\s*9\s*\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-        out["psa9"] = psa9_val
+            psa9_val = _money_from_text([r"\bPSA\s*9\b", r"\bGrade\s*9\b"])
 
+        out["raw"] = float(raw_val or 0.0)
+        out["psa9"] = float(psa9_val or 0.0)
+        out["psa10"] = float(psa10_val or 0.0)
         return out
 
     except Exception:
         return out
+
 
 
 def _repull_market_values_to_inventory_sheet():
@@ -552,9 +584,16 @@ MISC_WS = st.secrets.get("misc_worksheet", "misc")
 # Load all data
 # =========================
 inv = load_sheet_df(INV_WS)
-txn = load_sheet_df(TXN_WS)
+
+# Keep an unfiltered copy for LISTED lookups (do NOT filter to SOLD)
+txn_all = load_sheet_df(TXN_WS)
+
+# Existing logic below will normalize + filter txn to SOLD for sales reporting
+txn = txn_all.copy()
+
 grd = load_sheet_df(GRD_WS)
 misc = load_sheet_df(MISC_WS)
+
 
 
 # =========================
@@ -707,6 +746,56 @@ else:
     tx_date_col = None
     tx_inv_col = None
     txn = pd.DataFrame(columns=["__sold_dt", "__sold_month", "__inventory_id", "__sold_price", "__fees", "__net", "__txn_card_type"])
+
+# =========================
+# LIST PRICE LOOKUP (from txn_all)
+# - Pull most recent LISTED transaction per inventory_id
+# =========================
+list_price_by_inv_id = {}
+
+if "txn_all" in locals() and isinstance(txn_all, pd.DataFrame) and not txn_all.empty:
+    txa = _ensure_unique_columns(txn_all.copy())
+
+    txa_status_col = _pick_col(txa, "status", None) or _pick_col(txa, "tx_status", None)
+    txa_inv_col = _pick_col(txa, "inventory_id", None) or _pick_col(txa, "inv_id", None)
+
+    # list price column candidates (in your transactions sheet)
+    txa_list_price_col = (
+        _pick_col(txa, "list_price", None)
+        or _pick_col(txa, "listed_price", None)
+        or _pick_col(txa, "asking_price", None)
+        or _pick_col(txa, "price", None)
+    )
+
+    # date column candidates for “most recent”
+    txa_dt_col = (
+        _pick_col(txa, "listed_date", None)
+        or _pick_col(txa, "date", None)
+        or _pick_col(txa, "created_at", None)
+        or _pick_col(txa, "timestamp", None)
+    )
+
+    if txa_status_col and txa_inv_col and txa_list_price_col:
+        txa["__status"] = txa[txa_status_col].astype(str).str.upper().str.strip()
+        txa["__inventory_id"] = txa[txa_inv_col].apply(lambda x: _safe_str(x).strip())
+
+        # LISTED rows only
+        txa = txa[txa["__status"].eq("LISTED")].copy()
+
+        # parse list price
+        txa["__list_price"] = _to_num(txa[txa_list_price_col])
+
+        # parse date if present
+        if txa_dt_col and txa_dt_col in txa.columns:
+            txa["__dt"] = _to_dt(txa[txa_dt_col])
+        else:
+            txa["__dt"] = pd.NaT
+
+        # keep the most recent row per inventory_id
+        txa = txa.sort_values(by=["__inventory_id", "__dt"], na_position="last")
+        last_rows = txa.groupby("__inventory_id", as_index=False).tail(1)
+
+        list_price_by_inv_id = last_rows.set_index("__inventory_id")["__list_price"].to_dict()
 
 
 # =========================
@@ -1133,7 +1222,7 @@ with tab_bs:
         # =========================================================
         # TOP TABLE (NEW): Listed Items overview
         #  - # of items
-        #  - List Price Total
+        #  - List Price Total  (NOW pulled from transactions LISTED rows by inventory_id)
         #  - Market Value of Listed Items
         # Uses holdings-as-of (inv_holdings) so SOLD items are excluded correctly
         # =========================================================
@@ -1145,9 +1234,6 @@ with tab_bs:
             # normalize status + card_type
             inv_listed["__status_upper"] = inv_listed[inv_status_col].astype(str).str.upper().str.strip()
             inv_listed = inv_listed[inv_listed["__status_upper"].eq("LISTED")].copy()
-
-            # pick list_price column if it exists (supports future renames/dupes)
-            inv_list_price_col = _pick_col(inv_listed, "list_price", None) or _pick_col(inv_listed, "listed_price", None)
 
             if inv_listed.empty:
                 listed_df = pd.DataFrame([{
@@ -1162,11 +1248,12 @@ with tab_bs:
                 # Market value from cached inventory pricing
                 inv_listed["__mv"] = _to_num(inv_listed.get("__market_price", 0.0))
 
-                # List price (if missing, treat as 0)
-                if inv_list_price_col and inv_list_price_col in inv_listed.columns:
-                    inv_listed["__list_price"] = _to_num(inv_listed[inv_list_price_col])
-                else:
-                    inv_listed["__list_price"] = 0.0
+                # -----------------------------
+                # UPDATED: List Price from Transactions (LISTED) by inventory_id
+                # Requires: list_price_by_inv_id dict built earlier from txn_all
+                # -----------------------------
+                inv_listed["__inv_id_key"] = inv_listed[inv_id_col].apply(lambda x: _safe_str(x).strip())
+                inv_listed["__list_price"] = inv_listed["__inv_id_key"].map(list_price_by_inv_id).fillna(0.0)
 
                 rows = []
                 for ct in ["Sports", "Pokemon"]:
@@ -1202,6 +1289,7 @@ with tab_bs:
             .set_table_styles(_styler_table_header())
         )
         st.dataframe(sty_listed, use_container_width=True, hide_index=True)
+
 
 
         # =========================================================
