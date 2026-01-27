@@ -1,6 +1,7 @@
 # pages/1_Dashboard.py
 import json
 import re
+import time
 from pathlib import Path
 from datetime import date
 
@@ -16,13 +17,39 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
-
-
 # =========================
 # Page config
 # =========================
 st.set_page_config(page_title="Dashboard", layout="wide")
 st.title("Dashboard")
+
+
+# =========================
+# Quota-safe helpers (same pattern as other pages)
+# =========================
+def _is_quota_429(e: Exception) -> bool:
+    try:
+        return (
+            isinstance(e, gspread.exceptions.APIError)
+            and getattr(e, "response", None) is not None
+            and e.response.status_code == 429
+        )
+    except Exception:
+        return False
+
+
+def _with_backoff(fn, tries: int = 6, base_sleep: float = 0.8):
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if _is_quota_429(e):
+                time.sleep(base_sleep * (2 ** i))
+                continue
+            raise
+    raise last
 
 
 # =========================
@@ -64,10 +91,20 @@ def get_gspread_client():
     raise KeyError('Missing secrets: add "gcp_service_account" (Cloud) or "service_account_json_path" (local).')
 
 
-def _open_ws(ws_name: str):
+@st.cache_resource
+def _get_spreadsheet(spreadsheet_id: str):
     client = get_gspread_client()
-    sh = client.open_by_key(st.secrets["spreadsheet_id"])
-    return sh.worksheet(ws_name)
+    return _with_backoff(lambda: client.open_by_key(spreadsheet_id))
+
+
+@st.cache_resource
+def _get_ws(spreadsheet_id: str, ws_name: str):
+    sh = _get_spreadsheet(spreadsheet_id)
+    return _with_backoff(lambda: sh.worksheet(ws_name))
+
+
+def _open_ws(ws_name: str):
+    return _get_ws(st.secrets["spreadsheet_id"], ws_name)
 
 
 # =========================
@@ -78,21 +115,26 @@ def _safe_str(x) -> str:
         return ""
     return str(x)
 
+
 def _to_dt(s):
     return pd.to_datetime(s, errors="coerce")
+
 
 def _to_num(s):
     return pd.to_numeric(s, errors="coerce").fillna(0.0)
 
+
 def _month_start(dt_series):
     d = _to_dt(dt_series)
     return d.dt.to_period("M").dt.to_timestamp()
+
 
 def _fmt_money(x):
     try:
         return f"${float(x):,.2f}"
     except Exception:
         return "$0.00"
+
 
 def _pct(a, b):
     try:
@@ -102,6 +144,7 @@ def _pct(a, b):
     if b == 0:
         return 0.0
     return float(a) / b
+
 
 def _style_red_green(val):
     try:
@@ -114,12 +157,13 @@ def _style_red_green(val):
         return "color: #0b6b2f; font-weight: 800;"
     return ""
 
+
 def _base_col(c: str) -> str:
-    # normalize any renamed dup columns like "inventory_id__dup1"
     s = _safe_str(c)
     if "__dup" in s:
         s = s.split("__dup")[0]
     return s
+
 
 def _ensure_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -146,10 +190,6 @@ def _ensure_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-
-
-
-
 def _col_lookup(df: pd.DataFrame) -> dict:
     """
     Map lower(base_col_name) -> actual column name (first occurrence wins).
@@ -161,9 +201,11 @@ def _col_lookup(df: pd.DataFrame) -> dict:
             m[key] = c
     return m
 
+
 def _pick_col(df: pd.DataFrame, name: str, fallback: str = None):
     m = _col_lookup(df)
     return m.get(name.lower(), fallback)
+
 
 def _apply_period_filter(df: pd.DataFrame, dt_col: str, year_choice: str, month_choice: str) -> pd.DataFrame:
     if df is None or df.empty or dt_col not in df.columns:
@@ -181,7 +223,6 @@ def _apply_period_filter(df: pd.DataFrame, dt_col: str, year_choice: str, month_
             pass
 
     if month_choice != "All":
-        # month_choice expected like "2026-01"
         try:
             m = pd.to_datetime(month_choice + "-01", errors="coerce")
             if pd.notna(m):
@@ -192,8 +233,8 @@ def _apply_period_filter(df: pd.DataFrame, dt_col: str, year_choice: str, month_
     out = out.drop(columns=["__dt_filter"], errors="ignore")
     return out
 
+
 def _bucket_product(product_type, grading_company, grade, condition, inv_status) -> str:
-    # Avoid AttributeError from ints
     pt = _safe_str(product_type).strip().lower()
     comp = _safe_str(grading_company).strip()
     grd = _safe_str(grade).strip()
@@ -206,29 +247,24 @@ def _bucket_product(product_type, grading_company, grade, condition, inv_status)
     if "sealed" in pt:
         return "Sealed"
 
-    # "Graded Card" product_type or any populated grade/company indicates graded
     if "graded" in pt or comp or grd or ("graded" in cond):
         return "Graded Cards"
 
     return "Cards"
 
+
 def _normalize_card_type(val: str) -> str:
-    """
-    User requirement: ONLY Pokemon or Sports. Never show 'Other'.
-    Default any unknown/blank to Pokemon (fixes cases like Charizard promo falling into Other).
-    """
     s = _safe_str(val).strip().lower()
     if s == "sports":
         return "Sports"
     if s == "pokemon":
         return "Pokemon"
-    # handle variants
     if "sport" in s:
         return "Sports"
     if "pok" in s or "pokemon" in s:
         return "Pokemon"
-    # default
     return "Pokemon"
+
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def _fetch_pricecharting_prices(link: str) -> dict:
@@ -248,12 +284,17 @@ def _fetch_pricecharting_prices(link: str) -> dict:
             m = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", t)
             prices.append(float(m.group(1).replace(",", "")) if m else 0.0)
 
+        # Slot mapping in your current approach:
+        # raw = slot 1 (index 0)
+        # psa9 = slot 4 (index 3)
+        # psa10 = slot 6 (index 5)
         if len(prices) >= 1:
-            out["raw"] = float(prices[0] or 0.0)   # slot 1
+            out["raw"] = float(prices[0] or 0.0)
         if len(prices) >= 4:
-            out["psa9"] = float(prices[3] or 0.0)  # slot 4
+            out["psa9"] = float(prices[3] or 0.0)
         if len(prices) >= 6:
-            out["psa10"] = float(prices[5] or 0.0) # slot 6
+            out["psa10"] = float(prices[5] or 0.0)
+
         return out
     except Exception:
         return out
@@ -263,15 +304,18 @@ def _repull_market_values_to_inventory_sheet():
     """
     Runs on Dashboard Refresh:
     - reads inventory sheet rows
-    - computes market_price/market_value from pricecharting:
-        - if status == GRADING OR not graded => raw
-        - if graded and grade contains 10 => psa10
-        - if graded and grade contains 9 => psa9
-        - else => raw
-    - writes back to inventory in ONE column update per market col (quota friendly)
+    - computes:
+        market_price  = RAW PriceCharting price
+        market_value  = depends on grade/status:
+            - if status == GRADING OR not graded => RAW
+            - if graded and grade contains 10 => PSA10
+            - if graded and grade contains 9  => PSA9
+            - else => RAW
+    - writes back in ONE update per column (quota friendly)
+    - DOES NOT overwrite non-PriceCharting rows (keeps existing values)
     """
     ws = _open_ws(st.secrets.get("inventory_worksheet", "inventory"))
-    values = ws.get_all_values()
+    values = _with_backoff(lambda: ws.get_all_values())
     if not values or len(values) < 2:
         return 0
 
@@ -279,12 +323,10 @@ def _repull_market_values_to_inventory_sheet():
     rows = values[1:]
     nrows = len(rows)
 
-    # helpers
-    def base(h): 
+    def base(h):
         return h.split("__dup")[0] if "__dup" in h else h
 
     def norm(h: str) -> str:
-        # makes: "Product Type" -> "product_type"
         return re.sub(r"\s+", "_", (h or "").strip().lower())
 
     def col_idx(name: str):
@@ -293,7 +335,6 @@ def _repull_market_values_to_inventory_sheet():
             if norm(base(h)) == target:
                 return i
         return None
-
 
     # ensure required headers exist (append if missing)
     need = [
@@ -307,20 +348,18 @@ def _repull_market_values_to_inventory_sheet():
         "market_value",
         "market_price_updated_at",
     ]
-
     changed = False
     for nm in need:
         if col_idx(nm) is None:
             header.append(nm)
             changed = True
     if changed:
-        ws.update("1:1", [header], value_input_option="USER_ENTERED")
-        # pad existing rows to new header length
+        _with_backoff(lambda: ws.update("1:1", [header], value_input_option="USER_ENTERED"))
         for i in range(len(rows)):
             if len(rows[i]) < len(header):
                 rows[i] = rows[i] + [""] * (len(header) - len(rows[i]))
 
-    # re-resolve col indices (after header update)
+    # resolve col indices
     i_ref = col_idx("reference_link")
     i_status = col_idx("inventory_status")
     i_pt = col_idx("product_type")
@@ -331,51 +370,75 @@ def _repull_market_values_to_inventory_sheet():
     i_mv = col_idx("market_value")
     i_mpu = col_idx("market_price_updated_at")
 
+    # ensure rows are padded
+    for i in range(len(rows)):
+        if len(rows[i]) < len(header):
+            rows[i] = rows[i] + [""] * (len(header) - len(rows[i]))
 
-    # repull should not rely on cached results if user explicitly pressed refresh
+    # refresh should not rely on cached results
     try:
         _fetch_pricecharting_prices.clear()
     except Exception:
         pass
 
-
-    market_prices = []
-    market_updated_ats = []
     now_iso = pd.Timestamp.utcnow().isoformat()
+
+    # Start with existing values so we don't overwrite non-PC links
+    def _num_cell(x):
+        s = _safe_str(x).strip().replace("$", "").replace(",", "")
+        if s == "":
+            return ""
+        try:
+            return float(pd.to_numeric(s, errors="coerce"))
+        except Exception:
+            return ""
+
+    existing_mp = [r[i_mp] if i_mp is not None else "" for r in rows]
+    existing_mv = [r[i_mv] if i_mv is not None else "" for r in rows]
+    existing_mpu = [r[i_mpu] if i_mpu is not None else "" for r in rows]
+
+    out_mp = [[_num_cell(v)] for v in existing_mp]
+    out_mv = [[_num_cell(v)] for v in existing_mv]
+    out_mpu = [[v] for v in existing_mpu]
+
     updated = 0
 
-    for r in rows:
-        link = (r[i_ref] if i_ref is not None and i_ref < len(r) else "").strip()
+    for idx, r in enumerate(rows):
+        link = (r[i_ref] if i_ref is not None else "").strip()
         if "pricecharting.com" not in link.lower():
-            market_prices.append([0.0])
-            market_updated_ats.append([""])
-            continue
+            continue  # leave as-is
 
-        status = (r[i_status] if i_status is not None and i_status < len(r) else "").strip().upper()
-        pt = (r[i_pt] if i_pt is not None and i_pt < len(r) else "").strip().lower()
-        comp = (r[i_comp] if i_comp is not None and i_comp < len(r) else "").strip()
-        grade = (r[i_grade] if i_grade is not None and i_grade < len(r) else "").strip().upper()
-        cond = (r[i_cond] if i_cond is not None and i_cond < len(r) else "").strip().lower()
+        status = (r[i_status] if i_status is not None else "").strip().upper()
+        pt = (r[i_pt] if i_pt is not None else "").strip().lower()
+        comp = (r[i_comp] if i_comp is not None else "").strip()
+        grade = (r[i_grade] if i_grade is not None else "").strip().upper()
+        cond = (r[i_cond] if i_cond is not None else "").strip().lower()
 
         prices = _fetch_pricecharting_prices(link)
+
+        raw_price = float(prices.get("raw", 0.0) or 0.0)
+        psa9 = float(prices.get("psa9", 0.0) or 0.0)
+        psa10 = float(prices.get("psa10", 0.0) or 0.0)
 
         is_sealed = "sealed" in pt
         is_grading = (status == "GRADING")
         is_graded = ("graded" in pt) or bool(comp) or bool(grade) or ("graded" in cond)
 
-        mv = float(prices.get("raw", 0.0) or 0.0)  # default raw
+        # market_price = raw always (for PriceCharting rows)
+        out_mp[idx] = [raw_price]
+
+        # market_value depends on grade/status
+        mv = raw_price
         if (not is_sealed) and (not is_grading) and is_graded:
             if "10" in grade:
-                mv = float(prices.get("psa10", 0.0) or 0.0)
+                mv = psa10 if psa10 else raw_price
             elif "9" in grade:
-                mv = float(prices.get("psa9", 0.0) or 0.0)
+                mv = psa9 if psa9 else raw_price
+        out_mv[idx] = [mv]
 
-        market_prices.append([mv])
-        market_updated_ats.append([now_iso])
+        out_mpu[idx] = [now_iso]
         updated += 1
 
-
-    # write market_price column in ONE call
     def a1_col_letter(n: int) -> str:
         letters = ""
         while n:
@@ -383,38 +446,30 @@ def _repull_market_values_to_inventory_sheet():
             letters = chr(65 + r) + letters
         return letters
 
-    mp_col_letter = a1_col_letter(i_mp + 1)
-    ws.update(f"{mp_col_letter}2:{mp_col_letter}{nrows+1}", market_prices, value_input_option="USER_ENTERED")
+    if nrows > 0:
+        mp_col_letter = a1_col_letter(i_mp + 1)
+        mv_col_letter = a1_col_letter(i_mv + 1)
+        mpu_col_letter = a1_col_letter(i_mpu + 1)
 
-    mv_col_letter = a1_col_letter(i_mv + 1)
-    ws.update(f"{mv_col_letter}2:{mv_col_letter}{nrows+1}", market_prices, value_input_option="USER_ENTERED")
-
-    mpu_col_letter = a1_col_letter(i_mpu + 1)
-    ws.update(f"{mpu_col_letter}2:{mpu_col_letter}{nrows+1}", market_updated_ats, value_input_option="USER_ENTERED")
+        _with_backoff(lambda: ws.update(f"{mp_col_letter}2:{mp_col_letter}{nrows+1}", out_mp, value_input_option="USER_ENTERED"))
+        _with_backoff(lambda: ws.update(f"{mv_col_letter}2:{mv_col_letter}{nrows+1}", out_mv, value_input_option="USER_ENTERED"))
+        _with_backoff(lambda: ws.update(f"{mpu_col_letter}2:{mpu_col_letter}{nrows+1}", out_mpu, value_input_option="USER_ENTERED"))
 
     return updated
 
 
-
-
-
-
 def _styler_table_header():
-    # Column header background + bold
     return [
         {"selector": "th", "props": [("background-color", "#0f172a"), ("color", "white"), ("font-weight", "800")]},
         {"selector": "td", "props": [("font-weight", "500")]},
     ]
 
+
 def _style_group_and_total_rows(df: pd.DataFrame, first_col: str):
-    """
-    Shade + bold group header rows (no leading spaces) and totals row.
-    """
     def _row_style(row):
         v = _safe_str(row.get(first_col, ""))
         if v.strip().lower() in {"totals", "total"}:
             return ["background-color: #dbeafe; font-weight: 900;"] * len(row)
-        # group rows are top-level (no leading spaces)
         if v.startswith("  "):
             return [""] * len(row)
         return ["background-color: #eef2ff; font-weight: 800;"] * len(row)
@@ -426,12 +481,12 @@ def _style_group_and_total_rows(df: pd.DataFrame, first_col: str):
 def load_sheet_df(worksheet_name: str) -> pd.DataFrame:
     """
     Robust sheet read that tolerates:
-    - duplicate headers (gspread.get_all_records fails)
+    - duplicate headers
     - blank headers
     - ragged rows
     """
     ws = _open_ws(worksheet_name)
-    values = ws.get_all_values()
+    values = _with_backoff(lambda: ws.get_all_values())
 
     if not values:
         return pd.DataFrame()
@@ -439,7 +494,6 @@ def load_sheet_df(worksheet_name: str) -> pd.DataFrame:
     header = [str(h or "").strip() for h in values[0]]
     rows = values[1:] if len(values) > 1 else []
 
-    # Fill blank headers and make them unique (so pandas + streamlit won't crash)
     fixed = []
     seen = {}
     for i, h in enumerate(header):
@@ -451,7 +505,6 @@ def load_sheet_df(worksheet_name: str) -> pd.DataFrame:
             seen[name] += 1
             fixed.append(f"{name}__dup{seen[name]}")
 
-    # Pad rows to header length
     width = len(fixed)
     norm_rows = []
     for r in rows:
@@ -462,9 +515,7 @@ def load_sheet_df(worksheet_name: str) -> pd.DataFrame:
             r = r[:width]
         norm_rows.append(r)
 
-    df = pd.DataFrame(norm_rows, columns=fixed)
-    return df
-
+    return pd.DataFrame(norm_rows, columns=fixed)
 
 
 # =========================
@@ -473,24 +524,18 @@ def load_sheet_df(worksheet_name: str) -> pd.DataFrame:
 top_left, top_right = st.columns([3, 1])
 with top_right:
     if st.button("🔄 Refresh from Sheets", use_container_width=True):
-        # 1) Repull + write market values to inventory sheet
         try:
             n = _repull_market_values_to_inventory_sheet()
             st.success(f"Market values refreshed for {n} row(s). Reloading…")
         except Exception as e:
             st.warning(f"Market refresh ran into an issue: {e}. Reloading anyway…")
 
-        # 2) Clear caches and reload
+        # Clear ONLY data cache (keep resource cache to avoid re-auth / extra quota)
         try:
             st.cache_data.clear()
         except Exception:
             pass
-        try:
-            st.cache_resource.clear()
-        except Exception:
-            pass
         st.rerun()
-
 
 
 # =========================
@@ -526,20 +571,17 @@ if not inv.empty:
     inv_purchase_date_col = _pick_col(inv, "purchase_date", "purchase_date")
     inv_ref_col = _pick_col(inv, "reference_link", "reference_link")
 
-
     inv_product_type_col = _pick_col(inv, "product_type", "product_type")
     inv_card_type_col = _pick_col(inv, "card_type", "card_type")
     inv_grade_col = _pick_col(inv, "grade", "grade")
     inv_company_col = _pick_col(inv, "grading_company", "grading_company")
     inv_condition_col = _pick_col(inv, "condition", "condition")
 
-    # Market price (optional cached)
-    inv_market_col = _pick_col(inv, "market_price", None) or _pick_col(inv, "market_value", None)
+    inv_market_col = _pick_col(inv, "market_value", None) or _pick_col(inv, "market_price", None)
 
     for needed in [inv_id_col, inv_status_col, inv_total_col, inv_purchase_date_col, inv_ref_col]:
         if needed not in inv.columns:
             inv[needed] = ""
-
 
     for needed in [inv_product_type_col, inv_card_type_col, inv_grade_col, inv_company_col, inv_condition_col]:
         if needed not in inv.columns:
@@ -549,17 +591,9 @@ if not inv.empty:
     inv[inv_total_col] = _to_num(inv[inv_total_col])
     inv["__purchase_dt"] = _to_dt(inv[inv_purchase_date_col])
 
-    # Base: read from sheet if present (market_price or market_value)
     inv["__market_price"] = 0.0
     if inv_market_col and inv_market_col in inv.columns:
         inv["__market_price"] = _to_num(inv[inv_market_col])
-
-    # If missing in sheet, pull from PriceCharting:
-    # - Raw uses slot 1 (.price.js-price index 1)
-    # - PSA9 uses slot 4
-    # - PSA10 uses slot 6
-
-
 else:
     inv_id_col = "inventory_id"
     inv_status_col = "inventory_status"
@@ -590,11 +624,8 @@ if not txn.empty:
     tx_inv_col = _pick_col(txn, "inventory_id", None) or _pick_col(txn, "inv_id", None)
     tx_sold_price_col = _pick_col(txn, "sold_price", None) or _pick_col(txn, "sale_price", None) or _pick_col(txn, "price", None)
 
-    # fees can be "fees_total" or "fees"
     tx_fees_total_col = _pick_col(txn, "fees_total", None)
     tx_fees_col = _pick_col(txn, "fees", None) or _pick_col(txn, "platform_fees", None) or _pick_col(txn, "fee", None)
-
-    # IMPORTANT: txn may already have card_type column (use it if present)
     tx_card_type_col = _pick_col(txn, "card_type", None)
 
     if tx_date_col is None:
@@ -605,7 +636,6 @@ if not txn.empty:
     if tx_inv_col is None:
         txn["__inventory_id"] = ""
     else:
-        # keep as string to prevent 2.01E+06 mismatch
         txn["__inventory_id"] = txn[tx_inv_col].apply(lambda x: _safe_str(x).strip())
 
     if tx_sold_price_col is None:
@@ -613,9 +643,6 @@ if not txn.empty:
     else:
         txn["__sold_price"] = _to_num(txn[tx_sold_price_col])
 
-    # -----------------------------
-    # Fees
-    # -----------------------------
     if tx_fees_total_col and tx_fees_total_col in txn.columns:
         txn["__fees"] = _to_num(txn[tx_fees_total_col])
     elif tx_fees_col and tx_fees_col in txn.columns:
@@ -623,25 +650,17 @@ if not txn.empty:
     else:
         txn["__fees"] = 0.0
 
-    # -----------------------------
-    # NEW: status + net_proceeds alignment with Transactions page
-    # - Only include SOLD transactions
-    # - Prefer net_proceeds written by 3_Transactions.py (sold - fees + shipping_charged)
-    # -----------------------------
     tx_status_col = _pick_col(txn, "status", None) or _pick_col(txn, "tx_status", None)
     tx_net_proceeds_col = _pick_col(txn, "net_proceeds", None) or _pick_col(txn, "net", None)
     tx_ship_charged_col = _pick_col(txn, "shipping_charged", None) or _pick_col(txn, "shipping", None)
 
-    # Only count SOLD rows (ignore LISTED / CANCELLED)
     if tx_status_col and tx_status_col in txn.columns:
         txn["__status"] = txn[tx_status_col].astype(str).str.upper().str.strip()
         txn = txn[txn["__status"].eq("SOLD")].copy()
 
-    # Net: prefer the sheet's computed net_proceeds
     if tx_net_proceeds_col and tx_net_proceeds_col in txn.columns:
         txn["__net"] = _to_num(txn[tx_net_proceeds_col])
     else:
-        # fallback if net_proceeds column doesn't exist yet
         if tx_ship_charged_col and tx_ship_charged_col in txn.columns:
             txn["__ship_charged"] = _to_num(txn[tx_ship_charged_col])
         else:
@@ -650,13 +669,10 @@ if not txn.empty:
 
     txn["__sold_month"] = _month_start(txn["__sold_dt"])
 
-    # normalize transaction card_type if it exists
     if tx_card_type_col and tx_card_type_col in txn.columns:
         txn["__txn_card_type"] = txn[tx_card_type_col].apply(_normalize_card_type)
     else:
         txn["__txn_card_type"] = ""
-
-
 else:
     tx_date_col = None
     tx_inv_col = None
@@ -681,11 +697,9 @@ if not grd.empty:
     g_psa10_col = _pick_col(grd, "psa10_price", "psa10_price")
     g_psa9_col = _pick_col(grd, "psa9_price", "psa9_price")
 
-    # grading cost columns (canonical)
     g_fee_init_col = _pick_col(grd, "grading_fee_initial", "grading_fee_initial")
     g_add_col = _pick_col(grd, "additional_costs", "additional_costs")
 
-    # fallback legacy columns
     g_fee_per_card_col = _pick_col(grd, "grading_fee_per_card", None)
     g_extra_costs_col = _pick_col(grd, "extra_costs", None)
 
@@ -699,7 +713,6 @@ if not grd.empty:
         if c not in grd.columns:
             grd[c] = 0.0
 
-    # Coalesce legacy -> canonical
     if g_fee_per_card_col and g_fee_per_card_col in grd.columns:
         base = grd[g_fee_init_col].astype(str)
         fb = grd[g_fee_per_card_col].astype(str)
@@ -720,7 +733,6 @@ if not grd.empty:
     grd["__grading_cost"] = _to_num(grd[g_fee_init_col]) + _to_num(grd[g_add_col])
     grd["__purchase_total"] = _to_num(grd[g_purchase_total_col])
 
-    # Cost month for “Other Expenses -> Grading Cost”
     if g_sub_dt_col and g_sub_dt_col in grd.columns:
         grd["__grading_dt"] = _to_dt(grd[g_sub_dt_col])
     else:
@@ -799,7 +811,7 @@ tab_bs, tab_forecast, tab_bench = st.tabs(["Balance Sheet", "Expenses + Forecast
 
 
 # =========================================================
-# TAB 1: Balance Sheet (match your screenshot layout + filter + drilldowns)
+# TAB 1: Balance Sheet
 # =========================================================
 with tab_bs:
     st.subheader("Balance Sheet (Filtered)")
@@ -808,7 +820,6 @@ with tab_bs:
     with f1:
         year_choice = st.selectbox("Year", options=year_opts, index=0)
     with f2:
-        # Month options: if year selected, limit months to that year
         if year_choice != "All":
             try:
                 y = int(year_choice)
@@ -820,40 +831,26 @@ with tab_bs:
 
         month_choice = st.selectbox("Month", options=month_opts, index=0)
 
-    # Apply filters
     inv_f = _apply_period_filter(inv, "__purchase_dt", year_choice, month_choice) if not inv.empty else inv
     txn_f = _apply_period_filter(txn, "__sold_dt", year_choice, month_choice) if not txn.empty else txn
     grd_f = _apply_period_filter(grd, "__grading_dt", year_choice, month_choice) if not grd.empty else grd
     misc_f = _apply_period_filter(misc, "__dt", year_choice, month_choice) if not misc.empty else misc
 
-    # Join helpers (for sales bucket/card_type)
-    # Join helpers (for sales bucket/card_type)
     inv_by_id = {}
     if not inv.empty:
-        # CRITICAL FIX: normalize inventory_id to string keys to prevent "2.01E+06" / numeric mismatches
         inv_keyed = inv.copy()
         inv_keyed[inv_id_col] = inv_keyed[inv_id_col].apply(lambda x: _safe_str(x).strip())
         inv_by_id = inv_keyed.set_index(inv_id_col, drop=False).to_dict("index")
 
-    # ---------------------------------------------------------
-    # NEW: Build in-flight grading cost map by inventory_id
-    # (Adds grading fees into COGS on Dashboard for GRADING items,
-    #  but ONLY when they haven't been synced into inventory yet.)
-    # ---------------------------------------------------------
     grading_cost_by_inv_id = {}
-
     if not grd.empty:
         g = grd.copy()
-
-        # Ensure columns exist
         for col in ["inventory_id", "grading_fee_initial", "additional_costs", "status", "synced_to_inventory"]:
             if col not in g.columns:
                 g[col] = ""
 
-        # Normalize keys
         g["__inv_id"] = g["inventory_id"].apply(lambda x: _safe_str(x).strip())
 
-        # Safe numeric parse
         def _num(v):
             try:
                 s = _safe_str(v).strip().replace("$", "").replace(",", "")
@@ -869,8 +866,6 @@ with tab_bs:
         g["__status"] = g["status"].astype(str).str.upper().str.strip()
         g["__synced"] = g["synced_to_inventory"].astype(str).str.upper().str.strip()
 
-        # Only include rows NOT synced yet, and still in-flight
-        # Include RETURNED too (until synced_to_inventory=YES), because inventory may not have been updated yet
         inflight = g[
             (g["__synced"] != "YES")
             & (g["__status"].isin(["SUBMITTED", "IN_GRADING", "SENT", "IN_TRANSIT", "RETURNED"]))
@@ -880,20 +875,14 @@ with tab_bs:
             inflight["__grading_cost"] = (inflight["__fee"] + inflight["__add"]).fillna(0.0)
             grading_cost_by_inv_id = inflight.groupby("__inv_id")["__grading_cost"].sum().to_dict()
 
-
     def _tx_card_type_from_inv(inv_id: str) -> str:
         rec = inv_by_id.get(_safe_str(inv_id).strip())
         if rec is None:
-            # NEVER return Other
             return "Pokemon"
         ct = _normalize_card_type(rec.get(inv_card_type_col, ""))
         return ct
 
     def _tx_card_type_rowaware(row) -> str:
-        """
-        Prefer txn's own card_type column if present, else map to inventory.
-        This guarantees your Charizard Promo sale stays Pokemon even if the join key is funky.
-        """
         try:
             if "__txn_card_type" in row and _safe_str(row["__txn_card_type"]).strip():
                 return _normalize_card_type(row["__txn_card_type"])
@@ -913,11 +902,7 @@ with tab_bs:
             rec.get(inv_status_col, ""),
         )
 
-    # ---------------------------------------------------------
-    # AS-OF Holdings logic (exclude SOLD items from Assets)
-    # ---------------------------------------------------------
     def _period_end_dt(year_choice: str, month_choice: str) -> pd.Timestamp:
-        # end of selected month/year; if All, use "today" end-of-day
         today = pd.Timestamp(date.today())
         if month_choice != "All":
             m = pd.to_datetime(month_choice + "-01", errors="coerce")
@@ -931,7 +916,6 @@ with tab_bs:
                 pass
         return today + pd.Timedelta(hours=23, minutes=59, seconds=59)
 
-    # SOLD date by inventory_id (use ALL txn, not txn_f, so Assets always excludes sold items)
     sold_dt_by_id = {}
     if not txn.empty and "__sold_dt" in txn.columns and "__inventory_id" in txn.columns:
         tmp = txn[["__inventory_id", "__sold_dt"]].copy()
@@ -939,7 +923,6 @@ with tab_bs:
         if not tmp.empty:
             sold_dt_by_id = tmp.groupby("__inventory_id")["__sold_dt"].min().to_dict()
 
-    # Build holdings-as-of inventory (this is what Assets should use)
     asof_cutoff = _period_end_dt(year_choice, month_choice)
 
     inv_holdings = pd.DataFrame()
@@ -955,11 +938,6 @@ with tab_bs:
             & (inv_holdings["__sold_dt"].isna() | (inv_holdings["__sold_dt"] > asof_cutoff))
         ].copy()
 
-
-
-    # -------------------------
-    # ASSETS (Inventory breakdown)
-    # -------------------------
     left, right = st.columns([1.15, 1.0])
 
     with left:
@@ -971,8 +949,6 @@ with tab_bs:
         else:
             inv_asof = inv_holdings.copy()
 
-
-            # FIX: remove "Other" entirely
             inv_asof["__card_type"] = inv_asof[inv_card_type_col].apply(_normalize_card_type)
             inv_asof["__bucket"] = inv_asof.apply(
                 lambda r: _bucket_product(
@@ -986,20 +962,13 @@ with tab_bs:
             )
             inv_asof["__cost"] = _to_num(inv_asof[inv_total_col])
 
-            # NEW: add in-flight grading cost into COGS for items currently GRADING (not yet synced)
             inv_asof["__inv_id_key"] = inv_asof[inv_id_col].apply(lambda x: _safe_str(x).strip())
             inv_asof["__grading_cost_inflight"] = inv_asof["__inv_id_key"].map(grading_cost_by_inv_id).fillna(0.0)
 
             inv_asof["__status_upper"] = inv_asof[inv_status_col].astype(str).str.upper().str.strip()
             mask_grading = inv_asof["__status_upper"] == "GRADING"
-
             inv_asof.loc[mask_grading, "__cost"] = inv_asof.loc[mask_grading, "__cost"] + inv_asof.loc[mask_grading, "__grading_cost_inflight"]
 
-
-            # Market value source:
-            # - Use inventory.market_price/market_value if present
-            # - For GRADING items, still use that same raw market value (NOT PSA9/10)
-            # - If missing, market value = 0
             inv_asof["__mv"] = 0.0
             if "__market_price" in inv_asof.columns:
                 inv_asof["__mv"] = _to_num(inv_asof["__market_price"])
@@ -1012,7 +981,6 @@ with tab_bs:
 
                 rows.append([ct, int(len(sub)), float(sub["__cost"].sum()), float(sub["__mv"].sum())])
 
-                # Order like your screenshot
                 bucket_order = ["Cards", "Grading In-Process", "Graded Cards", "Sealed"]
                 for b in bucket_order:
                     sb = sub[sub["__bucket"] == b]
@@ -1020,9 +988,6 @@ with tab_bs:
 
             assets_df = pd.DataFrame(rows, columns=["Inventory", "# of items", "Cost of Goods", "Market Value"])
 
-
-            # Totals row
-            # Totals row (DO NOT sum display rows — it double counts)
             if not assets_df.empty:
                 total_items = int(len(inv_asof))
                 total_cost = float(inv_asof["__cost"].sum())
@@ -1041,27 +1006,20 @@ with tab_bs:
                     ignore_index=True
                 )
 
-
-
         sty = (
             _style_group_and_total_rows(assets_df, "Inventory")
             .format({"Cost of Goods": "${:,.2f}", "Market Value": "${:,.2f}"})
             .set_table_styles(_styler_table_header())
         )
-
         st.dataframe(sty, use_container_width=True, hide_index=True)
 
         st.markdown("### Other Expenses")
 
         misc_total = float(misc_f["__amount"].sum()) if not misc_f.empty else 0.0
-
         other_df = pd.DataFrame(
-            [
-                ["Misc", int(len(misc_f)) if not misc_f.empty else 0, misc_total],
-            ],
+            [["Misc", int(len(misc_f)) if not misc_f.empty else 0, misc_total]],
             columns=["Other Expenses", "# of lines", "Dollar Cost"],
         )
-
         other_df = pd.concat(
             [
                 other_df,
@@ -1077,9 +1035,6 @@ with tab_bs:
         sty2 = _style_group_and_total_rows(other_df, "Other Expenses").format({"Dollar Cost": "${:,.2f}"}).set_table_styles(_styler_table_header())
         st.dataframe(sty2, use_container_width=True, hide_index=True)
 
-    # -------------------------
-    # SALES + SUMMARY (right side)
-    # -------------------------
     with right:
         st.markdown("### Sales")
 
@@ -1091,12 +1046,9 @@ with tab_bs:
             sales_count_total = 0
         else:
             tx = txn_f.copy()
-
-            # card type + bucket
             tx["__card_type"] = tx.apply(_tx_card_type_rowaware, axis=1)
             tx["__bucket"] = tx["__inventory_id"].map(_tx_product_bucket).fillna("Cards")
 
-            # TRUE totals (do NOT derive from sales_df display rows)
             sales_count_total = int(len(tx))
             fees_total = float(tx["__fees"].sum())
             net_total = float(tx["__net"].sum())
@@ -1107,17 +1059,14 @@ with tab_bs:
                 if sub.empty:
                     continue
 
-                # parent row = NET proceeds
                 rows.append([ct, int(len(sub)), float(sub["__net"].sum())])
 
-                # child rows = NET proceeds by bucket
                 for b in ["Cards", "Graded Cards", "Sealed"]:
                     sb = sub[sub["__bucket"] == b]
                     rows.append([f"  {b}", int(len(sb)), float(sb["__net"].sum())])
 
             sales_df = pd.DataFrame(rows, columns=["Sales", "# of Sales", "Dollar Sales"])
 
-            # Totals row = from tx (not from sales_df)
             if not sales_df.empty:
                 sales_df = pd.concat(
                     [
@@ -1138,14 +1087,8 @@ with tab_bs:
         )
         st.dataframe(sty3, use_container_width=True, hide_index=True)
 
-
-        sty3 = _style_group_and_total_rows(sales_df, "Sales").format({"Dollar Sales": "${:,.2f}"}).set_table_styles(_styler_table_header())
-        st.dataframe(sty3, use_container_width=True, hide_index=True)
-
         st.markdown("### Summary")
 
-        # Expenses = inventory purchases + misc + grading (in selected window)
-        # Inventory spend should include unsynced grading cost (RETURNED or in-flight)
         if not inv_f.empty:
             tmp_inv = inv_f.copy()
             tmp_inv["__inv_id_key"] = tmp_inv[inv_id_col].apply(lambda x: _safe_str(x).strip())
@@ -1156,13 +1099,8 @@ with tab_bs:
             inv_spend = 0.0
 
         misc_spend = float(misc_f["__amount"].sum()) if not misc_f.empty else 0.0
-
-        # Grading costs are embedded in inventory total_price (COGS) once incurred;
-        # do NOT also count them separately here.
         total_expenses = inv_spend + misc_spend
 
-
-        # Build per card_type (ONLY Sports/Pokemon)
         summary_rows = []
         for ct in ["Sports", "Pokemon"]:
             inv_ct = inv_f[inv_f[inv_card_type_col].apply(_normalize_card_type).astype(str).str.upper() == ct.upper()] if not inv_f.empty else pd.DataFrame()
@@ -1194,7 +1132,6 @@ with tab_bs:
 
         totals_pl = (net_total - total_expenses)
         summary_rows.append(["Totals", total_expenses, net_total, fees_total, totals_pl])
-
 
         summary_df = pd.DataFrame(summary_rows, columns=["Total", "Total Expenses", "Sales", "Fees/shipping", "Profit/Loss"])
 
@@ -1236,10 +1173,9 @@ with tab_bs:
             st.info("No sales lines.")
         else:
             out = txn_f.copy()
-            out["card_type"] = out.apply(_tx_card_type_rowaware, axis=1)  # FIX: no Other
+            out["card_type"] = out.apply(_tx_card_type_rowaware, axis=1)
             out["bucket"] = out["__inventory_id"].map(_tx_product_bucket).fillna("Cards")
 
-            # pick columns safely (avoid dup crash)
             cols = []
             if tx_date_col and tx_date_col in out.columns:
                 cols.append(tx_date_col)
@@ -1296,12 +1232,11 @@ with tab_bs:
 
 
 # =========================================================
-# TAB 2: Expenses + Forecast (kept as-is, but hardened)
+# TAB 2: Expenses + Forecast (your existing logic)
 # =========================================================
 with tab_forecast:
     st.subheader("Cumulative View (Monthly)")
 
-    # Monthly expenses
     inv_monthly = pd.DataFrame(columns=["month", "inventory_expense"])
     if not inv.empty and "__purchase_dt" in inv.columns:
         inv_monthly = (
@@ -1325,7 +1260,6 @@ with tab_forecast:
         sales_monthly = txn.groupby("__sold_month", as_index=False)["__net"].sum().rename(columns={"__sold_month": "month", "__net": "sales_net"})
         sales_monthly = sales_monthly.dropna(subset=["month"])
 
-    # Inventory market value by month (only works if inventory has __market_price)
     inv_market_by_month = pd.DataFrame(columns=["month", "inventory_market_value"])
     if not inv.empty and "__purchase_dt" in inv.columns and inv["__purchase_dt"].notna().any():
         sold_dt_by_id = {}
@@ -1355,7 +1289,6 @@ with tab_forecast:
             rows.append({"month": m, "inventory_market_value": mv})
         inv_market_by_month = pd.DataFrame(rows)
 
-    # Combine into base monthly frame
     all_months = []
     for d in [inv_monthly.get("month"), misc_monthly.get("month"), grading_monthly.get("month"), sales_monthly.get("month"), inv_market_by_month.get("month")]:
         if isinstance(d, pd.Series) and not d.empty:
@@ -1390,7 +1323,6 @@ with tab_forecast:
     base["cum_sales_net"] = base["sales_net"].cumsum()
     base["assets_plus_sales"] = base["inventory_market_value"] + base["cum_sales_net"]
 
-    # Forecast dotted lines
     current_month = pd.Timestamp(date.today().replace(day=1))
     forecast = base[["month", "assets_plus_sales"]].copy()
     forecast["upside"] = np.nan
@@ -1501,7 +1433,7 @@ with tab_forecast:
 
 
 # =========================================================
-# TAB 3: Benchmarks (unchanged)
+# TAB 3: Benchmarks
 # =========================================================
 with tab_bench:
     st.subheader("Benchmarks vs Targets")
@@ -1512,7 +1444,6 @@ with tab_bench:
     if not grd.empty:
         got = grd.copy()
         grade_col = None
-        # try canonical first
         for cand in ["received_grade", "returned_grade", "grade"]:
             c = _pick_col(got, cand, None)
             if c and c in got.columns:
