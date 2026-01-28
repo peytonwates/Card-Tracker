@@ -323,43 +323,113 @@ def _fetch_market_prices(link: str) -> dict:
             return out
 
         # -------------------------
-        # SportsCardsPro parse (robust)
+        # SportsCardsPro parse (TABLE-FIRST, then fallback)
         # -------------------------
-        text = soup.get_text("\n", strip=True)
-
-        def _money_from_text(label_patterns):
-            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-            dollar_pat = re.compile(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-            label_res = [re.compile(p, flags=re.IGNORECASE) for p in label_patterns]
-
-            for i, ln in enumerate(lines):
-                if any(rx.search(ln) for rx in label_res):
-                    m = dollar_pat.search(ln)
-                    if m:
-                        return float(m.group(1).replace(",", ""))
-                    for j in range(1, 4):
-                        if i + j < len(lines):
-                            m2 = dollar_pat.search(lines[i + j])
-                            if m2:
-                                return float(m2.group(1).replace(",", ""))
-            return 0.0
-
-        def _money_regex(pattern: str) -> float:
-            m = re.search(pattern, text, flags=re.IGNORECASE)
+        def _parse_money(s: str) -> float:
+            if not s:
+                return 0.0
+            m = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", s)
             if not m:
                 return 0.0
-            return float(m.group(1).replace(",", ""))
+            try:
+                return float(m.group(1).replace(",", ""))
+            except Exception:
+                return 0.0
 
-        raw_val = _money_regex(r"(?:Ungraded|Raw)\b[^$]{0,50}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-        psa10_val = _money_regex(r"PSA\s*10\b[^$]{0,50}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-        psa9_val = _money_regex(r"(?:PSA\s*9|Grade\s*9)\b[^$]{0,50}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+        def _scp_full_prices_table(soup: BeautifulSoup) -> dict:
+            """
+            Pull values from the 'Full Price Guide' table:
+              <tr><td>Ungraded</td><td class="price js-price">$1.99</td></tr>
+              <tr><td>Grade 9</td><td class="price js-price">$12.34</td></tr>
+              <tr><td>PSA 10</td><td class="price js-price">$44.25</td></tr>
+            Returns dict label->value for anything we find.
+            """
+            tbl_map = {}
 
-        if raw_val <= 0:
-            raw_val = _money_from_text([r"\bUngraded\b", r"\bRaw\b"])
-        if psa10_val <= 0:
-            psa10_val = _money_from_text([r"\bPSA\s*10\b"])
-        if psa9_val <= 0:
-            psa9_val = _money_from_text([r"\bPSA\s*9\b", r"\bGrade\s*9\b"])
+            # Prefer the full prices section if it exists
+            tables = []
+            full_prices = soup.select_one("#full-prices")
+            if full_prices:
+                tables = full_prices.find_all("table")
+
+            # Fallback: scan all tables (site markup can vary)
+            if not tables:
+                tables = soup.find_all("table")
+
+            for tbl in tables:
+                for tr in tbl.find_all("tr"):
+                    tds = tr.find_all("td")
+                    if len(tds) < 2:
+                        continue
+
+                    label = tds[0].get_text(" ", strip=True)
+                    price_text = tds[1].get_text(" ", strip=True)
+                    if not label:
+                        continue
+
+                    # Normalize label spacing
+                    label = re.sub(r"\s+", " ", label.strip())
+                    tbl_map[label] = _parse_money(price_text)
+
+            return tbl_map
+
+        # 1) Table-first (fixes cases where sales text is missing but table shows values)
+        tbl = _scp_full_prices_table(soup)
+
+        def _pick_tbl(labels):
+            # exact match first
+            for lab in labels:
+                if lab in tbl:
+                    return float(tbl.get(lab, 0.0) or 0.0)
+            # case-insensitive match
+            lower_map = {k.lower(): k for k in tbl.keys()}
+            for lab in labels:
+                k = lower_map.get(lab.lower())
+                if k:
+                    return float(tbl.get(k, 0.0) or 0.0)
+            return 0.0
+
+        raw_val = _pick_tbl(["Ungraded", "Raw"])
+        psa9_val = _pick_tbl(["PSA 9", "Grade 9"])
+        psa10_val = _pick_tbl(["PSA 10", "Grade 10"])
+
+        # 2) Fallback to your previous robust text parsing if table didn't yield anything
+        if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
+            text = soup.get_text("\n", strip=True)
+
+            def _money_from_text(label_patterns):
+                lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                dollar_pat = re.compile(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+                label_res = [re.compile(p, flags=re.IGNORECASE) for p in label_patterns]
+
+                for i, ln in enumerate(lines):
+                    if any(rx.search(ln) for rx in label_res):
+                        m = dollar_pat.search(ln)
+                        if m:
+                            return float(m.group(1).replace(",", ""))
+                        for j in range(1, 4):
+                            if i + j < len(lines):
+                                m2 = dollar_pat.search(lines[i + j])
+                                if m2:
+                                    return float(m2.group(1).replace(",", ""))
+                return 0.0
+
+            def _money_regex(pattern: str) -> float:
+                m = re.search(pattern, text, flags=re.IGNORECASE)
+                if not m:
+                    return 0.0
+                return float(m.group(1).replace(",", ""))
+
+            raw_val = _money_regex(r"(?:Ungraded|Raw)\b[^$]{0,50}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+            psa10_val = _money_regex(r"PSA\s*10\b[^$]{0,50}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+            psa9_val = _money_regex(r"(?:PSA\s*9|Grade\s*9)\b[^$]{0,50}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+
+            if raw_val <= 0:
+                raw_val = _money_from_text([r"\bUngraded\b", r"\bRaw\b"])
+            if psa10_val <= 0:
+                psa10_val = _money_from_text([r"\bPSA\s*10\b"])
+            if psa9_val <= 0:
+                psa9_val = _money_from_text([r"\bPSA\s*9\b", r"\bGrade\s*9\b"])
 
         out["raw"] = float(raw_val or 0.0)
         out["psa9"] = float(psa9_val or 0.0)
@@ -498,6 +568,7 @@ def _styler_table_header():
         {"selector": "td", "props": [("font-weight", "500")]},
     ]
 
+
 def _style_group_and_total_rows(df: pd.DataFrame, first_col: str):
     def _row_style(row):
         v = _safe_str(row.get(first_col, ""))
@@ -508,6 +579,7 @@ def _style_group_and_total_rows(df: pd.DataFrame, first_col: str):
         return ["background-color: #eef2ff; font-weight: 800;"] * len(row)
 
     return df.style.apply(_row_style, axis=1)
+
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 10)
