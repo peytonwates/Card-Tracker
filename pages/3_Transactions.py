@@ -709,6 +709,32 @@ def scrape_image_url(reference_link: str) -> str:
 # =========================================================
 # UI HELPERS
 # =========================================================
+def _to_float_money(x) -> float:
+    """
+    Safely convert common Sheet/Excel numeric strings to float.
+    Handles: $1,234.56  (1,234.56)  0  ""  None
+    Returns 0.0 if it can't parse.
+    """
+    if x is None:
+        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
+
+    s = str(x).strip()
+    if s == "":
+        return 0.0
+
+    # Remove currency symbols/commas/whitespace
+    s = s.replace("$", "").replace(",", "").strip()
+
+    # Handle parentheses as negatives: (123.45) -> -123.45
+    if s.startswith("(") and s.endswith(")"):
+        s = "-" + s[1:-1].strip()
+
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
 
 def _money(x) -> str:
     try:
@@ -1254,6 +1280,7 @@ with tab_create:
 
 
 # =========================================================
+# =========================================================
 # TAB 2: MARK SOLD / UPDATE LISTING
 # =========================================================
 with tab_update:
@@ -1347,6 +1374,11 @@ with tab_update:
                 tx_internal = {sheet_header_to_internal(k): v for k, v in tx_sheet_dict.items()}
                 tx_internal = _coalesce_duplicate_columns(pd.DataFrame([tx_internal])).iloc[0].to_dict()
 
+                # --- NEW: sanitize numeric fields from Sheets (e.g., "$0.00") ---
+                for c in NUMERIC_TX:
+                    if c in tx_internal:
+                        tx_internal[c] = _to_float_money(tx_internal.get(c))
+
                 now_iso = pd.Timestamp.utcnow().isoformat()
 
                 if cancel_btn:
@@ -1383,9 +1415,10 @@ with tab_update:
                     st.rerun()
 
                 if mark_btn:
-                    all_in_cost = float(tx_internal.get("all_in_cost", 0.0) or 0.0)
+                    # --- UPDATED: safe float parsing (handles "$0.00") ---
+                    all_in_cost = _to_float_money(tx_internal.get("all_in_cost", 0.0))
                     if all_in_cost <= 0:
-                        all_in_cost = float(tx_internal.get("purchase_total", 0.0) or 0.0)
+                        all_in_cost = _to_float_money(tx_internal.get("purchase_total", 0.0))
 
                     net, profit = _compute_net_and_profit(
                         all_in_cost=all_in_cost,
