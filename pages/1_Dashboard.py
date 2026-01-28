@@ -3,6 +3,7 @@ import json
 import re
 from pathlib import Path
 from datetime import date
+from urllib.parse import urlparse, urlunparse
 
 import pandas as pd
 import numpy as np
@@ -274,6 +275,44 @@ def _normalize_card_type(val: str) -> str:
     return "Pokemon"
 
 
+# =========================
+# ✅ NEW: Canonicalize reference links so weird SportscardsPro links still work
+# - strips ?q=... and #...
+# - forces https
+# - normalizes sportscardspro host to www.sportscardspro.com
+# =========================
+def _canonicalize_reference_link(url: str) -> str:
+    if not url:
+        return ""
+    url = str(url).strip()
+    if not url:
+        return ""
+
+    # Handle scheme-less URLs
+    if url.startswith("//"):
+        url = "https:" + url
+    elif not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    try:
+        p = urlparse(url)
+    except Exception:
+        return url
+
+    netloc = (p.netloc or "").lower()
+    path = p.path or ""
+
+    # Normalize known host variants
+    if "sportscardspro.com" in netloc:
+        netloc = "www.sportscardspro.com"
+
+    # Drop query + fragment, strip trailing slash
+    path = path.rstrip("/")
+    canonical = urlunparse(("https", netloc, path, "", "", ""))
+
+    return canonical
+
+
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def _fetch_market_prices(link: str) -> dict:
     """
@@ -290,7 +329,8 @@ def _fetch_market_prices(link: str) -> dict:
     if not link:
         return out
 
-    url = str(link).strip()
+    # ✅ FIX: canonicalize the link so ?q=... and other variants still scrape
+    url = _canonicalize_reference_link(link)
     u = url.lower()
 
     if ("pricecharting.com" not in u) and ("sportscardspro.com" not in u):
@@ -327,9 +367,6 @@ def _fetch_market_prices(link: str) -> dict:
 
         # -------------------------
         # SportsCardsPro parse
-        # Fix: many item pages (like your Jonathan Taylor link) expose prices
-        # as a "Full Price Guide" text block, NOT an HTML <table>.
-        # We parse that block first, then fall back to table + regex methods.
         # -------------------------
         def _parse_money(s: str) -> float:
             if not s:
@@ -374,11 +411,6 @@ def _fetch_market_prices(link: str) -> dict:
                 if any(re.search(p, ln, flags=re.IGNORECASE) for p in stop_markers):
                     break
 
-                # Examples:
-                # "Ungraded $2.00"
-                # "Grade 9 $13.18"
-                # "PSA 10 $39.30"
-                # "Grade 1 -"   (no price)
                 m = re.match(r"^([A-Za-z0-9 .]+)\s+(.+)$", ln)
                 if not m:
                     continue
@@ -386,7 +418,6 @@ def _fetch_market_prices(link: str) -> dict:
                 label = re.sub(r"\s+", " ", m.group(1)).strip()
                 tail = m.group(2).strip()
 
-                # handle "-" / "n/a" style
                 if tail in {"-", "—"} or tail.lower() in {"n/a", "na"}:
                     val = 0.0
                 else:
@@ -444,11 +475,10 @@ def _fetch_market_prices(link: str) -> dict:
                     return float(m.get(k, 0.0) or 0.0)
             return 0.0
 
-        # 1) FULL PRICE GUIDE (TEXT) — fixes your failing example link
+        # 1) FULL PRICE GUIDE (TEXT)
         guide_map = _scp_from_full_price_guide_text(soup)
         raw_val = _pick_from_map(guide_map, ["Ungraded", "Raw"])
         psa10_val = _pick_from_map(guide_map, ["PSA 10"])
-        # Prefer PSA 9 if it exists, otherwise use Grade 9
         psa9_val = _pick_from_map(guide_map, ["PSA 9"])
         if psa9_val <= 0:
             psa9_val = _pick_from_map(guide_map, ["Grade 9"])
@@ -462,7 +492,7 @@ def _fetch_market_prices(link: str) -> dict:
             if psa9_val <= 0:
                 psa9_val = _pick_from_map(tbl, ["Grade 9"])
 
-        # 3) Fallback: robust text regex (your original approach)
+        # 3) Fallback: robust text regex
         if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
             text = soup.get_text("\n", strip=True)
 
@@ -510,7 +540,6 @@ def _fetch_market_prices(link: str) -> dict:
 
     except Exception:
         return out
-
 
 
 def _repull_market_values_to_inventory_sheet():
@@ -575,6 +604,10 @@ def _repull_market_values_to_inventory_sheet():
     i_mv = col_idx("market_value")
     i_mpu = col_idx("market_price_updated_at")
 
+    # safety: if headers were appended, ensure indices exist
+    if i_mp is None or i_mv is None or i_mpu is None or i_ref is None:
+        raise RuntimeError("Inventory sheet is missing required market columns after header update.")
+
     try:
         _fetch_market_prices.clear()
     except Exception:
@@ -587,7 +620,11 @@ def _repull_market_values_to_inventory_sheet():
 
     for r in rows:
         link = (r[i_ref] if i_ref is not None and i_ref < len(r) else "").strip()
-        ll = link.lower()
+
+        # ✅ FIX: canonicalize here too (so the cache key + scrape are consistent)
+        link_canon = _canonicalize_reference_link(link)
+        ll = link_canon.lower()
+
         if ("pricecharting.com" not in ll) and ("sportscardspro.com" not in ll):
             market_prices.append([0.0])
             market_updated_ats.append([""])
@@ -599,12 +636,15 @@ def _repull_market_values_to_inventory_sheet():
         grade = (r[i_grade] if i_grade is not None and i_grade < len(r) else "").strip().upper()
         cond = (r[i_cond] if i_cond is not None and i_cond < len(r) else "").strip().lower()
 
-        prices = _fetch_market_prices(link)
+        prices = _fetch_market_prices(link_canon)
 
         is_sealed = "sealed" in pt
         is_grading = (status == "GRADING")
         is_graded = ("graded" in pt) or bool(comp) or bool(grade) or ("graded" in cond)
 
+        # Market value logic:
+        # - default to raw/ungraded
+        # - if graded, use PSA 9/10 as appropriate
         mv = float(prices.get("raw", 0.0) or 0.0)
         if (not is_sealed) and (not is_grading) and is_graded:
             if "10" in grade:
@@ -853,7 +893,6 @@ if not txn.empty:
         txn["__net"] = (txn["__sold_price"] - txn["__fees"] + txn["__ship_charged"]).fillna(0.0)
 
     # ✅ FIX: fallback “sold rows only” guard even if status col was missing upstream
-    # Drop rows that look like LISTED (no sold date, no sold price, no net).
     txn = txn[~(txn["__sold_dt"].isna() & (txn["__sold_price"] <= 0) & (txn["__net"] <= 0))].copy()
 
     txn["__sold_month"] = _month_start(txn["__sold_dt"])
@@ -881,7 +920,6 @@ if "txn_all" in locals() and isinstance(txn_all, pd.DataFrame) and not txn_all.e
     txa_status_col = _pick_col(txa, "status", None) or _pick_col(txa, "tx_status", None)
     txa_inv_col = _pick_col(txa, "inventory_id", None) or _pick_col(txa, "inv_id", None)
 
-    # ✅ FIX: include "amount" as fallback; normalization now handles "List Price" headers too.
     txa_list_price_col = (
         _pick_col(txa, "list_price", None)
         or _pick_col(txa, "listed_price", None)
@@ -907,11 +945,9 @@ if "txn_all" in locals() and isinstance(txn_all, pd.DataFrame) and not txn_all.e
         if txa_dt_col and txa_dt_col in txa.columns:
             txa["__dt"] = _to_dt(txa[txa_dt_col])
         else:
-            # if no dt column, preserve sheet order via index
             txa["__dt"] = pd.NaT
             txa["__row"] = np.arange(len(txa))
 
-        # keep the most recent row per inventory_id
         sort_cols = ["__inventory_id"]
         if "__row" in txa.columns:
             sort_cols += ["__row"]
@@ -1352,7 +1388,6 @@ with tab_bs:
             tx["__card_type"] = tx.apply(_tx_card_type_rowaware, axis=1)
             tx["__bucket"] = tx["__inventory_id"].map(_tx_product_bucket).fillna("Cards")
 
-            # ✅ FIX: count should only represent sold rows (tx is already sold-filtered; this is now safe)
             sales_count_total = int(len(tx))
             fees_total = float(tx["__fees"].sum())
             net_total = float(tx["__net"].sum())
