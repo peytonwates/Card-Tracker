@@ -283,7 +283,7 @@ def _fetch_market_prices(link: str) -> dict:
 
     Returns dict with:
       raw  = ungraded
-      psa9 = PSA 9 (or Grade 9 on SCP)
+      psa9 = PSA 9 (or Grade 9 on SCP if PSA 9 not present)
       psa10 = PSA 10
     """
     out = {"raw": 0.0, "psa9": 0.0, "psa10": 0.0}
@@ -297,7 +297,10 @@ def _fetch_market_prices(link: str) -> dict:
         return out
 
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (CardTracker; +Streamlit)"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (CardTracker; +Streamlit)",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
         r = requests.get(url, headers=headers, timeout=12)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
@@ -323,7 +326,10 @@ def _fetch_market_prices(link: str) -> dict:
             return out
 
         # -------------------------
-        # SportsCardsPro parse (TABLE-FIRST, then fallback)
+        # SportsCardsPro parse
+        # Fix: many item pages (like your Jonathan Taylor link) expose prices
+        # as a "Full Price Guide" text block, NOT an HTML <table>.
+        # We parse that block first, then fall back to table + regex methods.
         # -------------------------
         def _parse_money(s: str) -> float:
             if not s:
@@ -336,23 +342,74 @@ def _fetch_market_prices(link: str) -> dict:
             except Exception:
                 return 0.0
 
+        def _scp_from_full_price_guide_text(soup: BeautifulSoup) -> dict:
+            """
+            Parses the "Full Price Guide" section that appears in page text like:
+              Full Price Guide: ...
+              Ungraded $2.00
+              Grade 9 $13.18
+              PSA 10 $39.30
+            Returns dict with any labels it can read.
+            """
+            txt = soup.get_text("\n", strip=True)
+            lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+
+            # find the "Full Price Guide" header line
+            start = None
+            for i, ln in enumerate(lines):
+                if re.search(r"\bFull Price Guide\b", ln, flags=re.IGNORECASE):
+                    start = i
+                    break
+            if start is None:
+                return {}
+
+            # consume subsequent lines until we hit the footer/explanation
+            stop_markers = [
+                r"^All prices are\b",
+                r"\bprices are based on the historic sales\b",
+                r"^Chart shows\b",
+            ]
+            out_map = {}
+            for ln in lines[start + 1 :]:
+                if any(re.search(p, ln, flags=re.IGNORECASE) for p in stop_markers):
+                    break
+
+                # Examples:
+                # "Ungraded $2.00"
+                # "Grade 9 $13.18"
+                # "PSA 10 $39.30"
+                # "Grade 1 -"   (no price)
+                m = re.match(r"^([A-Za-z0-9 .]+)\s+(.+)$", ln)
+                if not m:
+                    continue
+
+                label = re.sub(r"\s+", " ", m.group(1)).strip()
+                tail = m.group(2).strip()
+
+                # handle "-" / "n/a" style
+                if tail in {"-", "—"} or tail.lower() in {"n/a", "na"}:
+                    val = 0.0
+                else:
+                    val = _parse_money(tail)
+
+                if label:
+                    out_map[label] = val
+
+            return out_map
+
         def _scp_full_prices_table(soup: BeautifulSoup) -> dict:
             """
-            Pull values from the 'Full Price Guide' table:
+            Older/alternate markup: table rows like:
               <tr><td>Ungraded</td><td class="price js-price">$1.99</td></tr>
-              <tr><td>Grade 9</td><td class="price js-price">$12.34</td></tr>
-              <tr><td>PSA 10</td><td class="price js-price">$44.25</td></tr>
             Returns dict label->value for anything we find.
             """
             tbl_map = {}
 
-            # Prefer the full prices section if it exists
             tables = []
             full_prices = soup.select_one("#full-prices")
             if full_prices:
                 tables = full_prices.find_all("table")
 
-            # Fallback: scan all tables (site markup can vary)
             if not tables:
                 tables = soup.find_all("table")
 
@@ -367,33 +424,45 @@ def _fetch_market_prices(link: str) -> dict:
                     if not label:
                         continue
 
-                    # Normalize label spacing
                     label = re.sub(r"\s+", " ", label.strip())
                     tbl_map[label] = _parse_money(price_text)
 
             return tbl_map
 
-        # 1) Table-first (fixes cases where sales text is missing but table shows values)
-        tbl = _scp_full_prices_table(soup)
-
-        def _pick_tbl(labels):
-            # exact match first
+        def _pick_from_map(m: dict, labels):
+            if not m:
+                return 0.0
+            # exact match
             for lab in labels:
-                if lab in tbl:
-                    return float(tbl.get(lab, 0.0) or 0.0)
+                if lab in m:
+                    return float(m.get(lab, 0.0) or 0.0)
             # case-insensitive match
-            lower_map = {k.lower(): k for k in tbl.keys()}
+            lower_map = {k.lower(): k for k in m.keys()}
             for lab in labels:
                 k = lower_map.get(lab.lower())
                 if k:
-                    return float(tbl.get(k, 0.0) or 0.0)
+                    return float(m.get(k, 0.0) or 0.0)
             return 0.0
 
-        raw_val = _pick_tbl(["Ungraded", "Raw"])
-        psa9_val = _pick_tbl(["PSA 9", "Grade 9"])
-        psa10_val = _pick_tbl(["PSA 10", "Grade 10"])
+        # 1) FULL PRICE GUIDE (TEXT) — fixes your failing example link
+        guide_map = _scp_from_full_price_guide_text(soup)
+        raw_val = _pick_from_map(guide_map, ["Ungraded", "Raw"])
+        psa10_val = _pick_from_map(guide_map, ["PSA 10"])
+        # Prefer PSA 9 if it exists, otherwise use Grade 9
+        psa9_val = _pick_from_map(guide_map, ["PSA 9"])
+        if psa9_val <= 0:
+            psa9_val = _pick_from_map(guide_map, ["Grade 9"])
 
-        # 2) Fallback to your previous robust text parsing if table didn't yield anything
+        # 2) Table markup (if guide parse didn't yield anything)
+        if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
+            tbl = _scp_full_prices_table(soup)
+            raw_val = _pick_from_map(tbl, ["Ungraded", "Raw"])
+            psa10_val = _pick_from_map(tbl, ["PSA 10", "Grade 10"])
+            psa9_val = _pick_from_map(tbl, ["PSA 9"])
+            if psa9_val <= 0:
+                psa9_val = _pick_from_map(tbl, ["Grade 9"])
+
+        # 3) Fallback: robust text regex (your original approach)
         if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
             text = soup.get_text("\n", strip=True)
 
@@ -407,7 +476,7 @@ def _fetch_market_prices(link: str) -> dict:
                         m = dollar_pat.search(ln)
                         if m:
                             return float(m.group(1).replace(",", ""))
-                        for j in range(1, 4):
+                        for j in range(1, 6):
                             if i + j < len(lines):
                                 m2 = dollar_pat.search(lines[i + j])
                                 if m2:
@@ -420,9 +489,12 @@ def _fetch_market_prices(link: str) -> dict:
                     return 0.0
                 return float(m.group(1).replace(",", ""))
 
-            raw_val = _money_regex(r"(?:Ungraded|Raw)\b[^$]{0,50}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-            psa10_val = _money_regex(r"PSA\s*10\b[^$]{0,50}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-            psa9_val = _money_regex(r"(?:PSA\s*9|Grade\s*9)\b[^$]{0,50}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+            raw_val = _money_regex(r"(?:Ungraded|Raw)\b[^$]{0,80}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+            psa10_val = _money_regex(r"PSA\s*10\b[^$]{0,80}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+
+            psa9_val = _money_regex(r"PSA\s*9\b[^$]{0,80}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+            if psa9_val <= 0:
+                psa9_val = _money_regex(r"Grade\s*9\b[^$]{0,80}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
 
             if raw_val <= 0:
                 raw_val = _money_from_text([r"\bUngraded\b", r"\bRaw\b"])
@@ -438,6 +510,7 @@ def _fetch_market_prices(link: str) -> dict:
 
     except Exception:
         return out
+
 
 
 def _repull_market_values_to_inventory_sheet():
