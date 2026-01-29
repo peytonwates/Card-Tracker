@@ -1,3 +1,4 @@
+# pages/1_Dashboard.py
 import json
 import re
 import time
@@ -84,16 +85,32 @@ def _to_dt(s):
     return pd.to_datetime(s, errors="coerce")
 
 def _to_num(s):
+    """
+    Robust numeric parser:
+    - handles currency strings like "$1,234.56"
+    - handles negatives like "(12.34)" or "-12.34"
+    - leaves real numerics alone
+    """
     if isinstance(s, pd.Series):
         x = s.copy()
+        # if already numeric, just coerce
         if pd.api.types.is_numeric_dtype(x):
             return pd.to_numeric(x, errors="coerce").fillna(0.0)
+
         x = x.astype(str).str.strip()
+
+        # convert (123.45) => -123.45
         x = x.str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+
+        # remove $ and commas and spaces
         x = x.str.replace(r"[\$,]", "", regex=True)
+
+        # handle blanks / "nan"
         x = x.replace({"": "0", "nan": "0", "None": "0"})
+
         return pd.to_numeric(x, errors="coerce").fillna(0.0)
 
+    # scalar
     try:
         if s is None:
             return 0.0
@@ -110,22 +127,163 @@ def _to_num(s):
     except Exception:
         return 0.0
 
+
+def _month_start(dt_series):
+    d = _to_dt(dt_series)
+    return d.dt.to_period("M").dt.to_timestamp()
+
+def _fmt_money(x):
+    try:
+        return f"${float(x):,.2f}"
+    except Exception:
+        return "$0.00"
+
+def _pct(a, b):
+    try:
+        b = float(b)
+    except Exception:
+        b = 0.0
+    if b == 0:
+        return 0.0
+    return float(a) / b
+
+def _style_red_green(val):
+    try:
+        v = float(val)
+    except Exception:
+        return ""
+    if v < 0:
+        return "color: #b00020; font-weight: 700;"
+    if v > 0:
+        return "color: #0b6b2f; font-weight: 800;"
+    return ""
+
 def _base_col(c: str) -> str:
+    # normalize any renamed dup columns like "inventory_id__dup1"
     s = _safe_str(c)
     if "__dup" in s:
         s = s.split("__dup")[0]
     return s
 
+# ✅ FIX: robust normalization so "List Price" == "list_price", "Inventory ID" == "inventory_id", etc.
 def _norm_key(s: str) -> str:
     s = _safe_str(s).strip().lower()
+    # convert common separators to underscore
     s = re.sub(r"[\s\-\/]+", "_", s)
+    # drop any remaining non-word chars (keep underscore)
     s = re.sub(r"[^\w]+", "", s)
+    # collapse multiple underscores
     s = re.sub(r"_+", "_", s).strip("_")
     return s
 
+def _ensure_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Google Sheets can end up with duplicate headers (or merges can create duplicates).
+    Streamlit/Arrow will crash if df.columns are not unique.
+    We rename duplicates with __dup{n} suffixes.
+    """
+    if df is None or df.empty:
+        return df
+
+    cols = list(df.columns)
+    seen = {}
+    new_cols = []
+    for c in cols:
+        b = _safe_str(c)
+        if b not in seen:
+            seen[b] = 0
+            new_cols.append(b)
+        else:
+            seen[b] += 1
+            new_cols.append(f"{b}__dup{seen[b]}")
+    df = df.copy()
+    df.columns = new_cols
+    return df
+
+def _col_lookup(df: pd.DataFrame) -> dict:
+    """
+    Map normalized(base_col_name) -> actual column name (first occurrence wins).
+    """
+    m = {}
+    for c in df.columns:
+        key = _norm_key(_base_col(c))
+        if key and key not in m:
+            m[key] = c
+    return m
+
+def _pick_col(df: pd.DataFrame, name: str, fallback: str = None):
+    m = _col_lookup(df)
+    return m.get(_norm_key(name), fallback)
+
+def _apply_period_filter(df: pd.DataFrame, dt_col: str, year_choice: str, month_choice: str) -> pd.DataFrame:
+    if df is None or df.empty or dt_col not in df.columns:
+        return df
+
+    d = _to_dt(df[dt_col])
+    out = df.copy()
+    out["__dt_filter"] = d
+
+    if year_choice != "All":
+        try:
+            y = int(year_choice)
+            out = out[out["__dt_filter"].dt.year == y]
+        except Exception:
+            pass
+
+    if month_choice != "All":
+        # month_choice expected like "2026-01"
+        try:
+            m = pd.to_datetime(month_choice + "-01", errors="coerce")
+            if pd.notna(m):
+                out = out[out["__dt_filter"].dt.to_period("M") == m.to_period("M")]
+        except Exception:
+            pass
+
+    out = out.drop(columns=["__dt_filter"], errors="ignore")
+    return out
+
+def _bucket_product(product_type, grading_company, grade, condition, inv_status) -> str:
+    # Avoid AttributeError from ints
+    pt = _safe_str(product_type).strip().lower()
+    comp = _safe_str(grading_company).strip()
+    grd = _safe_str(grade).strip()
+    cond = _safe_str(condition).strip().lower()
+    status = _safe_str(inv_status).strip().upper()
+
+    if status == "GRADING":
+        return "Grading In-Process"
+
+    if "sealed" in pt:
+        return "Sealed"
+
+    # "Graded Card" product_type or any populated grade/company indicates graded
+    if "graded" in pt or comp or grd or ("graded" in cond):
+        return "Graded Cards"
+
+    return "Cards"
+
+def _normalize_card_type(val: str) -> str:
+    """
+    User requirement: ONLY Pokemon or Sports. Never show 'Other'.
+    Default any unknown/blank to Pokemon.
+    """
+    s = _safe_str(val).strip().lower()
+    if s == "sports":
+        return "Sports"
+    if s == "pokemon":
+        return "Pokemon"
+    if "sport" in s:
+        return "Sports"
+    if "pok" in s or "pokemon" in s:
+        return "Pokemon"
+    return "Pokemon"
+
 
 # =========================
-# Canonicalize reference links
+# ✅ NEW: Canonicalize reference links so weird SportscardsPro links still work
+# - strips ?q=... and #...
+# - forces https
+# - normalizes sportscardspro host to www.sportscardspro.com
 # =========================
 def _canonicalize_reference_link(url: str) -> str:
     if not url:
@@ -134,6 +292,7 @@ def _canonicalize_reference_link(url: str) -> str:
     if not url:
         return ""
 
+    # Handle scheme-less URLs
     if url.startswith("//"):
         url = "https:" + url
     elif not url.startswith(("http://", "https://")):
@@ -145,23 +304,32 @@ def _canonicalize_reference_link(url: str) -> str:
         return url
 
     netloc = (p.netloc or "").lower()
-    path = (p.path or "").rstrip("/")
+    path = p.path or ""
 
+    # Normalize known host variants
     if "sportscardspro.com" in netloc:
         netloc = "www.sportscardspro.com"
 
-    # drop query + fragment
-    return urlunparse(("https", netloc, path, "", "", ""))
+    # Drop query + fragment, strip trailing slash
+    path = path.rstrip("/")
+    canonical = urlunparse(("https", netloc, path, "", "", ""))
+
+    return canonical
 
 
 # =========================
-# ✅ HTTP session + throttling to reduce 429s
+# ✅ NEW: HTTP session + throttling/backoff to reduce 429s
 # =========================
 @st.cache_resource
 def _get_http_session() -> requests.Session:
+    """
+    One shared session per Streamlit process (connection pooling).
+    We handle retries manually (esp. 429 Retry-After), so urllib3 retry is disabled.
+    """
     s = requests.Session()
+
     retry = Retry(
-        total=0,  # we handle retries manually (esp 429)
+        total=0,
         connect=0,
         read=0,
         status=0,
@@ -173,9 +341,10 @@ def _get_http_session() -> requests.Session:
     s.mount("http://", adapter)
     return s
 
+
 # simple in-process rate limiter per-domain
 _DOMAIN_LAST_HIT = {}
-_MIN_GAP_SECONDS = 1.2   # tune: 1.2–2.5 is usually enough to calm 429s
+_MIN_GAP_SECONDS = 1.2   # tune: 1.2–2.5 typically reduces 429s a lot
 _JITTER_SECONDS = 0.4
 
 def _throttle(url: str):
@@ -195,7 +364,6 @@ def _http_get_with_backoff(url: str, headers: dict, timeout: int = 12) -> reques
     Handles 429 with exponential backoff and respects Retry-After if present.
     """
     sess = _get_http_session()
-
     max_attempts = 5
     base_sleep = 2.0
 
@@ -205,11 +373,11 @@ def _http_get_with_backoff(url: str, headers: dict, timeout: int = 12) -> reques
         resp = sess.get(url, headers=headers, timeout=timeout)
         last_resp = resp
 
-        # Success
+        # success
         if resp.status_code < 400:
             return resp
 
-        # Rate limit
+        # rate limited
         if resp.status_code == 429:
             ra = resp.headers.get("Retry-After")
             if ra:
@@ -220,7 +388,6 @@ def _http_get_with_backoff(url: str, headers: dict, timeout: int = 12) -> reques
             else:
                 sleep_s = base_sleep * (2 ** (attempt - 1))
 
-            # jitter so multiple reruns don’t sync
             sleep_s = sleep_s + random.random() * 0.75
             time.sleep(min(sleep_s, 60))
             continue
@@ -231,7 +398,7 @@ def _http_get_with_backoff(url: str, headers: dict, timeout: int = 12) -> reques
             time.sleep(min(sleep_s, 30))
             continue
 
-        # other errors: break
+        # other errors -> stop retrying
         break
 
     return last_resp
@@ -239,6 +406,19 @@ def _http_get_with_backoff(url: str, headers: dict, timeout: int = 12) -> reques
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def _fetch_market_prices(link: str) -> dict:
+    """
+    Supports BOTH:
+      - pricecharting.com
+      - sportscardspro.com
+
+    Returns dict with:
+      raw  = ungraded
+      psa9 = PSA 9 (or Grade 9)
+      psa10 = PSA 10 (or Grade 10)
+
+    Also includes:
+      _debug = "success" or a reason string (why prices are 0)
+    """
     out = {"raw": 0.0, "psa9": 0.0, "psa10": 0.0, "_debug": "unknown"}
 
     if not link:
@@ -266,9 +446,11 @@ def _fetch_market_prices(link: str) -> dict:
     def _pick_from_map(m: dict, labels) -> float:
         if not m:
             return 0.0
+        # exact match
         for lab in labels:
             if lab in m:
                 return float(m.get(lab, 0.0) or 0.0)
+        # case-insensitive match
         lower_map = {k.lower(): k for k in m.keys()}
         for lab in labels:
             k = lower_map.get(lab.lower())
@@ -276,7 +458,28 @@ def _fetch_market_prices(link: str) -> dict:
                 return float(m.get(k, 0.0) or 0.0)
         return 0.0
 
+    def _looks_like_bot_or_block(text: str) -> bool:
+        t = (text or "").lower()
+        bad = [
+            "access denied",
+            "request blocked",
+            "captcha",
+            "unusual traffic",
+            "verify you are a human",
+            "cloudflare",
+            "attention required",
+        ]
+        return any(x in t for x in bad)
+
     def _extract_price_map_from_price_cells(soup: BeautifulSoup) -> tuple[dict, set]:
+        """
+        Strategy A:
+        Builds a label->price map by locating all elements with class "price js-price",
+        then finding the closest row label (usually first td/th in the same <tr>).
+
+        Returns:
+          (map, labels_seen)
+        """
         price_map = {}
         labels_seen = set()
 
@@ -306,15 +509,90 @@ def _fetch_market_prices(link: str) -> dict:
 
         return price_map, labels_seen
 
-    headers = {
-        # slightly more realistic UA reduces blocks for some sites
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Connection": "keep-alive",
-    }
+    def _extract_price_map_generic_table(soup: BeautifulSoup) -> tuple[dict, set]:
+        """
+        Strategy B:
+        Some pages render the price guide without `.price.js-price`.
+        Scan table rows: label in first cell, money in later cells or common price classes.
+        """
+        price_map = {}
+        labels_seen = set()
+
+        for tr in soup.find_all("tr"):
+            cells = tr.find_all(["td", "th"])
+            if len(cells) < 2:
+                continue
+
+            label = re.sub(r"\s+", " ", (cells[0].get_text(" ", strip=True) or "")).strip()
+            if not label:
+                continue
+
+            price_val = 0.0
+            for c in cells[1:]:
+                pv = _parse_money(c.get_text(" ", strip=True))
+                if pv > 0:
+                    price_val = pv
+                    break
+
+            if price_val == 0.0:
+                pcell = tr.select_one("td.price, span.price, div.price")
+                if pcell:
+                    price_val = _parse_money(pcell.get_text(" ", strip=True))
+
+            if price_val != 0.0:
+                labels_seen.add(label)
+                price_map[label] = float(price_val or 0.0)
+
+        return price_map, labels_seen
+
+    def _extract_prices_from_jsonld(soup: BeautifulSoup) -> dict:
+        """
+        Strategy C:
+        If JSON-LD exists, sometimes it includes offers/price.
+        Typically only helps with a raw-ish price.
+        """
+        result = {}
+        scripts = soup.find_all("script", type="application/ld+json")
+        for sc in scripts:
+            try:
+                txt = sc.string or ""
+                if not txt.strip():
+                    continue
+                data = json.loads(txt)
+                items = data if isinstance(data, list) else [data]
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    offers = it.get("offers")
+                    if isinstance(offers, dict):
+                        price = offers.get("price")
+                        if price is not None:
+                            try:
+                                result["raw"] = float(price)
+                            except Exception:
+                                pass
+                    elif isinstance(offers, list):
+                        for off in offers:
+                            if isinstance(off, dict) and off.get("price") is not None:
+                                try:
+                                    result["raw"] = float(off.get("price"))
+                                    break
+                                except Exception:
+                                    pass
+            except Exception:
+                continue
+        return result
 
     try:
+        headers = {
+            # slightly more realistic UA helps reduce block/429 in practice
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Connection": "keep-alive",
+        }
+
+        # ✅ use throttled/backoff GET instead of raw requests.get
         r = _http_get_with_backoff(url, headers=headers, timeout=12)
         if r is None:
             out["_debug"] = "exception"
@@ -327,9 +605,15 @@ def _fetch_market_prices(link: str) -> dict:
             out["_debug"] = f"http_error_{r.status_code}"
             return out
 
+        if _looks_like_bot_or_block((r.text or "")[:5000]):
+            out["_debug"] = "blocked_or_captcha"
+            return out
+
         soup = BeautifulSoup(r.text, "lxml")
 
+        # Strategy A
         price_map, labels_seen = _extract_price_map_from_price_cells(soup)
+
         raw_val = _pick_from_map(price_map, ["Ungraded", "Raw"])
         psa9_val = _pick_from_map(price_map, ["PSA 9", "Grade 9"])
         psa10_val = _pick_from_map(price_map, ["PSA 10", "Grade 10"])
@@ -339,6 +623,33 @@ def _fetch_market_prices(link: str) -> dict:
             for lab in ["Ungraded", "Raw", "PSA 9", "Grade 9", "PSA 10", "Grade 10"]
         )
 
+        # Strategy B
+        if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
+            pm2, ls2 = _extract_price_map_generic_table(soup)
+            if pm2:
+                price_map = {**price_map, **pm2}
+                labels_seen = set(list(labels_seen) + list(ls2))
+
+            raw_val = raw_val or _pick_from_map(price_map, ["Ungraded", "Raw"])
+            psa9_val = psa9_val or _pick_from_map(price_map, ["PSA 9", "Grade 9"])
+            psa10_val = psa10_val or _pick_from_map(price_map, ["PSA 10", "Grade 10"])
+
+            target_labels_present = target_labels_present or any(
+                lab.lower() in {s.lower() for s in labels_seen}
+                for lab in ["Ungraded", "Raw", "PSA 9", "Grade 9", "PSA 10", "Grade 10"]
+            )
+
+        # Strategy C (JSON-LD raw only)
+        if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
+            j = _extract_prices_from_jsonld(soup)
+            if "raw" in j and j["raw"] > 0:
+                out["_debug"] = "success_jsonld_raw_only"
+                out["raw"] = float(j["raw"] or 0.0)
+                out["psa9"] = 0.0
+                out["psa10"] = 0.0
+                return out
+
+        # Strategy D (final text fallback)
         if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
             text = soup.get_text("\n", strip=True)
 
@@ -380,9 +691,17 @@ def _fetch_market_prices(link: str) -> dict:
 
 def _repull_market_values_to_inventory_sheet():
     """
-    ✅ Fixes for 429s:
-    - Cooldown retries if last attempt got 429 recently
-    - Does NOT rely on global cache clears
+    Runs on Dashboard Refresh:
+    - reads inventory sheet rows
+    - computes market_price (raw/ungraded) and market_value (grade-selected) from PriceCharting or SportsCardsPro
+    - writes back to inventory in ONE column update per market col (quota friendly)
+    - writes a debug status column describing success / why 0 was returned
+
+    ✅ New behavior:
+    - If market_price_updated_at is within last 12 hours, we SKIP re-scraping
+      UNLESS current market_price is 0.
+    - If the last debug was a 429 recently, we SKIP for a cooldown window (prevents hammering).
+    - We do NOT clear _fetch_market_prices cache here anymore (clearing forces re-hit and causes 429s).
     """
     ws = _open_ws(st.secrets.get("inventory_worksheet", "inventory"))
     values = ws.get_all_values()
@@ -413,10 +732,10 @@ def _repull_market_values_to_inventory_sheet():
         "grading_company",
         "grade",
         "condition",
-        "market_price",
-        "market_value",
+        "market_price",              # raw/ungraded
+        "market_value",              # grade-selected
         "market_price_updated_at",
-        "market_price_debug",
+        "market_price_debug",        # ✅ NEW
     ]
 
     changed = False
@@ -445,18 +764,16 @@ def _repull_market_values_to_inventory_sheet():
     if any(x is None for x in [i_ref, i_mp, i_mv, i_mpu, i_dbg]):
         raise RuntimeError("Inventory sheet is missing required market columns after header update.")
 
-    market_price_raw = []
-    market_value_sel = []
-    market_updated_ats = []
-    market_debug = []
+    market_price_raw = []     # writes to market_price
+    market_value_sel = []     # writes to market_value
+    market_updated_ats = []   # writes to market_price_updated_at
+    market_debug = []         # writes to market_price_debug
 
     now_utc = pd.Timestamp.utcnow()
     now_iso = now_utc.isoformat()
 
-    # ✅ Cooldown windows
-    RECENT_HOURS_OK = 12
-    COOLDOWN_429_HOURS = 6   # don’t retry a 429 row for 6 hours
-
+    RECENT_HOURS = 12
+    COOLDOWN_429_HOURS = 6
     updated = 0
 
     for r in rows:
@@ -464,11 +781,13 @@ def _repull_market_values_to_inventory_sheet():
         link_canon = _canonicalize_reference_link(link)
         ll = link_canon.lower()
 
+        # Current stored values (used for skip/cooldown logic)
         cur_mp = _to_num(r[i_mp]) if i_mp is not None and i_mp < len(r) else 0.0
         cur_mv = _to_num(r[i_mv]) if i_mv is not None and i_mv < len(r) else 0.0
         cur_mpu = (r[i_mpu] if i_mpu is not None and i_mpu < len(r) else "").strip()
         cur_dbg = (r[i_dbg] if i_dbg is not None and i_dbg < len(r) else "").strip().lower()
 
+        # timestamp age
         mpu_dt = _to_dt(cur_mpu) if cur_mpu else pd.NaT
         age_hours = None
         if pd.notna(mpu_dt):
@@ -477,16 +796,20 @@ def _repull_market_values_to_inventory_sheet():
             except Exception:
                 age_hours = None
 
-        # ✅ If last attempt was a 429 recently, SKIP to avoid hammering
-        if age_hours is not None and age_hours >= 0 and age_hours < COOLDOWN_429_HOURS and "http_error_429" in cur_dbg:
+        # ✅ Cooldown for recent 429s
+        if age_hours is not None and 0 <= age_hours < COOLDOWN_429_HOURS and "http_error_429" in cur_dbg:
             market_price_raw.append([float(cur_mp or 0.0)])
             market_value_sel.append([float(cur_mv or 0.0)])
             market_updated_ats.append([cur_mpu])
             market_debug.append(["skipped_recent_429_cooldown"])
             continue
 
-        # ✅ If we have a good price and it’s recent, skip
-        if age_hours is not None and age_hours >= 0 and age_hours < RECENT_HOURS_OK and float(cur_mp or 0.0) > 0.0:
+        # ✅ Skip recent if within last 12h AND market_price != 0
+        is_recent = False
+        if age_hours is not None:
+            is_recent = (age_hours >= 0 and age_hours < RECENT_HOURS)
+
+        if is_recent and float(cur_mp or 0.0) > 0.0:
             market_price_raw.append([float(cur_mp or 0.0)])
             market_value_sel.append([float(cur_mv or 0.0)])
             market_updated_ats.append([cur_mpu])
@@ -523,8 +846,10 @@ def _repull_market_values_to_inventory_sheet():
         psa9_val = float(prices.get("psa9", 0.0) or 0.0)
         psa10_val = float(prices.get("psa10", 0.0) or 0.0)
 
+        # market_price should always be raw/ungraded
         market_price_raw.append([raw_val])
 
+        # market_value is chosen based on inventory grade when applicable
         mv = raw_val
         chosen = "raw"
         if (not is_sealed) and (not is_grading) and is_graded:
@@ -577,10 +902,28 @@ def _repull_market_values_to_inventory_sheet():
     return updated
 
 
-# =========================
-# ✅ IMPORTANT: don’t clear st.cache_data globally anymore
-# Instead: use a refresh_token cache-buster for sheet loads
-# =========================
+
+def _styler_table_header():
+    return [
+        {"selector": "th", "props": [("background-color", "#0f172a"), ("color", "white"), ("font-weight", "800")]},
+        {"selector": "td", "props": [("font-weight", "500")]},
+    ]
+
+
+def _style_group_and_total_rows(df: pd.DataFrame, first_col: str):
+    def _row_style(row):
+        v = _safe_str(row.get(first_col, ""))
+        if v.strip().lower() in {"totals", "total"}:
+            return ["background-color: #dbeafe; font-weight: 900;"] * len(row)
+        if v.startswith("  "):
+            return [""] * len(row)
+        return ["background-color: #eef2ff; font-weight: 800;"] * len(row)
+
+    return df.style.apply(_row_style, axis=1)
+
+
+
+# ✅ Token to force sheet reloads without clearing ALL caches (keeps _fetch_market_prices cache)
 if "refresh_token" not in st.session_state:
     st.session_state["refresh_token"] = 0
 
@@ -617,7 +960,8 @@ def load_sheet_df(worksheet_name: str, refresh_token: int = 0) -> pd.DataFrame:
             r = r[:width]
         norm_rows.append(r)
 
-    return pd.DataFrame(norm_rows, columns=fixed)
+    df = pd.DataFrame(norm_rows, columns=fixed)
+    return df
 
 
 # =========================
@@ -632,12 +976,11 @@ with top_right:
         except Exception as e:
             st.warning(f"Market refresh ran into an issue: {e}. Reloading anyway…")
 
-        # ✅ bump token to force sheet reloads without nuking _fetch_market_prices cache
+        # ✅ Do NOT clear global caches (causes re-scrape bursts => 429s)
+        # Instead force re-load of sheets via token.
         st.session_state["refresh_token"] += 1
         st.rerun()
 
-
-# fix it
 
 # =========================
 # Sheet names (defaults)
