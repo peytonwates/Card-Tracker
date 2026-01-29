@@ -322,19 +322,87 @@ def _fetch_market_prices(link: str) -> dict:
 
     Returns dict with:
       raw  = ungraded
-      psa9 = PSA 9 (or Grade 9 on SCP if PSA 9 not present)
-      psa10 = PSA 10
+      psa9 = PSA 9 (or Grade 9)
+      psa10 = PSA 10 (or Grade 10)
+
+    Also includes:
+      _debug = "success" or a reason string (why prices are 0)
     """
-    out = {"raw": 0.0, "psa9": 0.0, "psa10": 0.0}
+    out = {"raw": 0.0, "psa9": 0.0, "psa10": 0.0, "_debug": "unknown"}
+
     if not link:
+        out["_debug"] = "no_link"
         return out
 
-    # ✅ FIX: canonicalize the link so ?q=... and other variants still scrape
     url = _canonicalize_reference_link(link)
     u = url.lower()
 
     if ("pricecharting.com" not in u) and ("sportscardspro.com" not in u):
+        out["_debug"] = "unsupported_domain"
         return out
+
+    def _parse_money(s: str) -> float:
+        if not s:
+            return 0.0
+        m = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", s)
+        if not m:
+            return 0.0
+        try:
+            return float(m.group(1).replace(",", ""))
+        except Exception:
+            return 0.0
+
+    def _pick_from_map(m: dict, labels) -> float:
+        if not m:
+            return 0.0
+        # exact match
+        for lab in labels:
+            if lab in m:
+                return float(m.get(lab, 0.0) or 0.0)
+        # case-insensitive match
+        lower_map = {k.lower(): k for k in m.keys()}
+        for lab in labels:
+            k = lower_map.get(lab.lower())
+            if k:
+                return float(m.get(k, 0.0) or 0.0)
+        return 0.0
+
+    def _extract_price_map_from_price_cells(soup: BeautifulSoup) -> tuple[dict, set]:
+        """
+        Builds a label->price map by locating all elements with class "price js-price",
+        then finding the closest row label (usually first td/th in the same <tr>).
+
+        Returns:
+          (map, labels_seen)
+        """
+        price_map = {}
+        labels_seen = set()
+
+        cells = soup.select(".price.js-price")
+        if not cells:
+            return price_map, labels_seen
+
+        for cell in cells:
+            price_val = _parse_money(cell.get_text(" ", strip=True))
+
+            label = ""
+            tr = cell.find_parent("tr")
+            if tr:
+                tds = tr.find_all(["td", "th"])
+                if len(tds) >= 1:
+                    label = tds[0].get_text(" ", strip=True)
+
+            if not label:
+                prev = cell.find_previous(["td", "th"])
+                if prev:
+                    label = prev.get_text(" ", strip=True)
+
+            label = re.sub(r"\s+", " ", (label or "").strip())
+            if label:
+                labels_seen.add(label)
+                price_map[label] = float(price_val or 0.0)
+
+        return price_map, labels_seen
 
     try:
         headers = {
@@ -345,209 +413,74 @@ def _fetch_market_prices(link: str) -> dict:
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
 
-        # -------------------------
-        # PriceCharting parse
-        # -------------------------
-        if "pricecharting.com" in u:
-            nodes = soup.select(".price.js-price")
-            prices = []
-            for n in nodes:
-                t = n.get_text(" ", strip=True)
-                m = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", t)
-                prices.append(float(m.group(1).replace(",", "")) if m else 0.0)
+        # ---------------------------------------------------------
+        # ✅ Primary parse for BOTH sites:
+        # Find all ".price.js-price" cells and map them to row labels
+        # ---------------------------------------------------------
+        price_map, labels_seen = _extract_price_map_from_price_cells(soup)
 
-            # slots: 1=raw, 4=psa9, 6=psa10
-            if len(prices) >= 1:
-                out["raw"] = float(prices[0] or 0.0)
-            if len(prices) >= 4:
-                out["psa9"] = float(prices[3] or 0.0)
-            if len(prices) >= 6:
-                out["psa10"] = float(prices[5] or 0.0)
-            return out
+        raw_val = _pick_from_map(price_map, ["Ungraded", "Raw"])
+        psa9_val = _pick_from_map(price_map, ["PSA 9", "Grade 9"])
+        psa10_val = _pick_from_map(price_map, ["PSA 10", "Grade 10"])
 
-        # -------------------------
-        # SportsCardsPro parse
-        # -------------------------
-        def _parse_money(s: str) -> float:
-            if not s:
-                return 0.0
-            m = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", s)
-            if not m:
-                return 0.0
-            try:
-                return float(m.group(1).replace(",", ""))
-            except Exception:
-                return 0.0
+        # If we saw the target labels but they’re $0, treat that as "no sales data"
+        target_labels_present = any(
+            lab.lower() in {s.lower() for s in labels_seen}
+            for lab in ["Ungraded", "Raw", "PSA 9", "Grade 9", "PSA 10", "Grade 10"]
+        )
 
-        def _scp_from_full_price_guide_text(soup: BeautifulSoup) -> dict:
-            """
-            Parses the "Full Price Guide" section that appears in page text like:
-              Full Price Guide: ...
-              Ungraded $2.00
-              Grade 9 $13.18
-              PSA 10 $39.30
-            Returns dict with any labels it can read.
-            """
-            txt = soup.get_text("\n", strip=True)
-            lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
-
-            # find the "Full Price Guide" header line
-            start = None
-            for i, ln in enumerate(lines):
-                if re.search(r"\bFull Price Guide\b", ln, flags=re.IGNORECASE):
-                    start = i
-                    break
-            if start is None:
-                return {}
-
-            # consume subsequent lines until we hit the footer/explanation
-            stop_markers = [
-                r"^All prices are\b",
-                r"\bprices are based on the historic sales\b",
-                r"^Chart shows\b",
-            ]
-            out_map = {}
-            for ln in lines[start + 1 :]:
-                if any(re.search(p, ln, flags=re.IGNORECASE) for p in stop_markers):
-                    break
-
-                m = re.match(r"^([A-Za-z0-9 .]+)\s+(.+)$", ln)
-                if not m:
-                    continue
-
-                label = re.sub(r"\s+", " ", m.group(1)).strip()
-                tail = m.group(2).strip()
-
-                if tail in {"-", "—"} or tail.lower() in {"n/a", "na"}:
-                    val = 0.0
-                else:
-                    val = _parse_money(tail)
-
-                if label:
-                    out_map[label] = val
-
-            return out_map
-
-        def _scp_full_prices_table(soup: BeautifulSoup) -> dict:
-            """
-            Older/alternate markup: table rows like:
-              <tr><td>Ungraded</td><td class="price js-price">$1.99</td></tr>
-            Returns dict label->value for anything we find.
-            """
-            tbl_map = {}
-
-            tables = []
-            full_prices = soup.select_one("#full-prices")
-            if full_prices:
-                tables = full_prices.find_all("table")
-
-            if not tables:
-                tables = soup.find_all("table")
-
-            for tbl in tables:
-                for tr in tbl.find_all("tr"):
-                    tds = tr.find_all("td")
-                    if len(tds) < 2:
-                        continue
-
-                    label = tds[0].get_text(" ", strip=True)
-                    price_text = tds[1].get_text(" ", strip=True)
-                    if not label:
-                        continue
-
-                    label = re.sub(r"\s+", " ", label.strip())
-                    tbl_map[label] = _parse_money(price_text)
-
-            return tbl_map
-
-        def _pick_from_map(m: dict, labels):
-            if not m:
-                return 0.0
-            # exact match
-            for lab in labels:
-                if lab in m:
-                    return float(m.get(lab, 0.0) or 0.0)
-            # case-insensitive match
-            lower_map = {k.lower(): k for k in m.keys()}
-            for lab in labels:
-                k = lower_map.get(lab.lower())
-                if k:
-                    return float(m.get(k, 0.0) or 0.0)
-            return 0.0
-
-        # 1) FULL PRICE GUIDE (TEXT)
-        guide_map = _scp_from_full_price_guide_text(soup)
-        raw_val = _pick_from_map(guide_map, ["Ungraded", "Raw"])
-        psa10_val = _pick_from_map(guide_map, ["PSA 10"])
-        psa9_val = _pick_from_map(guide_map, ["PSA 9"])
-        if psa9_val <= 0:
-            psa9_val = _pick_from_map(guide_map, ["Grade 9"])
-
-        # 2) Table markup (if guide parse didn't yield anything)
-        if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
-            tbl = _scp_full_prices_table(soup)
-            raw_val = _pick_from_map(tbl, ["Ungraded", "Raw"])
-            psa10_val = _pick_from_map(tbl, ["PSA 10", "Grade 10"])
-            psa9_val = _pick_from_map(tbl, ["PSA 9"])
-            if psa9_val <= 0:
-                psa9_val = _pick_from_map(tbl, ["Grade 9"])
-
-        # 3) Fallback: robust text regex
+        # If the price cell strategy found nothing useful, fall back to text parsing (your old logic)
         if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
             text = soup.get_text("\n", strip=True)
-
-            def _money_from_text(label_patterns):
-                lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-                dollar_pat = re.compile(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-                label_res = [re.compile(p, flags=re.IGNORECASE) for p in label_patterns]
-
-                for i, ln in enumerate(lines):
-                    if any(rx.search(ln) for rx in label_res):
-                        m = dollar_pat.search(ln)
-                        if m:
-                            return float(m.group(1).replace(",", ""))
-                        for j in range(1, 6):
-                            if i + j < len(lines):
-                                m2 = dollar_pat.search(lines[i + j])
-                                if m2:
-                                    return float(m2.group(1).replace(",", ""))
-                return 0.0
 
             def _money_regex(pattern: str) -> float:
                 m = re.search(pattern, text, flags=re.IGNORECASE)
                 if not m:
                     return 0.0
-                return float(m.group(1).replace(",", ""))
+                try:
+                    return float(m.group(1).replace(",", ""))
+                except Exception:
+                    return 0.0
 
             raw_val = _money_regex(r"(?:Ungraded|Raw)\b[^$]{0,80}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-            psa10_val = _money_regex(r"PSA\s*10\b[^$]{0,80}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+            psa10_val = _money_regex(r"(?:PSA\s*10|Grade\s*10)\b[^$]{0,80}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+            psa9_val = _money_regex(r"(?:PSA\s*9|Grade\s*9)\b[^$]{0,80}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
 
-            psa9_val = _money_regex(r"PSA\s*9\b[^$]{0,80}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-            if psa9_val <= 0:
-                psa9_val = _money_regex(r"Grade\s*9\b[^$]{0,80}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-
-            if raw_val <= 0:
-                raw_val = _money_from_text([r"\bUngraded\b", r"\bRaw\b"])
-            if psa10_val <= 0:
-                psa10_val = _money_from_text([r"\bPSA\s*10\b"])
-            if psa9_val <= 0:
-                psa9_val = _money_from_text([r"\bPSA\s*9\b", r"\bGrade\s*9\b"])
+            if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
+                out["_debug"] = "parse_failed_no_prices_found"
+            else:
+                out["_debug"] = "success_text_fallback"
+        else:
+            if target_labels_present and (raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0):
+                out["_debug"] = "no_sales_data_all_targets_0"
+            else:
+                out["_debug"] = "success"
 
         out["raw"] = float(raw_val or 0.0)
         out["psa9"] = float(psa9_val or 0.0)
         out["psa10"] = float(psa10_val or 0.0)
         return out
 
-    except Exception:
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", None)
+        out["_debug"] = f"http_error_{code}" if code else "http_error"
         return out
+    except requests.Timeout:
+        out["_debug"] = "timeout"
+        return out
+    except Exception:
+        out["_debug"] = "exception"
+        return out
+
 
 
 def _repull_market_values_to_inventory_sheet():
     """
     Runs on Dashboard Refresh:
     - reads inventory sheet rows
-    - computes market_price/market_value from PriceCharting or SportsCardsPro
+    - computes market_price (raw/ungraded) and market_value (grade-selected) from PriceCharting or SportsCardsPro
     - writes back to inventory in ONE column update per market col (quota friendly)
+    - writes a debug status column describing success / why 0 was returned
     """
     ws = _open_ws(st.secrets.get("inventory_worksheet", "inventory"))
     values = ws.get_all_values()
@@ -578,9 +511,10 @@ def _repull_market_values_to_inventory_sheet():
         "grading_company",
         "grade",
         "condition",
-        "market_price",
-        "market_value",
+        "market_price",              # raw/ungraded
+        "market_value",              # grade-selected
         "market_price_updated_at",
+        "market_price_debug",        # ✅ NEW
     ]
 
     changed = False
@@ -600,34 +534,46 @@ def _repull_market_values_to_inventory_sheet():
     i_comp = col_idx("grading_company")
     i_grade = col_idx("grade")
     i_cond = col_idx("condition")
+
     i_mp = col_idx("market_price")
     i_mv = col_idx("market_value")
     i_mpu = col_idx("market_price_updated_at")
+    i_dbg = col_idx("market_price_debug")
 
-    # safety: if headers were appended, ensure indices exist
-    if i_mp is None or i_mv is None or i_mpu is None or i_ref is None:
+    if any(x is None for x in [i_ref, i_mp, i_mv, i_mpu, i_dbg]):
         raise RuntimeError("Inventory sheet is missing required market columns after header update.")
 
+    # Clear cached scrapes so refresh truly refreshes
     try:
         _fetch_market_prices.clear()
     except Exception:
         pass
 
-    market_prices = []
-    market_updated_ats = []
+    market_price_raw = []     # writes to market_price
+    market_value_sel = []     # writes to market_value
+    market_updated_ats = []   # writes to market_price_updated_at
+    market_debug = []         # writes to market_price_debug
+
     now_iso = pd.Timestamp.utcnow().isoformat()
     updated = 0
 
     for r in rows:
         link = (r[i_ref] if i_ref is not None and i_ref < len(r) else "").strip()
-
-        # ✅ FIX: canonicalize here too (so the cache key + scrape are consistent)
         link_canon = _canonicalize_reference_link(link)
         ll = link_canon.lower()
 
-        if ("pricecharting.com" not in ll) and ("sportscardspro.com" not in ll):
-            market_prices.append([0.0])
+        if not link_canon:
+            market_price_raw.append([0.0])
+            market_value_sel.append([0.0])
             market_updated_ats.append([""])
+            market_debug.append(["no_link"])
+            continue
+
+        if ("pricecharting.com" not in ll) and ("sportscardspro.com" not in ll):
+            market_price_raw.append([0.0])
+            market_value_sel.append([0.0])
+            market_updated_ats.append([""])
+            market_debug.append(["unsupported_domain"])
             continue
 
         status = (r[i_status] if i_status is not None and i_status < len(r) else "").strip().upper()
@@ -642,18 +588,47 @@ def _repull_market_values_to_inventory_sheet():
         is_grading = (status == "GRADING")
         is_graded = ("graded" in pt) or bool(comp) or bool(grade) or ("graded" in cond)
 
-        # Market value logic:
-        # - default to raw/ungraded
-        # - if graded, use PSA 9/10 as appropriate
-        mv = float(prices.get("raw", 0.0) or 0.0)
+        raw_val = float(prices.get("raw", 0.0) or 0.0)
+        psa9_val = float(prices.get("psa9", 0.0) or 0.0)
+        psa10_val = float(prices.get("psa10", 0.0) or 0.0)
+
+        # market_price should always be raw/ungraded (helps troubleshooting + makes columns meaningful)
+        market_price_raw.append([raw_val])
+
+        # market_value is chosen based on inventory grade when applicable
+        mv = raw_val
+        chosen = "raw"
         if (not is_sealed) and (not is_grading) and is_graded:
             if "10" in grade:
-                mv = float(prices.get("psa10", 0.0) or 0.0)
+                mv = psa10_val
+                chosen = "psa10_or_grade10"
+                # fallback: if grade wants 10 but 0, fall back to raw (so you still have something)
+                if mv <= 0 and raw_val > 0:
+                    mv = raw_val
+                    chosen = "psa10_missing_fallback_to_raw"
             elif "9" in grade:
-                mv = float(prices.get("psa9", 0.0) or 0.0)
+                mv = psa9_val
+                chosen = "psa9_or_grade9"
+                if mv <= 0 and raw_val > 0:
+                    mv = raw_val
+                    chosen = "psa9_missing_fallback_to_raw"
 
-        market_prices.append([mv])
+        market_value_sel.append([float(mv or 0.0)])
         market_updated_ats.append([now_iso])
+
+        # Debug column: "success" or reason
+        dbg = prices.get("_debug", "unknown")
+        if dbg.startswith("success") or dbg == "success":
+            # If scraping succeeded but the chosen mv is still 0, call it out explicitly
+            if (raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0):
+                market_debug.append(["no_sales_data_or_targets_missing"])
+            else:
+                market_debug.append([f"success ({chosen})"])
+        else:
+            # scrape-level failure reasons (timeout/http/parse/etc.)
+            # also annotate what we tried to choose
+            market_debug.append([f"{dbg} ({chosen})"])
+
         updated += 1
 
     def a1_col_letter(n: int) -> str:
@@ -664,15 +639,19 @@ def _repull_market_values_to_inventory_sheet():
         return letters
 
     mp_col_letter = a1_col_letter(i_mp + 1)
-    ws.update(f"{mp_col_letter}2:{mp_col_letter}{nrows+1}", market_prices, value_input_option="USER_ENTERED")
+    ws.update(f"{mp_col_letter}2:{mp_col_letter}{nrows+1}", market_price_raw, value_input_option="USER_ENTERED")
 
     mv_col_letter = a1_col_letter(i_mv + 1)
-    ws.update(f"{mv_col_letter}2:{mv_col_letter}{nrows+1}", market_prices, value_input_option="USER_ENTERED")
+    ws.update(f"{mv_col_letter}2:{mv_col_letter}{nrows+1}", market_value_sel, value_input_option="USER_ENTERED")
 
     mpu_col_letter = a1_col_letter(i_mpu + 1)
     ws.update(f"{mpu_col_letter}2:{mpu_col_letter}{nrows+1}", market_updated_ats, value_input_option="USER_ENTERED")
 
+    dbg_col_letter = a1_col_letter(i_dbg + 1)
+    ws.update(f"{dbg_col_letter}2:{dbg_col_letter}{nrows+1}", market_debug, value_input_option="USER_ENTERED")
+
     return updated
+
 
 
 def _styler_table_header():
