@@ -367,8 +367,22 @@ def _fetch_market_prices(link: str) -> dict:
                 return float(m.get(k, 0.0) or 0.0)
         return 0.0
 
+    def _looks_like_bot_or_block(text: str) -> bool:
+        t = (text or "").lower()
+        bad = [
+            "access denied",
+            "request blocked",
+            "captcha",
+            "unusual traffic",
+            "verify you are a human",
+            "cloudflare",
+            "attention required",
+        ]
+        return any(x in t for x in bad)
+
     def _extract_price_map_from_price_cells(soup: BeautifulSoup) -> tuple[dict, set]:
         """
+        Strategy A:
         Builds a label->price map by locating all elements with class "price js-price",
         then finding the closest row label (usually first td/th in the same <tr>).
 
@@ -404,6 +418,80 @@ def _fetch_market_prices(link: str) -> dict:
 
         return price_map, labels_seen
 
+    def _extract_price_map_generic_table(soup: BeautifulSoup) -> tuple[dict, set]:
+        """
+        Strategy B:
+        Some pages render the price guide without `.price.js-price`.
+        Scan table rows: label in first cell, money in later cells or common price classes.
+        """
+        price_map = {}
+        labels_seen = set()
+
+        for tr in soup.find_all("tr"):
+            cells = tr.find_all(["td", "th"])
+            if len(cells) < 2:
+                continue
+
+            label = re.sub(r"\s+", " ", (cells[0].get_text(" ", strip=True) or "")).strip()
+            if not label:
+                continue
+
+            price_val = 0.0
+            for c in cells[1:]:
+                pv = _parse_money(c.get_text(" ", strip=True))
+                if pv > 0:
+                    price_val = pv
+                    break
+
+            if price_val == 0.0:
+                pcell = tr.select_one("td.price, span.price, div.price")
+                if pcell:
+                    price_val = _parse_money(pcell.get_text(" ", strip=True))
+
+            if price_val != 0.0:
+                labels_seen.add(label)
+                price_map[label] = float(price_val or 0.0)
+
+        return price_map, labels_seen
+
+    def _extract_prices_from_jsonld(soup: BeautifulSoup) -> dict:
+        """
+        Strategy C:
+        If JSON-LD exists, sometimes it includes offers/price.
+        Typically only helps with a raw-ish price.
+        """
+        result = {}
+        scripts = soup.find_all("script", type="application/ld+json")
+        for sc in scripts:
+            try:
+                txt = sc.string or ""
+                if not txt.strip():
+                    continue
+                data = json.loads(txt)
+                items = data if isinstance(data, list) else [data]
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    offers = it.get("offers")
+                    if isinstance(offers, dict):
+                        price = offers.get("price")
+                        if price is not None:
+                            try:
+                                result["raw"] = float(price)
+                            except Exception:
+                                pass
+                    elif isinstance(offers, list):
+                        for off in offers:
+                            if isinstance(off, dict) and off.get("price") is not None:
+                                try:
+                                    result["raw"] = float(off.get("price"))
+                                    break
+                                except Exception:
+                                    pass
+            except Exception:
+                continue
+        return result
+
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (CardTracker; +Streamlit)",
@@ -411,25 +499,52 @@ def _fetch_market_prices(link: str) -> dict:
         }
         r = requests.get(url, headers=headers, timeout=12)
         r.raise_for_status()
+
+        if _looks_like_bot_or_block(r.text[:5000]):
+            out["_debug"] = "blocked_or_captcha"
+            return out
+
         soup = BeautifulSoup(r.text, "lxml")
 
-        # ---------------------------------------------------------
-        # ✅ Primary parse for BOTH sites:
-        # Find all ".price.js-price" cells and map them to row labels
-        # ---------------------------------------------------------
+        # Strategy A
         price_map, labels_seen = _extract_price_map_from_price_cells(soup)
 
         raw_val = _pick_from_map(price_map, ["Ungraded", "Raw"])
         psa9_val = _pick_from_map(price_map, ["PSA 9", "Grade 9"])
         psa10_val = _pick_from_map(price_map, ["PSA 10", "Grade 10"])
 
-        # If we saw the target labels but they’re $0, treat that as "no sales data"
         target_labels_present = any(
             lab.lower() in {s.lower() for s in labels_seen}
             for lab in ["Ungraded", "Raw", "PSA 9", "Grade 9", "PSA 10", "Grade 10"]
         )
 
-        # If the price cell strategy found nothing useful, fall back to text parsing (your old logic)
+        # Strategy B
+        if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
+            pm2, ls2 = _extract_price_map_generic_table(soup)
+            if pm2:
+                price_map = {**price_map, **pm2}
+                labels_seen = set(list(labels_seen) + list(ls2))
+
+            raw_val = raw_val or _pick_from_map(price_map, ["Ungraded", "Raw"])
+            psa9_val = psa9_val or _pick_from_map(price_map, ["PSA 9", "Grade 9"])
+            psa10_val = psa10_val or _pick_from_map(price_map, ["PSA 10", "Grade 10"])
+
+            target_labels_present = target_labels_present or any(
+                lab.lower() in {s.lower() for s in labels_seen}
+                for lab in ["Ungraded", "Raw", "PSA 9", "Grade 9", "PSA 10", "Grade 10"]
+            )
+
+        # Strategy C (JSON-LD raw only)
+        if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
+            j = _extract_prices_from_jsonld(soup)
+            if "raw" in j and j["raw"] > 0:
+                out["_debug"] = "success_jsonld_raw_only"
+                out["raw"] = float(j["raw"] or 0.0)
+                out["psa9"] = 0.0
+                out["psa10"] = 0.0
+                return out
+
+        # Strategy D (final text fallback)
         if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
             text = soup.get_text("\n", strip=True)
 
@@ -442,9 +557,9 @@ def _fetch_market_prices(link: str) -> dict:
                 except Exception:
                     return 0.0
 
-            raw_val = _money_regex(r"(?:Ungraded|Raw)\b[^$]{0,80}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-            psa10_val = _money_regex(r"(?:PSA\s*10|Grade\s*10)\b[^$]{0,80}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-            psa9_val = _money_regex(r"(?:PSA\s*9|Grade\s*9)\b[^$]{0,80}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+            raw_val = _money_regex(r"(?:Ungraded|Raw)\b[^$]{0,120}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+            psa10_val = _money_regex(r"(?:PSA\s*10|Grade\s*10)\b[^$]{0,120}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+            psa9_val = _money_regex(r"(?:PSA\s*9|Grade\s*9)\b[^$]{0,120}\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
 
             if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
                 out["_debug"] = "parse_failed_no_prices_found"
@@ -481,6 +596,10 @@ def _repull_market_values_to_inventory_sheet():
     - computes market_price (raw/ungraded) and market_value (grade-selected) from PriceCharting or SportsCardsPro
     - writes back to inventory in ONE column update per market col (quota friendly)
     - writes a debug status column describing success / why 0 was returned
+
+    ✅ New behavior:
+    - If market_price_updated_at is within last 12 hours, we SKIP re-scraping
+      UNLESS current market_price is 0.
     """
     ws = _open_ws(st.secrets.get("inventory_worksheet", "inventory"))
     values = ws.get_all_values()
@@ -543,7 +662,7 @@ def _repull_market_values_to_inventory_sheet():
     if any(x is None for x in [i_ref, i_mp, i_mv, i_mpu, i_dbg]):
         raise RuntimeError("Inventory sheet is missing required market columns after header update.")
 
-    # Clear cached scrapes so refresh truly refreshes
+    # Clear cached scrapes so refresh truly refreshes for rows we actually re-fetch
     try:
         _fetch_market_prices.clear()
     except Exception:
@@ -554,13 +673,40 @@ def _repull_market_values_to_inventory_sheet():
     market_updated_ats = []   # writes to market_price_updated_at
     market_debug = []         # writes to market_price_debug
 
-    now_iso = pd.Timestamp.utcnow().isoformat()
+    now_utc = pd.Timestamp.utcnow()
+    now_iso = now_utc.isoformat()
+
+    RECENT_HOURS = 12
     updated = 0
 
     for r in rows:
         link = (r[i_ref] if i_ref is not None and i_ref < len(r) else "").strip()
         link_canon = _canonicalize_reference_link(link)
         ll = link_canon.lower()
+
+        # Current stored values (used for "skip recent" logic)
+        cur_mp = _to_num(r[i_mp]) if i_mp is not None and i_mp < len(r) else 0.0
+        cur_mv = _to_num(r[i_mv]) if i_mv is not None and i_mv < len(r) else 0.0
+        cur_mpu = (r[i_mpu] if i_mpu is not None and i_mpu < len(r) else "").strip()
+
+        # ✅ Skip if updated within last 12h AND market_price != 0
+        mpu_dt = _to_dt(cur_mpu) if cur_mpu else pd.NaT
+        is_recent = False
+        if pd.notna(mpu_dt):
+            try:
+                # Treat naive timestamps as UTC
+                mpu_dt_utc = pd.Timestamp(mpu_dt)
+                age_hours = (now_utc - mpu_dt_utc).total_seconds() / 3600.0
+                is_recent = age_hours >= 0 and age_hours < RECENT_HOURS
+            except Exception:
+                is_recent = False
+
+        if is_recent and float(cur_mp or 0.0) > 0.0:
+            market_price_raw.append([float(cur_mp or 0.0)])
+            market_value_sel.append([float(cur_mv or 0.0)])
+            market_updated_ats.append([cur_mpu])
+            market_debug.append(["skipped_recent_under_12h"])
+            continue
 
         if not link_canon:
             market_price_raw.append([0.0])
@@ -592,7 +738,7 @@ def _repull_market_values_to_inventory_sheet():
         psa9_val = float(prices.get("psa9", 0.0) or 0.0)
         psa10_val = float(prices.get("psa10", 0.0) or 0.0)
 
-        # market_price should always be raw/ungraded (helps troubleshooting + makes columns meaningful)
+        # market_price should always be raw/ungraded
         market_price_raw.append([raw_val])
 
         # market_value is chosen based on inventory grade when applicable
@@ -602,7 +748,6 @@ def _repull_market_values_to_inventory_sheet():
             if "10" in grade:
                 mv = psa10_val
                 chosen = "psa10_or_grade10"
-                # fallback: if grade wants 10 but 0, fall back to raw (so you still have something)
                 if mv <= 0 and raw_val > 0:
                     mv = raw_val
                     chosen = "psa10_missing_fallback_to_raw"
@@ -616,17 +761,13 @@ def _repull_market_values_to_inventory_sheet():
         market_value_sel.append([float(mv or 0.0)])
         market_updated_ats.append([now_iso])
 
-        # Debug column: "success" or reason
         dbg = prices.get("_debug", "unknown")
         if dbg.startswith("success") or dbg == "success":
-            # If scraping succeeded but the chosen mv is still 0, call it out explicitly
             if (raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0):
                 market_debug.append(["no_sales_data_or_targets_missing"])
             else:
                 market_debug.append([f"success ({chosen})"])
         else:
-            # scrape-level failure reasons (timeout/http/parse/etc.)
-            # also annotate what we tried to choose
             market_debug.append([f"{dbg} ({chosen})"])
 
         updated += 1
