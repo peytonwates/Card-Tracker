@@ -657,21 +657,34 @@ def _batch_update_rows(ws, sheet_headers: list[str], updates: list[tuple[int, di
     _with_backoff(lambda: ws.batch_update(data, value_input_option="USER_ENTERED"))
 
 
-def _compute_net_and_profit(all_in_cost: float, sold_price: float, fees: float, shipping_charged: float) -> tuple[float, float]:
+def _compute_net_and_profit(all_in_cost: float, sold_price: float, fees: float, shipping_charge: float) -> tuple[float, float]:
+    """
+    SOLD LOGIC (per your definition):
+    - sold_price = total the buyer paid (all-in)
+    - fees = platform fees
+    - shipping_charge = what YOU paid for shipping
+    - net_proceeds = sold_price - fees - shipping_charge
+    - profit = net_proceeds - all_in_cost
+    """
     sold_price = float(sold_price or 0.0)
     fees = float(fees or 0.0)
-    shipping_charged = float(shipping_charged or 0.0)
+    shipping_charge = float(shipping_charge or 0.0)
     all_in_cost = float(all_in_cost or 0.0)
 
-    net = round(sold_price - fees + shipping_charged, 2)
+    net = round(sold_price - fees - shipping_charge, 2)
     profit = round(net - all_in_cost, 2)
     return net, profit
 
 
-def _compute_fees_total_for_dashboard(fees: float, shipping_charged: float) -> float:
+def _compute_fees_total_for_dashboard(fees: float, shipping_charge: float) -> float:
+    """
+    Dashboard alignment:
+    If Dashboard does net as (sold_price - fees_total),
+    then fees_total must include ALL deductions: fees + shipping_charge.
+    """
     fees = float(fees or 0.0)
-    shipping_charged = float(shipping_charged or 0.0)
-    return float(round(fees - shipping_charged, 2))
+    shipping_charge = float(shipping_charge or 0.0)
+    return float(round(fees + shipping_charge, 2))
 
 
 # =========================================================
@@ -1141,7 +1154,13 @@ with tab_create:
                     with l3:
                         fees = st.number_input("Fees (optional)", min_value=0.0, step=1.0, format="%.2f")
                     with l4:
-                        shipping_charged = st.number_input("Shipping charged (optional)", min_value=0.0, step=1.0, format="%.2f")
+                        shipping_charged = st.number_input(
+                            "Shipping charge (what you paid) (optional)",
+                            min_value=0.0,
+                            step=1.0,
+                            format="%.2f"
+                        )
+
 
                     list_date = ""
                     list_price = 0.0
@@ -1188,9 +1207,10 @@ with tab_create:
                             all_in_cost=all_in_cost,
                             sold_price=sold_price,
                             fees=fees,
-                            shipping_charged=shipping_charged,
+                            shipping_charge=shipping_charged,
                         )
                         fees_total = _compute_fees_total_for_dashboard(fees, shipping_charged)
+
                         tx_status = TX_STATUS_SOLD
                     else:
                         net, profit = 0.0, 0.0
@@ -1325,7 +1345,13 @@ with tab_update:
                 with s3:
                     fees = st.number_input("Fees*", min_value=0.0, step=1.0, format="%.2f")
                 with s4:
-                    shipping_charged = st.number_input("Shipping charged (optional)", min_value=0.0, step=1.0, format="%.2f")
+                    shipping_charged = st.number_input(
+                        "Shipping charge (what you paid) (optional)",
+                        min_value=0.0,
+                        step=1.0,
+                        format="%.2f"
+                    )
+
 
                 notes = st.text_input("Notes (optional)", value=str(tx_row.get("notes", "") or ""))
 
@@ -1424,9 +1450,10 @@ with tab_update:
                         all_in_cost=all_in_cost,
                         sold_price=sold_price,
                         fees=fees,
-                        shipping_charged=shipping_charged,
+                        shipping_charge=shipping_charged,
                     )
                     fees_total = _compute_fees_total_for_dashboard(fees, shipping_charged)
+
 
                     tx_internal["sold_date"] = str(sold_date)
                     tx_internal["sold_price"] = float(sold_price)
