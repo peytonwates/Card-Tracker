@@ -2585,16 +2585,18 @@ with tab_forecast:
 
             target_dwell = 14.0
             dwell_str = f"{avg_dwell:,.1f} days" if avg_dwell is not None else "—"
+
             if avg_dwell is None:
                 st.metric("Avg Dwell (Cards Only)", dwell_str)
             else:
-                dwell_delta_val = avg_dwell - target_dwell  # <=0 is good
+                dwell_delta_val = avg_dwell - target_dwell  # <= 0 is good
                 st.metric(
                     "Avg Dwell (Cards Only)",
                     dwell_str,
                     delta=f"{dwell_delta_val:+.1f} vs target",
-                    delta_color="normal",
+                    delta_color="inverse",  # ✅ negative is green, positive is red
                 )
+
 
             # Pokemon gradable rate = # sent in / # purchased (Pokemon cards only) target 50% (higher is better)
             pokemon_purchased = 0
