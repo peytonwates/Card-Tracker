@@ -1181,7 +1181,7 @@ with tab_update:
                     updated.at[idx, "returned_date"] = safe_str(e.get("returned_date", "")).strip()
                     updated.at[idx, "received_grade"] = safe_str(e.get("received_grade", "")).strip()
 
-                    if (not is_blank(updated.at[idx, "returned_date"])) or (not is_blank(updated.at[idx, "received_grade"]))):
+                    if (not is_blank(updated.at[idx, "returned_date"])) or (not is_blank(updated.at[idx, "received_grade"])):
                         updated.at[idx, "status"] = "RETURNED"
 
                     updated.at[idx, "updated_at"] = datetime.utcnow().isoformat()
