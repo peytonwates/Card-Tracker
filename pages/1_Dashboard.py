@@ -1027,15 +1027,25 @@ if not inv.empty:
     inv_company_col = _pick_col(inv, "grading_company", "grading_company")
     inv_condition_col = _pick_col(inv, "condition", "condition")
 
+    # ✅ NEW: Purchased From (for filtering)
+    inv_purchased_from_col = (
+        _pick_col(inv, "purchased_from", None)
+        or _pick_col(inv, "purchase_from", None)
+        or _pick_col(inv, "source", None)
+        or "purchased_from"
+    )
+
+
     inv_market_col = _pick_col(inv, "market_price", None) or _pick_col(inv, "market_value", None)
 
     for needed in [inv_id_col, inv_status_col, inv_total_col, inv_purchase_date_col, inv_ref_col]:
         if needed not in inv.columns:
             inv[needed] = ""
 
-    for needed in [inv_product_type_col, inv_card_type_col, inv_grade_col, inv_company_col, inv_condition_col]:
+    for needed in [inv_product_type_col, inv_card_type_col, inv_grade_col, inv_company_col, inv_condition_col, inv_purchased_from_col]:
         if needed not in inv.columns:
             inv[needed] = ""
+
 
     inv[inv_status_col] = inv[inv_status_col].replace("", "ACTIVE").fillna("ACTIVE").astype(str)
     inv[inv_total_col] = _to_num(inv[inv_total_col])
@@ -1055,10 +1065,12 @@ else:
     inv_grade_col = "grade"
     inv_company_col = "grading_company"
     inv_condition_col = "condition"
+    inv_purchased_from_col = "purchased_from"
+
     inv = pd.DataFrame(columns=[
         inv_id_col, inv_status_col, inv_total_col, inv_purchase_date_col,
         inv_product_type_col, inv_card_type_col, inv_grade_col, inv_company_col, inv_condition_col,
-        "__purchase_dt", "__market_price"
+        "__purchase_dt","__purchase_dt", "__market_price"
     ])
 
 
@@ -1347,9 +1359,10 @@ tab_bs, tab_forecast, tab_bench = st.tabs(["Balance Sheet", "Expenses + Forecast
 with tab_bs:
     st.subheader("Balance Sheet (Filtered)")
 
-    f1, f2 = st.columns([1, 1])
+    f1, f2, f3 = st.columns([1, 1, 2])
     with f1:
         year_choice = st.selectbox("Year", options=year_opts, index=0)
+
     with f2:
         if year_choice != "All":
             try:
@@ -1362,10 +1375,44 @@ with tab_bs:
 
         month_choice = st.selectbox("Month", options=month_opts, index=0)
 
+    with f3:
+        purchased_from_opts = []
+        if not inv.empty and inv_purchased_from_col in inv.columns:
+            purchased_from_opts = sorted({
+                _safe_str(x).strip()
+                for x in inv[inv_purchased_from_col].dropna().tolist()
+                if _safe_str(x).strip()
+            })
+
+        purchased_from_choice = st.multiselect(
+            "Purchased From",
+            options=purchased_from_opts,
+            default=purchased_from_opts,   # ✅ default = all
+        )
+
+
     inv_f = _apply_period_filter(inv, "__purchase_dt", year_choice, month_choice) if not inv.empty else inv
     txn_f = _apply_period_filter(txn, "__sold_dt", year_choice, month_choice) if not txn.empty else txn
     grd_f = _apply_period_filter(grd, "__grading_dt", year_choice, month_choice) if not grd.empty else grd
     misc_f = _apply_period_filter(misc, "__dt", year_choice, month_choice) if not misc.empty else misc
+
+        # ✅ NEW: apply Purchased From filter (inventory + sales)
+    if purchased_from_choice and (not inv.empty) and (inv_purchased_from_col in inv.columns):
+        # Filter inventory lines (purchases in period)
+        if not inv_f.empty and inv_purchased_from_col in inv_f.columns:
+            inv_f = inv_f[inv_f[inv_purchased_from_col].astype(str).str.strip().isin(purchased_from_choice)].copy()
+
+        # Filter sales lines (sold in period) by inventory_id -> purchased_from
+        allowed_ids = set(
+            inv.loc[
+                inv[inv_purchased_from_col].astype(str).str.strip().isin(purchased_from_choice),
+                inv_id_col
+            ].astype(str).str.strip().tolist()
+        )
+
+        if not txn_f.empty and "__inventory_id" in txn_f.columns:
+            txn_f = txn_f[txn_f["__inventory_id"].astype(str).str.strip().isin(allowed_ids)].copy()
+
 
     inv_by_id = {}
     if not inv.empty:
@@ -1466,6 +1513,14 @@ with tab_bs:
             & (inv_holdings["__purchase_dt"] <= asof_cutoff)
             & (inv_holdings["__sold_dt"].isna() | (inv_holdings["__sold_dt"] > asof_cutoff))
         ].copy()
+
+
+                # ✅ NEW: Purchased From filter applies to holdings/listings too
+        if purchased_from_choice and inv_purchased_from_col in inv_holdings.columns:
+            inv_holdings = inv_holdings[
+                inv_holdings[inv_purchased_from_col].astype(str).str.strip().isin(purchased_from_choice)
+            ].copy()
+
 
     # -------------------------
     # ASSETS
