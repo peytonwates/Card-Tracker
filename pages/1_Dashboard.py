@@ -1949,204 +1949,565 @@ with tab_bs:
 
 
 # =========================================================
-# TAB 2: Expenses + Forecast (unchanged)
+# TAB 2: Expenses + Forecast (REPLACED)
 # =========================================================
 with tab_forecast:
-    st.subheader("Cumulative View (Monthly)")
+    st.subheader("Business Dashboard")
 
-    inv_monthly = pd.DataFrame(columns=["month", "inventory_expense"])
-    if not inv.empty and "__purchase_dt" in inv.columns:
-        inv_monthly = (
-            inv.dropna(subset=["__purchase_dt"])
-              .assign(month=_month_start(inv["__purchase_dt"]))
-              .groupby("month", as_index=False)[inv_total_col]
-              .sum()
-              .rename(columns={inv_total_col: "inventory_expense"})
+    # -------------------------
+    # Filters (apply across this tab)
+    # -------------------------
+    f1, f2, f3, f4, f5 = st.columns([1, 1, 2, 1.4, 1.2])
+
+    with f1:
+        year_choice_2 = st.selectbox("Year", options=year_opts, index=0, key="dash_year")
+
+    with f2:
+        if year_choice_2 != "All":
+            try:
+                y = int(year_choice_2)
+                month_opts_2 = ["All"] + [m for m in month_opts_all[1:] if m.startswith(f"{y}-")]
+            except Exception:
+                month_opts_2 = month_opts_all
+        else:
+            month_opts_2 = month_opts_all
+
+        month_choice_2 = st.selectbox("Month", options=month_opts_2, index=0, key="dash_month")
+
+    # Purchased From options (from inventory)
+    purchased_from_opts_2 = []
+    if not inv.empty and inv_purchased_from_col in inv.columns:
+        purchased_from_opts_2 = sorted({
+            _safe_str(x).strip()
+            for x in inv[inv_purchased_from_col].dropna().tolist()
+            if _safe_str(x).strip()
+        })
+
+    with f3:
+        purchased_from_choice_2 = st.multiselect(
+            "Purchased From",
+            options=purchased_from_opts_2,
+            default=purchased_from_opts_2,
+            key="dash_purchased_from",
         )
 
-    misc_monthly = pd.DataFrame(columns=["month", "misc_expense"])
-    if not misc.empty and "__month" in misc.columns:
-        misc_monthly = misc.groupby("__month", as_index=False)["__amount"].sum().rename(columns={"__month": "month", "__amount": "misc_expense"})
+    # Product type options (from inventory)
+    product_type_opts_2 = []
+    if not inv.empty and inv_product_type_col in inv.columns:
+        product_type_opts_2 = sorted({
+            _safe_str(x).strip()
+            for x in inv[inv_product_type_col].dropna().tolist()
+            if _safe_str(x).strip()
+        })
 
-    grading_monthly = pd.DataFrame(columns=["month", "grading_expense"])
-    if not grd.empty and "__grading_month" in grd.columns:
-        grading_monthly = grd.groupby("__grading_month", as_index=False)["__grading_cost"].sum().rename(columns={"__grading_month": "month", "__grading_cost": "grading_expense"})
+    with f4:
+        product_type_choice_2 = st.multiselect(
+            "Product Type",
+            options=product_type_opts_2,
+            default=product_type_opts_2,
+            key="dash_product_type",
+        )
 
-    sales_monthly = pd.DataFrame(columns=["month", "sales_net"])
-    if not txn.empty and "__sold_month" in txn.columns:
-        sales_monthly = txn.groupby("__sold_month", as_index=False)["__net"].sum().rename(columns={"__sold_month": "month", "__net": "sales_net"})
-        sales_monthly = sales_monthly.dropna(subset=["month"])
+    with f5:
+        card_type_choice_2 = st.multiselect(
+            "Card Type",
+            options=["Pokemon", "Sports"],
+            default=["Pokemon", "Sports"],
+            key="dash_card_type",
+        )
 
-    inv_market_by_month = pd.DataFrame(columns=["month", "inventory_market_value"])
-    if not inv.empty and "__purchase_dt" in inv.columns and inv["__purchase_dt"].notna().any():
-        sold_dt_by_id = {}
-        if not txn.empty and "__sold_dt" in txn.columns and "__inventory_id" in txn.columns:
-            tmp = txn[["__inventory_id", "__sold_dt"]].copy()
-            tmp = tmp.dropna(subset=["__sold_dt"])
-            sold_dt_by_id = tmp.groupby("__inventory_id")["__sold_dt"].min().to_dict()
+    # -------------------------
+    # Apply time filters first (date-based)
+    # -------------------------
+    inv_f2 = _apply_period_filter(inv, "__purchase_dt", year_choice_2, month_choice_2) if not inv.empty else inv
+    txn_f2 = _apply_period_filter(txn, "__sold_dt", year_choice_2, month_choice_2) if not txn.empty else txn
+    grd_f2 = _apply_period_filter(grd, "__grading_dt", year_choice_2, month_choice_2) if not grd.empty else grd
+    misc_f2 = _apply_period_filter(misc, "__dt", year_choice_2, month_choice_2) if not misc.empty else misc
 
-        inv_tmp = inv.copy()
-        inv_tmp[inv_id_col] = inv_tmp[inv_id_col].apply(lambda x: _safe_str(x).strip())
-        inv_tmp["__sold_dt"] = inv_tmp[inv_id_col].astype(str).map(sold_dt_by_id)
-        inv_tmp["__sold_dt"] = _to_dt(inv_tmp["__sold_dt"])
+    # -------------------------
+    # Apply dimension filters (Purchased From, Product Type, Card Type)
+    # - Inventory is filtered directly
+    # - Transactions + Grading are filtered via inventory_id linkage to inventory
+    # -------------------------
+    if not inv_f2.empty:
+        # Purchased From filter
+        if purchased_from_choice_2 and inv_purchased_from_col in inv_f2.columns:
+            inv_f2 = inv_f2[inv_f2[inv_purchased_from_col].astype(str).str.strip().isin(purchased_from_choice_2)].copy()
 
-        min_month = _month_start(inv_tmp["__purchase_dt"]).min()
-        today_month = pd.Timestamp(date.today().replace(day=1))
-        max_month = today_month
+        # Product type filter
+        if product_type_choice_2 and inv_product_type_col in inv_f2.columns:
+            inv_f2 = inv_f2[inv_f2[inv_product_type_col].astype(str).str.strip().isin(product_type_choice_2)].copy()
 
-        if not open_grading.empty and "__est_return_month" in open_grading.columns and open_grading["__est_return_month"].notna().any():
-            max_month = max(max_month, open_grading["__est_return_month"].max())
+        # Card type filter
+        if card_type_choice_2 and inv_card_type_col in inv_f2.columns:
+            inv_f2["__ct"] = inv_f2[inv_card_type_col].apply(_normalize_card_type)
+            inv_f2 = inv_f2[inv_f2["__ct"].isin(card_type_choice_2)].copy()
 
-        months = pd.date_range(min_month, max_month, freq="MS")
-        rows = []
-        for m in months:
-            end_m = (m + pd.offsets.MonthEnd(1)).to_pydatetime()
-            held = (inv_tmp["__purchase_dt"] <= end_m) & ((inv_tmp["__sold_dt"].isna()) | (inv_tmp["__sold_dt"] > end_m))
-            mv = float(inv_tmp.loc[held, "__market_price"].sum()) if "__market_price" in inv_tmp.columns else 0.0
-            rows.append({"month": m, "inventory_market_value": mv})
-        inv_market_by_month = pd.DataFrame(rows)
+    # Allowed inventory ids for other tables
+    allowed_ids_2 = set()
+    if not inv.empty and inv_id_col in inv.columns:
+        inv_all_tmp = inv.copy()
+        inv_all_tmp[inv_id_col] = inv_all_tmp[inv_id_col].apply(lambda x: _safe_str(x).strip())
 
-    all_months = []
-    for d in [inv_monthly.get("month"), misc_monthly.get("month"), grading_monthly.get("month"), sales_monthly.get("month"), inv_market_by_month.get("month")]:
-        if isinstance(d, pd.Series) and not d.empty:
-            all_months.append(d.dropna())
+        # Build allowed IDs from the UNFILTERED inv, but apply the SAME dimension filters (not date)
+        mask = pd.Series(True, index=inv_all_tmp.index)
 
-    if all_months:
-        min_m = min([s.min() for s in all_months])
-        max_m = max([s.max() for s in all_months])
+        if purchased_from_choice_2 and inv_purchased_from_col in inv_all_tmp.columns:
+            mask &= inv_all_tmp[inv_purchased_from_col].astype(str).str.strip().isin(purchased_from_choice_2)
+
+        if product_type_choice_2 and inv_product_type_col in inv_all_tmp.columns:
+            mask &= inv_all_tmp[inv_product_type_col].astype(str).str.strip().isin(product_type_choice_2)
+
+        if card_type_choice_2 and inv_card_type_col in inv_all_tmp.columns:
+            mask &= inv_all_tmp[inv_card_type_col].apply(_normalize_card_type).isin(card_type_choice_2)
+
+        allowed_ids_2 = set(inv_all_tmp.loc[mask, inv_id_col].astype(str).str.strip().tolist())
+
+    if not txn_f2.empty and "__inventory_id" in txn_f2.columns and allowed_ids_2:
+        txn_f2 = txn_f2[txn_f2["__inventory_id"].astype(str).str.strip().isin(allowed_ids_2)].copy()
+
+    if not grd.empty:
+        # grade/forecast should filter by inventory_id linkage too
+        gtmp = grd.copy()
+        gtmp = _ensure_unique_columns(gtmp)
+        gid_col = _pick_col(gtmp, "inventory_id", "inventory_id")
+        gtmp["__inv_id"] = gtmp[gid_col].apply(lambda x: _safe_str(x).strip())
+        if allowed_ids_2:
+            gtmp = gtmp[gtmp["__inv_id"].isin(allowed_ids_2)].copy()
+
+        # Apply date filter for "expenses" view from grading_dt
+        grd_f2 = _apply_period_filter(gtmp, "__grading_dt", year_choice_2, month_choice_2) if "__grading_dt" in gtmp.columns else gtmp
+
+        # Open grading for forecast (future months) -> do NOT apply month filter by grading_dt; use est_return_dt later
+        open_grading_2 = gtmp[gtmp["__status"].isin(["SUBMITTED", "IN_GRADING", "SENT", "IN_TRANSIT"])].copy() if "__status" in gtmp.columns else pd.DataFrame()
     else:
-        min_m = pd.Timestamp(date.today().replace(day=1))
-        max_m = min_m
+        open_grading_2 = pd.DataFrame()
 
-    if not open_grading.empty and "__est_return_month" in open_grading.columns and open_grading["__est_return_month"].notna().any():
-        max_m = max(max_m, open_grading["__est_return_month"].max())
+    # Build inv_by_id (used for mapping dwell + purchased_from + product_type)
+    inv_by_id_2 = {}
+    if not inv.empty:
+        inv_keyed_2 = inv.copy()
+        inv_keyed_2 = _ensure_unique_columns(inv_keyed_2)
+        inv_keyed_2[inv_id_col] = inv_keyed_2[inv_id_col].apply(lambda x: _safe_str(x).strip())
+        inv_by_id_2 = inv_keyed_2.set_index(inv_id_col, drop=False).to_dict("index")
 
-    months = pd.date_range(min_m, max_m, freq="MS")
-    base = pd.DataFrame({"month": months})
+    def _inv_get(inv_id: str, col: str, default=""):
+        rec = inv_by_id_2.get(_safe_str(inv_id).strip())
+        if rec is None:
+            return default
+        return rec.get(col, default)
 
-    base = base.merge(inv_monthly, on="month", how="left")
-    base = base.merge(misc_monthly, on="month", how="left")
-    base = base.merge(grading_monthly, on="month", how="left")
-    base = base.merge(sales_monthly, on="month", how="left")
-    base = base.merge(inv_market_by_month, on="month", how="left")
+    def _cogs_for_inv_id_2(inv_id: str) -> float:
+        k = _safe_str(inv_id).strip()
+        rec = inv_by_id_2.get(k)
+        base = 0.0
+        if rec is not None:
+            base = _to_num(rec.get(inv_total_col, 0.0))
+        add = float(grading_cost_by_inv_id.get(k, 0.0) or 0.0)
+        return float(base + add)
 
-    for c in ["inventory_expense", "misc_expense", "grading_expense", "sales_net", "inventory_market_value"]:
-        if c not in base.columns:
-            base[c] = 0.0
-        base[c] = base[c].fillna(0.0)
+    # =========================================================
+    # KPIs (Sales-side)
+    # =========================================================
+    revenue = float(txn_f2["__dollar_sales"].sum()) if (not txn_f2.empty and "__dollar_sales" in txn_f2.columns) else 0.0
+    proceeds = float(txn_f2["__net"].sum()) if (not txn_f2.empty and "__net" in txn_f2.columns) else 0.0
 
-    base["total_expense"] = base["inventory_expense"] + base["misc_expense"] + base["grading_expense"]
-    base["cum_expense"] = base["total_expense"].cumsum()
-    base["cum_sales_net"] = base["sales_net"].cumsum()
-    base["assets_plus_sales"] = base["inventory_market_value"] + base["cum_sales_net"]
+    cogs = 0.0
+    net_profit = 0.0
+    items_sold = int(len(txn_f2)) if not txn_f2.empty else 0
 
-    current_month = pd.Timestamp(date.today().replace(day=1))
-    forecast = base[["month", "assets_plus_sales"]].copy()
-    forecast["upside"] = np.nan
-    forecast["downside"] = np.nan
+    if not txn_f2.empty:
+        tx_tmp = txn_f2.copy()
+        tx_tmp["__cogs"] = tx_tmp["__inventory_id"].apply(_cogs_for_inv_id_2)
+        cogs = float(tx_tmp["__cogs"].sum())
+        net_profit = float((tx_tmp["__net"] - tx_tmp["__cogs"]).sum())
 
-    if not open_grading.empty and "__psa10" in open_grading.columns and "__psa9" in open_grading.columns:
-        exp10 = (
-            open_grading.dropna(subset=["__est_return_month"])
-                       .groupby("__est_return_month", as_index=False)["__psa10"].sum()
-                       .rename(columns={"__est_return_month": "month", "__psa10": "add_10"})
-        )
-        exp9 = (
-            open_grading.dropna(subset=["__est_return_month"])
-                       .groupby("__est_return_month", as_index=False)["__psa9"].sum()
-                       .rename(columns={"__est_return_month": "month", "__psa9": "add_9"})
-        )
+    net_margin = (net_profit / revenue) if revenue else 0.0
 
-        f = base[["month", "assets_plus_sales"]].copy()
-        f = f.merge(exp10, on="month", how="left").merge(exp9, on="month", how="left")
-        f["add_10"] = f["add_10"].fillna(0.0)
-        f["add_9"] = f["add_9"].fillna(0.0)
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Revenue", _fmt_money(revenue))
+    k2.metric("COGS", _fmt_money(cogs))
+    k3.metric("Net Profit", _fmt_money(net_profit))
+    k4.metric("Net Margin", f"{net_margin*100:,.1f}%")
+    k5.metric("# Items Sold", f"{items_sold:,}")
 
+    st.markdown("---")
+
+    # =========================================================
+    # Top Row Charts
+    # =========================================================
+    top_l, top_r = st.columns([1.25, 1.0])
+
+    # -------------------------
+    # Chart 1: Sales vs Expenses by Month (+ TOTAL)
+    # -------------------------
+    with top_l:
+        st.markdown("### Sales vs Expenses (Monthly)")
+
+        # Monthly Revenue (gross sales) + Monthly Expenses (inv purchases + misc + grading)
+        sales_m = pd.DataFrame(columns=["month", "sales"])
+        if not txn_f2.empty and "__sold_month" in txn_f2.columns:
+            sales_m = (
+                txn_f2.dropna(subset=["__sold_month"])
+                     .groupby("__sold_month", as_index=False)["__dollar_sales"]
+                     .sum()
+                     .rename(columns={"__sold_month": "month", "__dollar_sales": "sales"})
+            )
+
+        inv_m = pd.DataFrame(columns=["month", "inv_expense"])
+        if not inv_f2.empty and "__purchase_dt" in inv_f2.columns:
+            inv_m = (
+                inv_f2.dropna(subset=["__purchase_dt"])
+                     .assign(month=_month_start(inv_f2["__purchase_dt"]))
+                     .groupby("month", as_index=False)[inv_total_col]
+                     .sum()
+                     .rename(columns={inv_total_col: "inv_expense"})
+            )
+
+        misc_m = pd.DataFrame(columns=["month", "misc_expense"])
+        if not misc_f2.empty and "__month" in misc_f2.columns:
+            misc_m = (
+                misc_f2.groupby("__month", as_index=False)["__amount"]
+                       .sum()
+                       .rename(columns={"__month": "month", "__amount": "misc_expense"})
+            )
+
+        grd_m = pd.DataFrame(columns=["month", "grading_expense"])
+        if not grd_f2.empty and "__grading_month" in grd_f2.columns:
+            grd_m = (
+                grd_f2.groupby("__grading_month", as_index=False)["__grading_cost"]
+                      .sum()
+                      .rename(columns={"__grading_month": "month", "__grading_cost": "grading_expense"})
+            )
+
+        # Build month backbone
+        allm = []
+        for s in [sales_m.get("month"), inv_m.get("month"), misc_m.get("month"), grd_m.get("month")]:
+            if isinstance(s, pd.Series) and not s.empty:
+                allm.append(s.dropna())
+
+        if allm:
+            min_m = min([x.min() for x in allm])
+            max_m = max([x.max() for x in allm])
+            months = pd.date_range(min_m, max_m, freq="MS")
+        else:
+            months = pd.date_range(pd.Timestamp(date.today().replace(day=1)), pd.Timestamp(date.today().replace(day=1)), freq="MS")
+
+        base_m = pd.DataFrame({"month": months})
+        base_m = base_m.merge(sales_m, on="month", how="left")
+        base_m = base_m.merge(inv_m, on="month", how="left")
+        base_m = base_m.merge(misc_m, on="month", how="left")
+        base_m = base_m.merge(grd_m, on="month", how="left")
+
+        for c in ["sales", "inv_expense", "misc_expense", "grading_expense"]:
+            if c not in base_m.columns:
+                base_m[c] = 0.0
+            base_m[c] = base_m[c].fillna(0.0)
+
+        base_m["expenses"] = base_m["inv_expense"] + base_m["misc_expense"] + base_m["grading_expense"]
+
+        # Add TOTAL row at end
+        total_row = pd.DataFrame([{
+            "month": pd.NaT,
+            "sales": float(base_m["sales"].sum()),
+            "expenses": float(base_m["expenses"].sum()),
+            "__label": "TOTAL"
+        }])
+
+        plot_m = base_m[["month", "sales", "expenses"]].copy()
+        plot_m["__label"] = plot_m["month"].dt.strftime("%Y-%m")
+        plot_m = pd.concat([plot_m, total_row], ignore_index=True)
+
+        plot_long = plot_m.melt(id_vars=["__label"], value_vars=["sales", "expenses"], var_name="series", value_name="value")
+        plot_long["series"] = plot_long["series"].map({"sales": "Sales", "expenses": "Expenses"})
+
+        bar = alt.Chart(plot_long).mark_bar().encode(
+            x=alt.X("__label:N", sort=None, title="Month"),
+            y=alt.Y("value:Q", title="$"),
+            xOffset="series:N",
+            color=alt.Color("series:N", scale=alt.Scale(range=["#2563eb", "#22c55e"]), legend=alt.Legend(title="")),
+            tooltip=[
+                alt.Tooltip("__label:N", title="Month"),
+                alt.Tooltip("series:N", title="Series"),
+                alt.Tooltip("value:Q", title="Value", format=",.2f"),
+            ],
+        ).properties(height=340)
+
+        st.altair_chart(bar, use_container_width=True)
+
+    # -------------------------
+    # Chart 2: Net Profit Trend (Actual + dotted forecast from grading)
+    # -------------------------
+    with top_r:
+        st.markdown("### Net Profit Trend")
+
+        # Actual net profit by month (based on sold transactions)
+        profit_m = pd.DataFrame(columns=["month", "profit"])
+        if not txn_f2.empty and "__sold_month" in txn_f2.columns:
+            txp = txn_f2.copy()
+            txp["__cogs"] = txp["__inventory_id"].apply(_cogs_for_inv_id_2)
+            txp["__profit"] = (txp["__net"] - txp["__cogs"]).fillna(0.0)
+
+            profit_m = (
+                txp.dropna(subset=["__sold_month"])
+                   .groupby("__sold_month", as_index=False)["__profit"]
+                   .sum()
+                   .rename(columns={"__sold_month": "month", "__profit": "profit"})
+            )
+
+        # Forecast profit by return month from grading (psa9/psa10 minus (purchase_total + grading_cost))
+        forecast_up = pd.DataFrame(columns=["month", "profit_up"])
+        forecast_dn = pd.DataFrame(columns=["month", "profit_dn"])
+
+        if not open_grading_2.empty and "__est_return_month" in open_grading_2.columns:
+            og = open_grading_2.dropna(subset=["__est_return_month"]).copy()
+
+            # projected profit assumptions
+            og["__base_cost"] = (_to_num(og.get("__purchase_total", 0.0)) + _to_num(og.get("__grading_cost", 0.0))).fillna(0.0)
+            og["__profit_up"] = (_to_num(og.get("__psa10", 0.0)) - og["__base_cost"]).fillna(0.0)
+            og["__profit_dn"] = (_to_num(og.get("__psa9", 0.0)) - og["__base_cost"]).fillna(0.0)
+
+            forecast_up = og.groupby("__est_return_month", as_index=False)["__profit_up"].sum().rename(
+                columns={"__est_return_month": "month", "__profit_up": "profit_up"}
+            )
+            forecast_dn = og.groupby("__est_return_month", as_index=False)["__profit_dn"].sum().rename(
+                columns={"__est_return_month": "month", "__profit_dn": "profit_dn"}
+            )
+
+        # Build a combined month backbone (include future grading months)
+        allm2 = []
+        for s in [profit_m.get("month"), forecast_up.get("month"), forecast_dn.get("month")]:
+            if isinstance(s, pd.Series) and not s.empty:
+                allm2.append(s.dropna())
+
+        if allm2:
+            min_m2 = min([x.min() for x in allm2])
+            max_m2 = max([x.max() for x in allm2])
+            months2 = pd.date_range(min_m2, max_m2, freq="MS")
+        else:
+            months2 = pd.date_range(pd.Timestamp(date.today().replace(day=1)), pd.Timestamp(date.today().replace(day=1)), freq="MS")
+
+        trend = pd.DataFrame({"month": months2})
+        trend = trend.merge(profit_m, on="month", how="left").merge(forecast_up, on="month", how="left").merge(forecast_dn, on="month", how="left")
+        trend["profit"] = trend["profit"].fillna(0.0)
+        trend["profit_up"] = trend["profit_up"].fillna(0.0)
+        trend["profit_dn"] = trend["profit_dn"].fillna(0.0)
+
+        # Only show dotted forecast for future months (next month onward)
+        current_month = pd.Timestamp(date.today().replace(day=1))
         next_month = current_month + pd.offsets.MonthBegin(1)
-        mask_future = f["month"] >= next_month
+        trend["__is_future"] = trend["month"] >= next_month
 
-        f.loc[mask_future, "cum_add_10_future"] = f.loc[mask_future, "add_10"].cumsum()
-        f.loc[mask_future, "cum_add_9_future"] = f.loc[mask_future, "add_9"].cumsum()
+        # Plot data
+        actual_line_df = trend.copy()
+        actual_line_df["series"] = "Actual"
+        actual_line_df["value"] = actual_line_df["profit"]
 
-        base_anchor = f.loc[f["month"] <= current_month, "assets_plus_sales"]
-        anchor_val = float(base_anchor.iloc[-1]) if len(base_anchor) else float(f["assets_plus_sales"].iloc[0])
+        up_df = trend[trend["__is_future"]].copy()
+        up_df["series"] = "Upside (All PSA 10s)"
+        up_df["value"] = up_df["profit_up"]
 
-        f.loc[mask_future, "upside"] = anchor_val + f.loc[mask_future, "cum_add_10_future"]
-        f.loc[mask_future, "downside"] = anchor_val + f.loc[mask_future, "cum_add_9_future"]
+        dn_df = trend[trend["__is_future"]].copy()
+        dn_df["series"] = "Downside (All PSA 9s)"
+        dn_df["value"] = dn_df["profit_dn"]
 
-        forecast = f[["month", "assets_plus_sales", "upside", "downside"]].copy()
+        plot_trend = pd.concat([actual_line_df[["month", "series", "value"]], up_df[["month", "series", "value"]], dn_df[["month", "series", "value"]]], ignore_index=True)
 
-    chart_df = base[["month", "cum_expense", "assets_plus_sales"]].copy().rename(columns={
-        "cum_expense": "Total Expenses (Cumulative)",
-        "assets_plus_sales": "Inventory Market Value + Sales (Actual)",
-    })
-    chart_long = chart_df.melt("month", var_name="series", value_name="value")
+        line_actual = alt.Chart(plot_trend[plot_trend["series"] == "Actual"]).mark_line(size=3).encode(
+            x=alt.X("month:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
+            y=alt.Y("value:Q", title="$"),
+            tooltip=[
+                alt.Tooltip("month:T", title="Month", format="%Y-%m"),
+                alt.Tooltip("value:Q", title="Net Profit", format=",.2f"),
+            ],
+        )
 
-    forecast_long = forecast[["month", "upside", "downside"]].copy()
-    forecast_long = forecast_long.melt("month", var_name="series", value_name="value").dropna(subset=["value"])
-    forecast_long["series"] = forecast_long["series"].map({
-        "upside": "Forecast Upside (All PSA 10s)",
-        "downside": "Forecast Downside (All PSA 9s)"
-    })
+        line_forecast = alt.Chart(plot_trend[plot_trend["series"] != "Actual"]).mark_line(size=2, strokeDash=[6, 6]).encode(
+            x="month:T",
+            y="value:Q",
+            color=alt.Color("series:N", legend=alt.Legend(title="")),
+            tooltip=[
+                alt.Tooltip("month:T", title="Month", format="%Y-%m"),
+                alt.Tooltip("series:N", title="Forecast"),
+                alt.Tooltip("value:Q", title="Projected Profit", format=",.2f"),
+            ],
+        )
 
-    base_area = alt.Chart(chart_long).mark_area(opacity=0.35).encode(
-        x=alt.X("month:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
-        y=alt.Y("value:Q", title="$"),
-        color=alt.Color("series:N", legend=alt.Legend(title="")),
-        tooltip=[
-            alt.Tooltip("month:T", title="Month", format="%Y-%m"),
-            alt.Tooltip("series:N", title="Series"),
-            alt.Tooltip("value:Q", title="Value", format=",.2f"),
-        ],
-    )
+        st.altair_chart((line_actual + line_forecast).properties(height=340).interactive(), use_container_width=True)
 
-    actual_line = alt.Chart(chart_df).mark_line(size=2).encode(
-        x="month:T",
-        y=alt.Y("Inventory Market Value + Sales (Actual):Q"),
-        tooltip=[
-            alt.Tooltip("month:T", title="Month", format="%Y-%m"),
-            alt.Tooltip("Inventory Market Value + Sales (Actual):Q", title="Actual", format=",.2f"),
-        ],
-    )
+    st.markdown("---")
 
-    forecast_line = alt.Chart(forecast_long).mark_line(size=2, strokeDash=[6, 6]).encode(
-        x="month:T",
-        y="value:Q",
-        color=alt.Color("series:N", legend=alt.Legend(title="")),
-        tooltip=[
-            alt.Tooltip("month:T", title="Month", format="%Y-%m"),
-            alt.Tooltip("series:N", title="Forecast"),
-            alt.Tooltip("value:Q", title="Value", format=",.2f"),
-        ],
-    )
+    # =========================================================
+    # Bottom Row: Profit by Purchased From + Market KPIs + Expense Breakdown
+    # =========================================================
+    b1, b2 = st.columns([1.0, 1.4])
 
-    chart = (base_area + actual_line + forecast_line).properties(height=420).interactive()
-    st.altair_chart(chart, use_container_width=True)
+    # -------------------------
+    # Bottom Left: Profit by Purchased From
+    # -------------------------
+    with b1:
+        st.markdown("### Profit by Purchased From")
 
-    st.markdown("### Monthly rollup")
-    roll = base[["month", "total_expense", "sales_net", "cum_expense", "cum_sales_net", "inventory_market_value", "assets_plus_sales"]].copy()
-    roll["month"] = roll["month"].dt.strftime("%Y-%m")
-    roll = roll.rename(columns={
-        "total_expense": "expenses",
-        "sales_net": "sales_net",
-        "cum_expense": "expenses_cum",
-        "cum_sales_net": "sales_cum",
-        "inventory_market_value": "inventory_market_value",
-        "assets_plus_sales": "inventory_market_value_plus_sales",
-    })
+        if txn_f2.empty:
+            st.info("No sales in the selected filters.")
+        else:
+            txp = txn_f2.copy()
+            txp["__cogs"] = txp["__inventory_id"].apply(_cogs_for_inv_id_2)
+            txp["__profit"] = (txp["__net"] - txp["__cogs"]).fillna(0.0)
+            txp["__purchased_from"] = txp["__inventory_id"].apply(lambda x: _safe_str(_inv_get(x, inv_purchased_from_col, "")).strip() or "Unknown")
 
-    st.dataframe(
-        roll.style.format({
-            "expenses": "${:,.2f}",
-            "sales_net": "${:,.2f}",
-            "expenses_cum": "${:,.2f}",
-            "sales_cum": "${:,.2f}",
-            "inventory_market_value": "${:,.2f}",
-            "inventory_market_value_plus_sales": "${:,.2f}",
-        }).set_table_styles(_styler_table_header()),
-        use_container_width=True,
-        hide_index=True,
-    )
+            pf = txp.groupby("__purchased_from", as_index=False)["__profit"].sum().rename(columns={"__purchased_from": "purchased_from", "__profit": "profit"})
+            pf = pf.sort_values("profit", ascending=False)
+
+            chart_pf = alt.Chart(pf).mark_bar().encode(
+                x=alt.X("profit:Q", title="Profit ($)"),
+                y=alt.Y("purchased_from:N", sort="-x", title="Purchased From"),
+                tooltip=[
+                    alt.Tooltip("purchased_from:N", title="Purchased From"),
+                    alt.Tooltip("profit:Q", title="Profit", format=",.2f"),
+                ],
+            ).properties(height=320)
+
+            st.altair_chart(chart_pf, use_container_width=True)
+
+    # -------------------------
+    # Bottom Right: Market KPIs + Expense Breakdown
+    # -------------------------
+    with b2:
+        st.markdown("### Operating Metrics")
+
+        mleft, mright = st.columns([1.0, 1.0])
+
+        # ---- KPI block (left)
+        with mleft:
+            # Avg dwell (Cards only) — target 14 days
+            avg_dwell = None
+            if not txn_f2.empty:
+                t = txn_f2.copy()
+                t["__sold_dt"] = _to_dt(t["__sold_dt"])
+                t["__purchase_dt"] = t["__inventory_id"].apply(lambda x: _to_dt(_inv_get(x, "__purchase_dt", pd.NaT)))
+                t["__product_type"] = t["__inventory_id"].apply(lambda x: _safe_str(_inv_get(x, inv_product_type_col, "")).strip().lower())
+                # cards only (exclude sealed)
+                t = t[~t["__product_type"].str.contains("sealed", na=False)].copy()
+                t["__dwell_days"] = (t["__sold_dt"] - t["__purchase_dt"]).dt.days
+                t = t[t["__dwell_days"].notna() & (t["__dwell_days"] >= 0)]
+                if not t.empty:
+                    avg_dwell = float(t["__dwell_days"].mean())
+
+            dwell_str = f"{avg_dwell:,.1f} days" if avg_dwell is not None else "—"
+            dwell_delta = None
+            if avg_dwell is not None:
+                dwell_delta = f"Target ≤ 14"
+
+            st.metric("Avg Dwell (Cards Only)", dwell_str, delta=dwell_delta)
+
+            # Pokemon gradable rate = # sent in / # purchased (Pokemon cards only) target 50%
+            pokemon_purchased = 0
+            pokemon_sent = 0
+
+            if not inv_f2.empty:
+                inv_cards = inv_f2.copy()
+                inv_cards["__ct"] = inv_cards[inv_card_type_col].apply(_normalize_card_type)
+                inv_cards["__pt"] = inv_cards[inv_product_type_col].astype(str).str.lower()
+                inv_cards = inv_cards[(inv_cards["__ct"] == "Pokemon") & (~inv_cards["__pt"].str.contains("sealed", na=False))].copy()
+                pokemon_purchased = int(len(inv_cards))
+                pokemon_ids = set(inv_cards[inv_id_col].astype(str).str.strip().tolist())
+            else:
+                pokemon_ids = set()
+
+            if not open_grading_2.empty:
+                g = open_grading_2.copy()
+                g["__inv_id"] = g.get("__inv_id", g.get("inventory_id", "")).astype(str).str.strip()
+                if pokemon_ids:
+                    pokemon_sent = int(g[g["__inv_id"].isin(pokemon_ids)]["__inv_id"].nunique())
+
+            grade_rate = (pokemon_sent / pokemon_purchased) if pokemon_purchased else 0.0
+            st.metric("Pokemon Grade Rate (Sent / Purchased)", f"{grade_rate*100:,.1f}%", delta="Target 50%")
+
+            # Avg purchase margin vs market (Cards only): (total_cost - market_price) / market_price
+            avg_buy_margin = None
+            if not inv_f2.empty and "__market_price" in inv_f2.columns:
+                inv_cards2 = inv_f2.copy()
+                inv_cards2["__pt"] = inv_cards2[inv_product_type_col].astype(str).str.lower()
+                inv_cards2 = inv_cards2[~inv_cards2["__pt"].str.contains("sealed", na=False)].copy()
+                inv_cards2["__mp"] = _to_num(inv_cards2["__market_price"])
+                inv_cards2["__cost"] = _to_num(inv_cards2[inv_total_col])
+                inv_cards2 = inv_cards2[inv_cards2["__mp"] > 0].copy()
+                if not inv_cards2.empty:
+                    inv_cards2["__margin"] = (inv_cards2["__cost"] - inv_cards2["__mp"]) / inv_cards2["__mp"]
+                    avg_buy_margin = float(inv_cards2["__margin"].mean())
+
+            buy_margin_str = f"{avg_buy_margin*100:,.1f}%" if avg_buy_margin is not None else "—"
+            st.metric("Avg Purchase Margin vs Market (Cards)", buy_margin_str)
+
+        # ---- Expense breakdown (right)
+        with mright:
+            st.markdown("#### Expenses by Type")
+
+            # Inventory expense (purchases in period)
+            inv_cost_total = float(_to_num(inv_f2[inv_total_col]).sum()) if (not inv_f2.empty and inv_total_col in inv_f2.columns) else 0.0
+
+            # Map misc categories into requested buckets
+            bucket_order = [
+                "Inventory cost",
+                "Packaging materials",
+                "Card show fees",
+                "Supplies",
+                "Shipping supplies",
+                "Subscriptions",
+                "Mileage/Travel",
+                "Other",
+            ]
+
+            def _map_misc_cat(c: str) -> str:
+                s = _safe_str(c).strip().lower()
+                if "pack" in s:
+                    return "Packaging materials"
+                if "card show" in s or ("show" in s and "card" in s):
+                    return "Card show fees"
+                if "ship" in s:
+                    return "Shipping supplies"
+                if "sub" in s:
+                    return "Subscriptions"
+                if "mile" in s or "travel" in s or "gas" in s or "uber" in s or "hotel" in s:
+                    return "Mileage/Travel"
+                if "suppl" in s:
+                    return "Supplies"
+                if s in {"other", ""}:
+                    return "Other"
+                # if it's already one of the named ones, keep it
+                for k in bucket_order:
+                    if s == k.lower():
+                        return k
+                return "Other"
+
+            rows_exp = [{"expense_type": "Inventory cost", "amount": inv_cost_total}]
+
+            if not misc_f2.empty and "__category" in misc_f2.columns and "__amount" in misc_f2.columns:
+                mm = misc_f2.copy()
+                mm["expense_type"] = mm["__category"].apply(_map_misc_cat)
+                mm2 = mm.groupby("expense_type", as_index=False)["__amount"].sum().rename(columns={"__amount": "amount"})
+                rows_exp += mm2.to_dict("records")
+
+            exp_df = pd.DataFrame(rows_exp)
+            if not exp_df.empty:
+                exp_df = exp_df.groupby("expense_type", as_index=False)["amount"].sum()
+                exp_df["expense_type"] = pd.Categorical(exp_df["expense_type"], categories=bucket_order, ordered=True)
+                exp_df = exp_df.sort_values("expense_type")
+
+                chart_exp = alt.Chart(exp_df).mark_bar().encode(
+                    x=alt.X("expense_type:N", title="", sort=bucket_order),
+                    y=alt.Y("amount:Q", title="$"),
+                    tooltip=[
+                        alt.Tooltip("expense_type:N", title="Type"),
+                        alt.Tooltip("amount:Q", title="Amount", format=",.2f"),
+                    ],
+                ).properties(height=320)
+
+                st.altair_chart(chart_exp, use_container_width=True)
+            else:
+                st.info("No expenses found for the selected filters.")
+
 
 
 # =========================================================
