@@ -3,6 +3,7 @@
 import json
 import re
 import uuid
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -12,363 +13,11 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 import gspread
+from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Grading", layout="wide")
 st.title("Grading")
-
-
-def sync_returned_grades_to_inventory():
-    import json
-    from pathlib import Path
-    import pandas as pd
-    import gspread
-    from google.oauth2.service_account import Credentials
-    import streamlit as st
-
-    STATUS_ACTIVE = "ACTIVE"
-    STATUS_LISTED = "LISTED"
-
-    def get_gspread_client():
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-
-        if "gcp_service_account" in st.secrets and not isinstance(st.secrets["gcp_service_account"], str):
-            sa = st.secrets["gcp_service_account"]
-            sa_info = {k: sa[k] for k in sa.keys()}
-            creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-            return gspread.authorize(creds)
-
-        if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], str):
-            sa_info = json.loads(st.secrets["gcp_service_account"])
-            creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-            return gspread.authorize(creds)
-
-        if "service_account_json_path" in st.secrets:
-            sa_rel = st.secrets["service_account_json_path"]
-            sa_path = Path(sa_rel)
-            if not sa_path.is_absolute():
-                sa_path = Path.cwd() / sa_rel
-            sa_info = json.loads(sa_path.read_text(encoding="utf-8"))
-            creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-            return gspread.authorize(creds)
-
-        raise KeyError('Missing secrets: add "gcp_service_account" or "service_account_json_path".')
-
-    def to_num(x):
-        try:
-            if x is None or x == "":
-                return 0.0
-            return float(str(x).replace("$", "").replace(",", "").strip())
-        except Exception:
-            return 0.0
-
-    def to_dt(x):
-        return pd.to_datetime(x, errors="coerce")
-
-    def norm(s):
-        return "" if s is None else str(s).strip()
-
-    # --- normalize / de-duplicate header row in-place (no new helpers; kept local) ---
-    def _repair_headers_in_place(ws):
-        raw = ws.row_values(1)
-        if not raw:
-            return raw
-
-        cleaned = []
-        for i, h in enumerate(raw, start=1):
-            hh = "" if h is None else str(h).strip()
-            if hh == "":
-                hh = f"unnamed__col{i}"
-            cleaned.append(hh)
-
-        counts = {}
-        unique = []
-        for h in cleaned:
-            if h not in counts:
-                counts[h] = 1
-                unique.append(h)
-            else:
-                counts[h] += 1
-                unique.append(f"{h}__dup{counts[h]}")
-
-        if unique != raw:
-            ws.update("1:1", [unique], value_input_option="USER_ENTERED")
-
-        return unique
-
-    client = get_gspread_client()
-    sh = client.open_by_key(st.secrets["spreadsheet_id"])
-
-    inv_ws_name = st.secrets.get("inventory_worksheet", "inventory")
-    grd_ws_name = st.secrets.get("grading_worksheet", "grading")
-
-    inv_ws = sh.worksheet(inv_ws_name)
-    grd_ws = sh.worksheet(grd_ws_name)
-
-    # Repair headers once so we don't keep creating duplicates across page loads
-    inv_headers = _repair_headers_in_place(inv_ws)
-    grd_headers = _repair_headers_in_place(grd_ws)
-
-    # ensure synced_to_inventory header exists (by base-name)
-    base_grd = {re.sub(r"__dup\d+$", "", h) for h in grd_headers}
-    if "synced_to_inventory" not in base_grd:
-        grd_ws.update("1:1", [grd_headers + ["synced_to_inventory"]], value_input_option="USER_ENTERED")
-        grd_headers = grd_ws.row_values(1)
-        grd_header_index = {h: i for i, h in enumerate(grd_headers)}
-
-
-    # --- READ ONCE (quota-friendly) ---
-    inv_records = inv_ws.get_all_records()
-    grd_records = grd_ws.get_all_records()
-
-    inv_df = pd.DataFrame(inv_records)
-    grd_df = pd.DataFrame(grd_records)
-
-    def _strip_dup_suffixes(name: str) -> str:
-        return re.sub(r"(?:__dup\d+)+$", "", str(name or "").strip())
-
-    def _coalesce_duplicates(df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty:
-            return df
-
-        # group original columns by base-name
-        groups = {}
-        for c in list(df.columns):
-            b = _strip_dup_suffixes(c)
-            groups.setdefault(b, []).append(c)
-
-        out = pd.DataFrame()
-        for base, cols in groups.items():
-            if len(cols) == 1:
-                out[base] = df[cols[0]]
-            else:
-                # coalesce left->right
-                s = df[cols[0]].astype(str)
-                for c in cols[1:]:
-                    t = df[c].astype(str)
-                    s = s.where(s.str.strip() != "", t)
-                out[base] = s
-        return out
-
-    inv_df = _coalesce_duplicates(inv_df)
-    grd_df = _coalesce_duplicates(grd_df)
-
-
-
-    if inv_df.empty or grd_df.empty:
-        return 0
-
-    # Normalize missing columns safely
-    for c in [
-        "inventory_id",
-        "inventory_status",
-        "reference_link",
-        "total_price",
-        "product_type",
-        "grading_company",
-        "grade",
-        "condition",
-    ]:
-        if c not in inv_df.columns:
-            inv_df[c] = ""
-
-    for c in [
-        "status",
-        "reference_link",
-        "grading_company",
-        "grading_fee_initial",
-        "additional_costs",
-        "grading_fee_per_card",
-        "extra_costs",
-        "total_grading_cost",
-        "psa10_price",
-        "psa9_price",
-        "received_grade",
-        "returned_grade",
-        "inventory_id",
-        "updated_at_utc",
-    ]:
-        if c not in grd_df.columns:
-            grd_df[c] = ""
-
-    # ---- COALESCE legacy / duplicate grading fields into canonical ones ----
-    # grading_fee_initial: prefer it, else use grading_fee_per_card, else (if present) total_grading_cost (per-row) minus extra_costs
-    def _first_nonblank_series(a: pd.Series, b: pd.Series) -> pd.Series:
-        a_s = a.astype(str)
-        b_s = b.astype(str)
-        return a_s.where(a_s.str.strip() != "", b_s)
-
-    grd_df["grading_fee_initial"] = _first_nonblank_series(grd_df["grading_fee_initial"], grd_df["grading_fee_per_card"])
-
-    # additional_costs: prefer it, else extra_costs
-    grd_df["additional_costs"] = _first_nonblank_series(grd_df["additional_costs"], grd_df["extra_costs"])
-
-    # received_grade: prefer it, else returned_grade
-    grd_df["received_grade"] = _first_nonblank_series(grd_df["received_grade"], grd_df["returned_grade"])
-
-    inv_df["__inv_total"] = inv_df["total_price"].apply(to_num)
-    inv_df["__inv_dt"] = to_dt(inv_df.get("purchase_date", ""))
-
-    grd_df["__status"] = grd_df["status"].astype(str).str.upper().str.strip()
-    returned = grd_df[grd_df["__status"] == "RETURNED"].copy()
-    if returned.empty:
-        return 0
-
-    # If you have a "synced" column, respect it (optional)
-    if "synced_to_inventory" in grd_df.columns:
-        returned = returned[returned["synced_to_inventory"].astype(str).str.upper().str.strip() != "YES"].copy()
-
-    if returned.empty:
-        return 0
-
-    # Map inventory_id -> sheet rownum (read col A once)
-    # find inventory_id column index by header (base-name)
-    inv_headers = inv_ws.row_values(1)
-    inv_id_col = None
-    for j, h in enumerate(inv_headers, start=1):
-        if re.sub(r"__dup\d+$", "", str(h)).strip() == "inventory_id":
-            inv_id_col = j
-            break
-    if not inv_id_col:
-        return 0
-
-    id_vals = inv_ws.col_values(inv_id_col)
-    id_to_rownum = {}
-    for i, v in enumerate(id_vals[1:], start=2):
-        sv = str(v or "").strip()
-        if sv:
-            id_to_rownum[sv] = i
-
-
-    # Header index based on repaired headers (unique, stripped)
-    inv_header_index = {h: i for i, h in enumerate(inv_headers)}
-    grd_header_index = {h: i for i, h in enumerate(grd_headers)}
-
-    def set_inv_cell(rownum: int, col_name: str, value):
-        # allow matching if sheet header had been suffixed; use base-name match
-        target = None
-        if col_name in inv_header_index:
-            target = col_name
-        else:
-            for h in inv_headers:
-                if re.sub(r"__dup\d+$", "", h) == col_name:
-                    target = h
-                    break
-        if not target:
-            return False
-        col_idx_1based = inv_header_index[target] + 1
-        a1 = gspread.utils.rowcol_to_a1(rownum, col_idx_1based)
-        inv_ws.update(a1, [[value]], value_input_option="USER_ENTERED")
-        return True
-
-    def set_grd_cell(rownum: int, col_name: str, value):
-        target = None
-        if col_name in grd_header_index:
-            target = col_name
-        else:
-            for h in grd_headers:
-                if re.sub(r"__dup\d+$", "", h) == col_name:
-                    target = h
-                    break
-        if not target:
-            return False
-        col_idx_1based = grd_header_index[target] + 1
-        a1 = gspread.utils.rowcol_to_a1(rownum, col_idx_1based)
-        grd_ws.update(a1, [[value]], value_input_option="USER_ENTERED")
-        return True
-
-    # get_all_records loses row numbers, so rownum = df index + 2 (header row at 1)
-    def grd_rownum_from_df_index(i):
-        return int(i) + 2
-
-    updated_count = 0
-
-    for i, g in returned.iterrows():
-        g_ref = norm(g.get("reference_link", ""))
-        g_inv_id = norm(g.get("inventory_id", ""))  # best case
-        g_company = norm(g.get("grading_company", ""))
-
-        g_grade = (
-            norm(g.get("received_grade", ""))
-            or norm(g.get("returned_grade", ""))
-            or norm(g.get("grade", ""))
-        )
-
-        grading_cost = to_num(g.get("grading_fee_initial", 0)) + to_num(g.get("additional_costs", 0))
-
-        # Market value: use psa10 if grade is a 10-type, else psa9
-        psa10 = to_num(g.get("psa10_price", 0))
-        psa9 = to_num(g.get("psa9_price", 0))
-        grade_upper = str(g_grade).upper()
-        if ("10" in grade_upper) or ("PRISTINE" in grade_upper) or ("BLACK" in grade_upper):
-            new_market = psa10
-        else:
-            new_market = psa9
-
-        # Find inventory match
-        inv_match = None
-
-        # 1) if inventory_id exists
-        if g_inv_id:
-            m = inv_df[inv_df["inventory_id"].astype(str).str.strip() == g_inv_id]
-            if not m.empty:
-                inv_match = m.iloc[0]
-
-        # 2) else match by reference_link + active/listed
-        if inv_match is None and g_ref:
-            candidates = inv_df[
-                (inv_df["reference_link"].astype(str).str.strip() == g_ref)
-                & (inv_df["inventory_status"].astype(str).str.upper().isin([STATUS_ACTIVE, STATUS_LISTED]))
-            ].copy()
-
-            if not candidates.empty:
-                # pick closest by purchase_date then by total
-                g_dt = to_dt(g.get("purchase_date", ""))
-                g_cost = to_num(g.get("purchase_total", 0)) or to_num(g.get("purchase_price", 0)) or 0.0
-
-                candidates["__dtdiff"] = (candidates["__inv_dt"] - g_dt).abs()
-                candidates["__costdiff"] = (candidates["__inv_total"] - g_cost).abs()
-                candidates = candidates.sort_values(["__dtdiff", "__costdiff"])
-                inv_match = candidates.iloc[0]
-
-        if inv_match is None:
-            continue
-
-        inv_id = str(inv_match["inventory_id"]).strip()
-        rownum = id_to_rownum.get(inv_id)
-        if not rownum:
-            continue
-
-        # Update inventory fields
-        old_total = to_num(inv_match.get("total_price", 0))
-        new_total = round(old_total + grading_cost, 2)
-
-        set_inv_cell(rownum, "product_type", "Graded Card")
-        set_inv_cell(rownum, "grading_company", g_company)
-        set_inv_cell(rownum, "grade", g_grade)
-        set_inv_cell(rownum, "condition", "Graded")
-        set_inv_cell(rownum, "total_price", new_total)
-
-        # Store market price if you have this column
-        set_inv_cell(rownum, "market_price", new_market)
-        set_inv_cell(rownum, "market_value", new_market)
-
-        # Mark grading row as synced so we don't add grading cost again
-        grd_rownum = grd_rownum_from_df_index(i)
-        set_grd_cell(grd_rownum, "synced_to_inventory", "YES")
-
-        updated_count += 1
-
-    return updated_count
-
-
-if st.button("🔁 Sync RETURNED grades → Inventory", use_container_width=True):
-    n = sync_returned_grades_to_inventory()
-    st.success(f"Synced {n} returned submission(s) into Inventory.")
-    st.rerun()
 
 
 # =========================================================
@@ -405,8 +54,8 @@ GRADING_CANON_COLS = [
     "purchase_date",
     "purchase_total",
     "grading_company",
-    "grading_fee_initial",   # <-- use THIS
-    "additional_costs",      # <-- use THIS
+    "grading_fee_initial",   # canonical
+    "additional_costs",      # canonical
     "psa9_price",
     "psa10_price",
     "status",
@@ -417,6 +66,7 @@ GRADING_CANON_COLS = [
     "updated_at",
     "synced_to_inventory",
 ]
+
 
 # =========================================================
 # HELPERS
@@ -460,6 +110,7 @@ def a1_col_letter(n: int) -> str:
         letters = chr(65 + r) + letters
     return letters
 
+
 # =========================================================
 # GOOGLE SHEETS AUTH
 # =========================================================
@@ -500,228 +151,167 @@ def get_ws(ws_name: str):
     sh = client.open_by_key(st.secrets["spreadsheet_id"])
     return sh.worksheet(ws_name)
 
-def ensure_headers(ws, needed_headers: list[str]):
+
+# =========================================================
+# QUOTA-SAFE WRITE WRAPPERS
+# =========================================================
+
+def _gs_write_retry(fn, *args, **kwargs):
     """
-    Idempotent header repair (quota-safe):
-    - strips whitespace
-    - strips ANY stacked __dup suffixes (e.g., foo__dup2__dup2 -> foo)
-    - rebuilds a stable unique header set: foo, foo__dup2, foo__dup3...
-    - appends missing canonical columns by base-name
-    - optionally deletes duplicate columns that are completely blank (safe prune)
-
-    IMPORTANT CHANGE:
-    - avoids an extra ws.row_values(1) read by reusing the header row already read from ws.get_all_values().
+    Retry gspread write calls on 429 with exponential backoff.
     """
-    def strip_dups(h: str) -> str:
-        return re.sub(r"(?:__dup\d+)+$", "", str(h or "").strip())
+    max_tries = 6
+    base_sleep = 0.8
+    for attempt in range(1, max_tries + 1):
+        try:
+            return fn(*args, **kwargs)
+        except APIError as e:
+            msg = str(e)
+            if "429" in msg or "Quota exceeded" in msg:
+                time.sleep(base_sleep * (2 ** (attempt - 1)))
+                continue
+            raise
+    # if still failing
+    raise APIError("APIError: [429] Quota exceeded (retries exhausted)")
 
-    # Single read for header + data (used for safe-prune)
-    values = ws.get_all_values()
-    if not values:
-        ws.update("1:1", [needed_headers], value_input_option="USER_ENTERED")
-        return needed_headers
 
-    raw = values[0] if values else []
-    if not raw:
-        ws.update("1:1", [needed_headers], value_input_option="USER_ENTERED")
-        return needed_headers
+# =========================================================
+# HEADER NORMALIZATION / REPAIR
+# =========================================================
 
-    # Clean + base
+def _strip_dups(h: str) -> str:
+    # remove ANY stacked __dup suffixes
+    return re.sub(r"(?:__dup\d+)+$", "", str(h or "").strip())
+
+def _build_stable_unique_headers(raw_headers: list[str]) -> list[str]:
+    """
+    Normalize:
+    - trim whitespace
+    - blank -> unnamed__colN
+    - base name = strip stacked __dup suffixes
+    - rebuild stable uniques: base, base__dup2, base__dup3...
+    """
     cleaned = []
-    for i, h in enumerate(raw, start=1):
+    for i, h in enumerate(raw_headers, start=1):
         hh = str(h or "").strip()
         if hh == "":
             hh = f"unnamed__col{i}"
         cleaned.append(hh)
 
-    bases = [strip_dups(h) for h in cleaned]
+    bases = [_strip_dups(h) for h in cleaned]
 
-    # ensure needed headers exist by base-name
-    base_set = set(bases)
-    for h in needed_headers:
-        b = strip_dups(h)
-        if b not in base_set:
-            bases.append(b)
-            cleaned.append(b)
-            base_set.add(b)
-
-    # Build stable unique names from bases (NO stacking)
     counts = {}
-    new_header = []
+    out = []
     for b in bases:
         counts[b] = counts.get(b, 0) + 1
-        if counts[b] == 1:
-            new_header.append(b)
-        else:
-            new_header.append(f"{b}__dup{counts[b]}")  # starts at __dup2
+        out.append(b if counts[b] == 1 else f"{b}__dup{counts[b]}")
+    return out
 
-    # --- Safe prune: delete duplicate columns that are entirely blank ---
-    # Only delete columns where:
-    # - base has multiple columns
-    # - this specific column is blank in all data rows
-    # This prevents runaway columns without risking data loss.
-    if len(values) > 1:
-        # Pad rows to current raw header length (pre-delete)
-        data_rows = []
-        for r in values[1:]:
-            if len(r) < len(raw):
-                r = r + [""] * (len(raw) - len(r))
-            data_rows.append(r)
-
-        base_to_cols = {}
-        for j, h in enumerate(raw):
-            b = strip_dups(h)
-            base_to_cols.setdefault(b, []).append(j)
-
-        delete_col_idxs_1based = []
-        for b, idxs in base_to_cols.items():
-            if len(idxs) <= 1:
-                continue
-            for j in idxs[1:]:
-                all_blank = True
-                for r in data_rows:
-                    v = str(r[j] if j < len(r) else "").strip()
-                    if v != "":
-                        all_blank = False
-                        break
-                if all_blank:
-                    delete_col_idxs_1based.append(j + 1)
-
-        # delete from right to left
-        deleted_any = False
-        for col in sorted(delete_col_idxs_1based, reverse=True):
-            try:
-                ws.delete_columns(col)
-                deleted_any = True
-            except Exception:
-                pass
-
-        if deleted_any:
-            # Re-read once after deletions (needed because structure changed)
-            values = ws.get_all_values()
-            raw = values[0] if values else []
-            if not raw:
-                ws.update("1:1", [needed_headers], value_input_option="USER_ENTERED")
-                return needed_headers
-
-            cleaned = []
-            for i, h in enumerate(raw, start=1):
-                hh = str(h or "").strip()
-                if hh == "":
-                    hh = f"unnamed__col{i}"
-                cleaned.append(hh)
-
-            bases = [strip_dups(h) for h in cleaned]
-            base_set = set(bases)
-            for h in needed_headers:
-                b = strip_dups(h)
-                if b not in base_set:
-                    bases.append(b)
-                    base_set.add(b)
-
-            counts = {}
-            new_header = []
-            for b in bases:
-                counts[b] = counts.get(b, 0) + 1
-                new_header.append(b if counts[b] == 1 else f"{b}__dup{counts[b]}")
-
-            # raw is now the current header row after deletion
-            raw = values[0] if values else raw
-
-    # Only update header row if it changed (NO extra row_values read)
-    if raw != new_header:
-        ws.update("1:1", [new_header], value_input_option="USER_ENTERED")
-
-    return new_header
-
-
-def update_grading_rows(df_rows: pd.DataFrame):
+def _append_missing_canon_headers(stable_headers: list[str], canon_headers: list[str]) -> list[str]:
     """
-    Quota-safe update:
-    - Repairs headers once
-    - Uses a SINGLE read (ws.get_all_values) to map grading_row_id -> rownum
-    - Writes rows using RAW to prevent Sheets from auto-coercing to dates
+    Ensures each canon header exists by base-name. Keeps existing duplicates.
+    Adds missing canon columns at the end.
     """
-    if df_rows is None or df_rows.empty:
-        return
+    existing_bases = {_strip_dups(h) for h in stable_headers}
+    out = list(stable_headers)
+    for h in canon_headers:
+        b = _strip_dups(h)
+        if b not in existing_bases:
+            out.append(b)  # add as base
+            existing_bases.add(b)
+    # rebuild stable unique again (in case added bases collide)
+    return _build_stable_unique_headers(out)
 
-    ws = get_ws(GRADING_WS_NAME)
-    headers = ensure_headers(ws, GRADING_CANON_COLS)  # may update header row
+def _prune_blank_duplicate_columns(ws, values, header_row):
+    """
+    Safe prune:
+    - For any base that has multiple columns,
+      delete duplicate columns (idx >= 2) that are entirely blank across all data rows.
+    Deletion happens right-to-left.
+    """
+    if not values or len(values) < 2:
+        return False
 
-    # Single read to build mapping (replaces ws.row_values + ws.col_values combo)
+    raw = header_row
+    data_rows = values[1:]
+
+    # pad rows to raw length
+    padded = []
+    for r in data_rows:
+        if len(r) < len(raw):
+            r = r + [""] * (len(raw) - len(r))
+        padded.append(r)
+
+    base_to_idxs = {}
+    for j, h in enumerate(raw):
+        b = _strip_dups(h)
+        base_to_idxs.setdefault(b, []).append(j)
+
+    delete_1based = []
+    for b, idxs in base_to_idxs.items():
+        if len(idxs) <= 1:
+            continue
+        # consider duplicates beyond the first occurrence
+        for j in idxs[1:]:
+            all_blank = True
+            for r in padded:
+                v = str(r[j] if j < len(r) else "").strip()
+                if v != "":
+                    all_blank = False
+                    break
+            if all_blank:
+                delete_1based.append(j + 1)
+
+    deleted_any = False
+    for col in sorted(delete_1based, reverse=True):
+        try:
+            _gs_write_retry(ws.delete_columns, col)
+            deleted_any = True
+        except Exception:
+            pass
+
+    return deleted_any
+
+def ensure_headers(ws, needed_headers: list[str], *, write: bool = False, prune_blank_dups: bool = False):
+    """
+    IMPORTANT: This function can run in READ-ONLY mode (write=False).
+    - When write=False: returns what the header *should be*, but does NOT write to the sheet.
+    - When write=True: writes only if header differs. Optional safe-prune blank dup columns.
+
+    This prevents quota blowups on page load.
+    """
+    # single read
     values = ws.get_all_values()
     if not values:
-        return
+        if write:
+            _gs_write_retry(ws.update, values=[needed_headers], range_name="1:1", value_input_option="USER_ENTERED")
+        return needed_headers
 
-    sheet_header = values[0] if values else []
-    if not sheet_header:
-        return
+    raw = values[0] if values else []
+    if not raw:
+        if write:
+            _gs_write_retry(ws.update, values=[needed_headers], range_name="1:1", value_input_option="USER_ENTERED")
+        return needed_headers
 
-    # find grading_row_id column index (0-based) by base-name
-    id_col_idx = None
-    for j, h in enumerate(sheet_header):
-        if re.sub(r"__dup\d+$", "", str(h)) == "grading_row_id":
-            id_col_idx = j
-            break
-    if id_col_idx is None:
-        raise ValueError("grading_row_id must exist in grading sheet header row.")
+    # stable + ensure canon exists
+    stable = _build_stable_unique_headers(raw)
+    stable = _append_missing_canon_headers(stable, needed_headers)
 
-    # build id -> sheet row number mapping from the same read
-    id_to_rownum: dict[str, int] = {}
-    for rownum, row in enumerate(values[1:], start=2):  # header row is 1
-        v = ""
-        if len(row) > id_col_idx:
-            v = str(row[id_col_idx] or "").strip()
-        if v:
-            id_to_rownum[v] = rownum
+    # optional prune (requires writes)
+    if prune_blank_dups and write:
+        # prune based on current sheet structure (raw, not stable)
+        deleted_any = _prune_blank_duplicate_columns(ws, values, raw)
+        if deleted_any:
+            # re-read after deletion
+            values = ws.get_all_values()
+            raw = values[0] if values else []
+            stable = _build_stable_unique_headers(raw)
+            stable = _append_missing_canon_headers(stable, needed_headers)
 
-    # We'll write using the *current sheet header* (post-repair)
-    headers = sheet_header
-    last_col = a1_col_letter(len(headers))
+    if write and raw != stable:
+        _gs_write_retry(ws.update, values=[stable], range_name="1:1", value_input_option="USER_ENTERED")
 
-    NUM_COLS = {
-        "purchase_total",
-        "grading_fee_initial",
-        "additional_costs",
-        "psa9_price",
-        "psa10_price",
-    }
-
-    def _num_str(v):
-        # store as raw numeric string so Sheets doesn't coerce to date
-        if v is None or (isinstance(v, str) and v.strip() == ""):
-            return ""
-        try:
-            return str(float(str(v).replace("$", "").replace(",", "").strip()))
-        except Exception:
-            return ""
-
-    # Reduce burstiness (helps avoid quota spikes on big saves)
-    import time
-
-    for i, (_, r) in enumerate(df_rows.iterrows(), start=1):
-        rid = str(r.get("grading_row_id", "")).strip()
-        rownum = id_to_rownum.get(rid)
-        if not rownum:
-            continue
-
-        out_row = []
-        for h in headers:
-            base = re.sub(r"__dup\d+$", "", str(h))
-            v = r.get(base, "")
-            if pd.isna(v):
-                v = ""
-
-            if base in NUM_COLS:
-                v = _num_str(v)
-
-            out_row.append(v)
-
-        ws.update(f"A{rownum}:{last_col}{rownum}", [out_row], value_input_option="RAW")
-
-        # small backoff every few rows
-        if i % 5 == 0:
-            time.sleep(0.6)
+    return stable
 
 
 # =========================================================
@@ -762,7 +352,7 @@ def fetch_pricecharting_prices(reference_link: str) -> dict:
 
 
 # =========================================================
-# LOADERS (CACHED)
+# LOADERS (CACHED) — READ-ONLY (NO WRITES)
 # =========================================================
 
 @st.cache_data(ttl=30)
@@ -783,7 +373,7 @@ def load_inventory_df():
 
     df["inventory_id"] = df["inventory_id"].astype(str)
 
-    # Force year to a clean string (prevents Arrow trying to cast to int64 and choking on "")
+    # Force year to a clean string
     df["year"] = (
         df["year"]
         .astype(str)
@@ -799,17 +389,17 @@ def load_inventory_df():
 
 @st.cache_data(ttl=30)
 def load_grading_df():
+    """
+    READ ONLY:
+    - does NOT call ensure_headers(write=True)
+    - just reads values + coalesces duplicates into canonical cols
+    """
     ws = get_ws(GRADING_WS_NAME)
-
-    # Ensure headers exist AND repair duplicates/whitespace drift
-    _ = ensure_headers(ws, GRADING_CANON_COLS)
-
-    # Read raw values so we respect the actual header row (post-repair)
     values = ws.get_all_values()
     if not values or len(values) < 1:
         return pd.DataFrame(columns=GRADING_CANON_COLS)
 
-    header_row = values[0]
+    header_row = values[0] if values else GRADING_CANON_COLS
     if not header_row:
         header_row = GRADING_CANON_COLS
 
@@ -824,23 +414,21 @@ def load_grading_df():
 
     df = pd.DataFrame(data_rows, columns=header_row)
     if df.empty:
-        return pd.DataFrame(columns=header_row)
+        return pd.DataFrame(columns=GRADING_CANON_COLS)
 
-    # Make sure all canon cols exist in df (even if sheet has more)
+    # Ensure canon cols exist
     for c in GRADING_CANON_COLS:
         if c not in df.columns:
             df[c] = ""
 
-    # ---- COALESCE legacy / duplicate fields (including __dupN versions) into canonical ones ----
     def _cols_named(base: str):
         cols = []
         for c in df.columns:
-            if re.sub(r"__dup\d+$", "", str(c)) == base:
+            if _strip_dups(c) == base:
                 cols.append(c)
         return cols
 
     def _coalesce_into(base: str, fallbacks: list[str]):
-        # base may exist multiple times due to __dupN; coalesce all of them left->right
         candidates = _cols_named(base)
         for fb in fallbacks:
             candidates += _cols_named(fb)
@@ -856,44 +444,38 @@ def load_grading_df():
         if not ordered:
             return
 
-        # start with first candidate, fill blanks from others
         s = df[ordered[0]].astype(str)
         for c in ordered[1:]:
             t = df[c].astype(str)
             s = s.where(s.str.strip() != "", t)
 
-        # write into canonical base column (exact name)
         df[base] = s
 
-    # grading fee: grading_fee_initial <- grading_fee_per_card
+    # Coalesce legacy → canonical
     _coalesce_into("grading_fee_initial", ["grading_fee_per_card"])
-
-    # additional costs: additional_costs <- extra_costs
     _coalesce_into("additional_costs", ["extra_costs"])
-
-    # received grade: received_grade <- returned_grade
     _coalesce_into("received_grade", ["returned_grade"])
 
     # Numeric parse
     for c in ["purchase_total", "grading_fee_initial", "additional_costs", "psa9_price", "psa10_price"]:
         df[c] = df[c].apply(lambda v: safe_float(v, 0.0))
 
-    # Ensure IDs are strings
     df["grading_row_id"] = df["grading_row_id"].astype(str)
     df["submission_id"] = df["submission_id"].astype(str)
 
-    # status default
     df["status"] = df["status"].astype(str).replace("", "SUBMITTED")
 
     return df
+
 
 def refresh_all():
     load_inventory_df.clear()
     load_grading_df.clear()
     st.rerun()
 
+
 # =========================================================
-# WRITES
+# WRITES (HEADER REPAIR ONLY HERE)
 # =========================================================
 
 def append_grading_rows(rows: list[dict]):
@@ -901,19 +483,11 @@ def append_grading_rows(rows: list[dict]):
         return
 
     ws = get_ws(GRADING_WS_NAME)
-    headers = ensure_headers(ws, GRADING_CANON_COLS)  # also repairs duplicates
+    headers = ensure_headers(ws, GRADING_CANON_COLS, write=True, prune_blank_dups=False)
 
-    # columns we always want treated as numeric in storage
-    NUM_COLS = {
-        "purchase_total",
-        "grading_fee_initial",
-        "additional_costs",
-        "psa9_price",
-        "psa10_price",
-    }
+    NUM_COLS = {"purchase_total", "grading_fee_initial", "additional_costs", "psa9_price", "psa10_price"}
 
     def _num_str(v):
-        # store as raw numeric string so Sheets doesn't coerce to date
         if v is None or (isinstance(v, str) and v.strip() == ""):
             return ""
         try:
@@ -921,54 +495,66 @@ def append_grading_rows(rows: list[dict]):
         except Exception:
             return ""
 
+    # Build all rows for a single append (append_rows is fewer requests than append_row loop)
+    out_rows = []
     for row in rows:
         values = []
         for h in headers:
-            base = re.sub(r"__dup\d+$", "", h)
+            base = _strip_dups(h)
             v = row.get(base, "")
-
             if base in NUM_COLS:
                 v = _num_str(v)
-
-            # IMPORTANT: write as RAW to prevent Sheet parsing/auto-typing
             values.append(v)
+        out_rows.append(values)
 
-        ws.append_row(values, value_input_option="RAW")
+    # append_rows is available in newer gspread; fallback to append_row if needed
+    if hasattr(ws, "append_rows"):
+        _gs_write_retry(ws.append_rows, out_rows, value_input_option="RAW")
+    else:
+        for r in out_rows:
+            _gs_write_retry(ws.append_row, r, value_input_option="RAW")
 
 
 def update_grading_rows(df_rows: pd.DataFrame):
-    if df_rows.empty:
+    """
+    Quota-safe update:
+    - Repairs headers once (write=True)
+    - Uses a SINGLE read (ws.get_all_values) to map grading_row_id -> rownum
+    - Batch updates all rows in one request (or a few) instead of per-row ws.update
+    """
+    if df_rows is None or df_rows.empty:
         return
 
     ws = get_ws(GRADING_WS_NAME)
-    headers = ensure_headers(ws, GRADING_CANON_COLS)  # also repairs duplicates
+    headers = ensure_headers(ws, GRADING_CANON_COLS, write=True, prune_blank_dups=False)
 
-    # locate grading_row_id in column (by base-name match)
-    id_header = None
-    for h in headers:
-        if re.sub(r"__dup\d+$", "", h) == "grading_row_id":
-            id_header = h
+    values = ws.get_all_values()
+    if not values:
+        return
+
+    sheet_header = values[0] if values else []
+    if not sheet_header:
+        return
+
+    # find grading_row_id column index
+    id_col_idx = None
+    for j, h in enumerate(sheet_header):
+        if _strip_dups(h) == "grading_row_id":
+            id_col_idx = j
             break
-    if not id_header:
+    if id_col_idx is None:
         raise ValueError("grading_row_id must exist in grading sheet header row.")
 
-    id_col = headers.index(id_header) + 1
-    id_vals = ws.col_values(id_col)
+    # id -> rownum mapping from same read
+    id_to_rownum: dict[str, int] = {}
+    for rownum, row in enumerate(values[1:], start=2):
+        v = str(row[id_col_idx] if len(row) > id_col_idx else "" or "").strip()
+        if v:
+            id_to_rownum[v] = rownum
 
-    id_to_rownum = {}
-    for idx, val in enumerate(id_vals[1:], start=2):
-        if val:
-            id_to_rownum[str(val).strip()] = idx
+    last_col = a1_col_letter(len(sheet_header))
 
-    last_col = a1_col_letter(len(headers))
-
-    NUM_COLS = {
-        "purchase_total",
-        "grading_fee_initial",
-        "additional_costs",
-        "psa9_price",
-        "psa10_price",
-    }
+    NUM_COLS = {"purchase_total", "grading_fee_initial", "additional_costs", "psa9_price", "psa10_price"}
 
     def _num_str(v):
         if v is None or (isinstance(v, str) and v.strip() == ""):
@@ -978,129 +564,136 @@ def update_grading_rows(df_rows: pd.DataFrame):
         except Exception:
             return ""
 
+    # Build batch update payload
+    data_updates = []
     for _, r in df_rows.iterrows():
         rid = str(r.get("grading_row_id", "")).strip()
         rownum = id_to_rownum.get(rid)
         if not rownum:
             continue
 
-        values = []
-        for h in headers:
-            base = re.sub(r"__dup\d+$", "", h)
+        out_row = []
+        for h in sheet_header:
+            base = _strip_dups(h)
             v = r.get(base, "")
             if pd.isna(v):
                 v = ""
-
             if base in NUM_COLS:
                 v = _num_str(v)
+            out_row.append(v)
 
-            values.append(v)
+        data_updates.append({
+            "range": f"A{rownum}:{last_col}{rownum}",
+            "values": [out_row],
+        })
 
-        ws.update(f"A{rownum}:{last_col}{rownum}", [values], value_input_option="RAW")
+    if not data_updates:
+        return
+
+    # batch_update in chunks to reduce request size if needed
+    chunk_size = 50
+    for i in range(0, len(data_updates), chunk_size):
+        chunk = data_updates[i:i + chunk_size]
+        _gs_write_retry(ws.batch_update, chunk, value_input_option="RAW")
 
 
 def update_inventory_status(inventory_id: str, new_status: str):
     inv_ws = get_ws(INVENTORY_WS_NAME)
-    headers = inv_ws.row_values(1)
+    values = inv_ws.get_all_values()
+    if not values:
+        return
+    headers = values[0] if values else []
     if not headers:
         return
 
-    # repair header drift (strip/dupes) without changing UI
-    _ = ensure_headers(inv_ws, ["inventory_id", "inventory_status"])
+    # Find cols by base-name
+    id_col_idx = None
+    status_col_idx = None
+    for j, h in enumerate(headers):
+        b = _strip_dups(h)
+        if b == "inventory_id":
+            id_col_idx = j
+        elif b == "inventory_status":
+            status_col_idx = j
 
-    headers = inv_ws.row_values(1)
-    # find inventory_id header by base-name
-    id_header = None
-    for h in headers:
-        if re.sub(r"__dup\d+$", "", h) == "inventory_id":
-            id_header = h
+    if id_col_idx is None or status_col_idx is None:
+        # only repair headers when we're actually writing
+        ensure_headers(inv_ws, ["inventory_id", "inventory_status"], write=True, prune_blank_dups=False)
+        values = inv_ws.get_all_values()
+        headers = values[0] if values else []
+        id_col_idx = None
+        status_col_idx = None
+        for j, h in enumerate(headers):
+            b = _strip_dups(h)
+            if b == "inventory_id":
+                id_col_idx = j
+            elif b == "inventory_status":
+                status_col_idx = j
+        if id_col_idx is None or status_col_idx is None:
+            return
+
+    # Locate row
+    target_row = None
+    for i, row in enumerate(values[1:], start=2):
+        v = str(row[id_col_idx] if len(row) > id_col_idx else "" or "").strip()
+        if v == str(inventory_id).strip():
+            target_row = i
             break
-    if not id_header:
+    if not target_row:
         return
 
-    id_col = headers.index(id_header) + 1
-    ids = inv_ws.col_values(id_col)
-
-    rownum = None
-    for i, v in enumerate(ids[1:], start=2):
-        if str(v).strip() == str(inventory_id).strip():
-            rownum = i
-            break
-    if not rownum:
-        return
-
-    status_header = None
-    for h in headers:
-        if re.sub(r"__dup\d+$", "", h) == "inventory_status":
-            status_header = h
-            break
-    if status_header:
-        c = headers.index(status_header) + 1
-        inv_ws.update(
-            f"{a1_col_letter(c)}{rownum}",
-            [[new_status]],
-            value_input_option="USER_ENTERED",
-        )
+    col_letter = a1_col_letter(status_col_idx + 1)
+    _gs_write_retry(inv_ws.update, values=[[new_status]], range_name=f"{col_letter}{target_row}", value_input_option="USER_ENTERED")
 
 
 def mark_inventory_as_graded(inventory_id: str, grading_company: str, grade: str):
     inv_ws = get_ws(INVENTORY_WS_NAME)
-    headers = inv_ws.row_values(1)
+
+    # Only repair headers on write path
+    ensure_headers(inv_ws, ["inventory_id", "product_type", "grading_company", "grade", "reference_link", "market_price", "market_value"], write=True, prune_blank_dups=False)
+
+    values = inv_ws.get_all_values()
+    if not values:
+        return
+    headers = values[0] if values else []
     if not headers:
         return
 
-    # ensure needed headers exist (includes market columns + reference_link)
-    _ = ensure_headers(inv_ws, ["inventory_id", "product_type", "grading_company", "grade", "reference_link", "market_price", "market_value"])
+    # find required col idxs by base
+    idx = { _strip_dups(h): j for j, h in enumerate(headers) }
 
-    headers = inv_ws.row_values(1)
-
-    # find inventory_id header by base-name
-    id_header = None
-    for h in headers:
-        if re.sub(r"__dup\d+$", "", h) == "inventory_id":
-            id_header = h
-            break
-    if not id_header:
+    if "inventory_id" not in idx:
         return
 
-    id_col = headers.index(id_header) + 1
-    ids = inv_ws.col_values(id_col)
+    id_col = idx["inventory_id"]
 
+    # locate row
     rownum = None
-    for i, v in enumerate(ids[1:], start=2):
-        if str(v).strip() == str(inventory_id).strip():
+    for i, row in enumerate(values[1:], start=2):
+        v = str(row[id_col] if len(row) > id_col else "" or "").strip()
+        if v == str(inventory_id).strip():
             rownum = i
             break
     if not rownum:
         return
 
-    def _header_for(base_name: str):
-        for h in headers:
-            if re.sub(r"__dup\d+$", "", h) == base_name:
-                return h
-        return None
-
     def _set(base_name: str, value):
-        target = _header_for(base_name)
-        if not target:
+        if base_name not in idx:
             return
-        c = headers.index(target) + 1
-        inv_ws.update(f"{a1_col_letter(c)}{rownum}", [[value]], value_input_option="USER_ENTERED")
-
+        c = idx[base_name] + 1
+        _gs_write_retry(inv_ws.update, values=[[value]], range_name=f"{a1_col_letter(c)}{rownum}", value_input_option="USER_ENTERED")
 
     def _get(base_name: str) -> str:
-        target = _header_for(base_name)
-        if not target:
+        if base_name not in idx:
             return ""
-        c = headers.index(target) + 1
-        return str(inv_ws.cell(rownum, c).value or "").strip()
+        c = idx[base_name]
+        row = values[rownum - 1] if rownum - 1 < len(values) else []
+        return str(row[c] if len(row) > c else "" or "").strip()
 
-    # set graded fields
     _set("product_type", "Graded Card")
     _set("grading_company", grading_company)
     _set("grade", grade)
 
-    # compute graded market value from pricecharting using grade slot logic
     link = _get("reference_link")
     if link and "pricecharting.com" in link.lower():
         prices = fetch_pricecharting_prices(link)
@@ -1117,6 +710,226 @@ def mark_inventory_as_graded(inventory_id: str, grading_company: str, grade: str
 
 
 # =========================================================
+# OPTIONAL: Manual header repair UI (safe + quota friendly)
+# =========================================================
+
+with st.expander("🛠️ Sheet Maintenance (fix duplicate columns / header drift)", expanded=False):
+    st.caption(
+        "If you previously had buggy header logic, click this once to normalize the header row and (optionally) "
+        "delete fully-blank duplicate columns. This prevents columns from endlessly multiplying."
+    )
+
+    cA, cB = st.columns([1, 1])
+    with cA:
+        do_prune = st.checkbox("Prune fully blank duplicate columns (safe)", value=True)
+    with cB:
+        if st.button("Repair grading sheet headers now", use_container_width=True):
+            ws = get_ws(GRADING_WS_NAME)
+            ensure_headers(ws, GRADING_CANON_COLS, write=True, prune_blank_dups=do_prune)
+            st.success("Repaired grading sheet headers.")
+            refresh_all()
+
+
+# =========================================================
+# SYNC RETURNED GRADES TO INVENTORY (unchanged logic, but write calls are retried)
+# =========================================================
+
+def sync_returned_grades_to_inventory():
+    STATUS_ACTIVE_LOCAL = "ACTIVE"
+    STATUS_LISTED_LOCAL = "LISTED"
+
+    def to_num(x):
+        return safe_float(x, 0.0)
+
+    def to_dt(x):
+        return pd.to_datetime(x, errors="coerce")
+
+    def norm(s):
+        return "" if s is None else str(s).strip()
+
+    client = get_gspread_client()
+    sh = client.open_by_key(st.secrets["spreadsheet_id"])
+
+    inv_ws_name = st.secrets.get("inventory_worksheet", "inventory")
+    grd_ws_name = st.secrets.get("grading_worksheet", "grading")
+
+    inv_ws = sh.worksheet(inv_ws_name)
+    grd_ws = sh.worksheet(grd_ws_name)
+
+    # Only repair headers if user is syncing (explicit action)
+    ensure_headers(inv_ws, ["inventory_id", "inventory_status", "product_type", "grading_company", "grade", "condition", "total_price", "reference_link", "market_price", "market_value"], write=True, prune_blank_dups=False)
+    ensure_headers(grd_ws, GRADING_CANON_COLS, write=True, prune_blank_dups=False)
+
+    inv_records = inv_ws.get_all_records()
+    grd_records = grd_ws.get_all_records()
+
+    inv_df = pd.DataFrame(inv_records)
+    grd_df = pd.DataFrame(grd_records)
+
+    if inv_df.empty or grd_df.empty:
+        return 0
+
+    # Normalize missing columns safely
+    for c in [
+        "inventory_id",
+        "inventory_status",
+        "reference_link",
+        "total_price",
+        "product_type",
+        "grading_company",
+        "grade",
+        "condition",
+        "purchase_date",
+    ]:
+        if c not in inv_df.columns:
+            inv_df[c] = ""
+
+    for c in [
+        "status",
+        "reference_link",
+        "grading_company",
+        "grading_fee_initial",
+        "additional_costs",
+        "psa10_price",
+        "psa9_price",
+        "received_grade",
+        "inventory_id",
+        "synced_to_inventory",
+    ]:
+        if c not in grd_df.columns:
+            grd_df[c] = ""
+
+    inv_df["__inv_total"] = inv_df["total_price"].apply(to_num)
+    inv_df["__inv_dt"] = to_dt(inv_df.get("purchase_date", ""))
+
+    grd_df["__status"] = grd_df["status"].astype(str).str.upper().str.strip()
+    returned = grd_df[grd_df["__status"] == "RETURNED"].copy()
+    if returned.empty:
+        return 0
+
+    if "synced_to_inventory" in grd_df.columns:
+        returned = returned[returned["synced_to_inventory"].astype(str).str.upper().str.strip() != "YES"].copy()
+    if returned.empty:
+        return 0
+
+    # Map inventory_id -> sheet rownum via values read
+    inv_values = inv_ws.get_all_values()
+    if not inv_values or not inv_values[0]:
+        return 0
+    inv_headers = inv_values[0]
+    inv_idx = { _strip_dups(h): j for j, h in enumerate(inv_headers) }
+    if "inventory_id" not in inv_idx:
+        return 0
+    id_col_idx = inv_idx["inventory_id"]
+
+    id_to_rownum = {}
+    for i, row in enumerate(inv_values[1:], start=2):
+        v = str(row[id_col_idx] if len(row) > id_col_idx else "" or "").strip()
+        if v:
+            id_to_rownum[v] = i
+
+    # Helper set cell (single cell updates; low volume here)
+    def set_inv_cell(rownum: int, col_base: str, value):
+        if col_base not in inv_idx:
+            return
+        c = inv_idx[col_base] + 1
+        _gs_write_retry(inv_ws.update, values=[[value]], range_name=f"{a1_col_letter(c)}{rownum}", value_input_option="USER_ENTERED")
+
+    # Grading values map
+    grd_values = grd_ws.get_all_values()
+    if not grd_values or not grd_values[0]:
+        return 0
+    grd_headers = grd_values[0]
+    grd_idx = { _strip_dups(h): j for j, h in enumerate(grd_headers) }
+    if "grading_row_id" not in grd_idx:
+        return 0
+    grd_id_col = grd_idx["grading_row_id"]
+
+    grd_id_to_rownum = {}
+    for i, row in enumerate(grd_values[1:], start=2):
+        v = str(row[grd_id_col] if len(row) > grd_id_col else "" or "").strip()
+        if v:
+            grd_id_to_rownum[v] = i
+
+    def set_grd_cell(rownum: int, col_base: str, value):
+        if col_base not in grd_idx:
+            return
+        c = grd_idx[col_base] + 1
+        _gs_write_retry(grd_ws.update, values=[[value]], range_name=f"{a1_col_letter(c)}{rownum}", value_input_option="USER_ENTERED")
+
+    updated_count = 0
+
+    for _, g in returned.iterrows():
+        g_ref = norm(g.get("reference_link", ""))
+        g_inv_id = norm(g.get("inventory_id", ""))
+        g_company = norm(g.get("grading_company", ""))
+        g_grade = norm(g.get("received_grade", ""))
+
+        grading_cost = to_num(g.get("grading_fee_initial", 0)) + to_num(g.get("additional_costs", 0))
+
+        psa10 = to_num(g.get("psa10_price", 0))
+        psa9 = to_num(g.get("psa9_price", 0))
+        grade_upper = str(g_grade).upper()
+        new_market = psa10 if ("10" in grade_upper) or ("PRISTINE" in grade_upper) or ("BLACK" in grade_upper) else psa9
+
+        inv_match = None
+
+        if g_inv_id:
+            m = inv_df[inv_df["inventory_id"].astype(str).str.strip() == g_inv_id]
+            if not m.empty:
+                inv_match = m.iloc[0]
+
+        if inv_match is None and g_ref:
+            candidates = inv_df[
+                (inv_df["reference_link"].astype(str).str.strip() == g_ref)
+                & (inv_df["inventory_status"].astype(str).str.upper().isin([STATUS_ACTIVE_LOCAL, STATUS_LISTED_LOCAL]))
+            ].copy()
+
+            if not candidates.empty:
+                g_dt = to_dt(g.get("purchase_date", ""))
+                g_cost = to_num(g.get("purchase_total", 0)) or 0.0
+
+                candidates["__dtdiff"] = (candidates["__inv_dt"] - g_dt).abs()
+                candidates["__costdiff"] = (candidates["__inv_total"] - g_cost).abs()
+                candidates = candidates.sort_values(["__dtdiff", "__costdiff"])
+                inv_match = candidates.iloc[0]
+
+        if inv_match is None:
+            continue
+
+        inv_id = str(inv_match["inventory_id"]).strip()
+        rownum = id_to_rownum.get(inv_id)
+        if not rownum:
+            continue
+
+        old_total = to_num(inv_match.get("total_price", 0))
+        new_total = round(old_total + grading_cost, 2)
+
+        set_inv_cell(rownum, "product_type", "Graded Card")
+        set_inv_cell(rownum, "grading_company", g_company)
+        set_inv_cell(rownum, "grade", g_grade)
+        set_inv_cell(rownum, "condition", "Graded")
+        set_inv_cell(rownum, "total_price", new_total)
+        set_inv_cell(rownum, "market_price", new_market)
+        set_inv_cell(rownum, "market_value", new_market)
+
+        rid = str(g.get("grading_row_id", "")).strip()
+        grd_rownum = grd_id_to_rownum.get(rid)
+        if grd_rownum:
+            set_grd_cell(grd_rownum, "synced_to_inventory", "YES")
+
+        updated_count += 1
+
+    return updated_count
+
+
+if st.button("🔁 Sync RETURNED grades → Inventory", use_container_width=True):
+    n = sync_returned_grades_to_inventory()
+    st.success(f"Synced {n} returned submission(s) into Inventory.")
+    st.rerun()
+
+
+# =========================================================
 # DATA
 # =========================================================
 
@@ -1128,6 +941,7 @@ if not eligible_inv.empty:
     eligible_inv = eligible_inv[eligible_inv["inventory_status"].isin(list(ELIGIBLE_INV_STATUSES))].copy()
     if "product_type" in eligible_inv.columns:
         eligible_inv = eligible_inv[~eligible_inv["product_type"].astype(str).str.lower().str.contains("sealed", na=False)]
+
 
 # =========================================================
 # UI TABS
@@ -1176,7 +990,6 @@ with tab_analysis:
             psa9 = prices["psa9"]
             psa10 = prices["psa10"]
 
-
         profit9 = psa9 - (purchase_total + fee)
         profit10 = psa10 - (purchase_total + fee)
 
@@ -1188,6 +1001,7 @@ with tab_analysis:
         d1, d2 = st.columns(2)
         d1.metric("Profit if PSA 9", f"${profit9:,.2f}")
         d2.metric("Profit if PSA 10", f"${profit10:,.2f}")
+
 
 # -------------------------
 # Create Submission
@@ -1281,6 +1095,7 @@ with tab_submit:
                     "notes": notes,
                     "created_at": now,
                     "updated_at": now,
+                    "synced_to_inventory": "",
                 })
 
                 update_inventory_status(inv_id, STATUS_GRADING)
@@ -1288,6 +1103,7 @@ with tab_submit:
             append_grading_rows(rows)
             st.success(f"Created submission {sub_id} with {len(rows)} card(s).")
             refresh_all()
+
 
 # -------------------------
 # Update Returns
@@ -1341,15 +1157,12 @@ with tab_update:
             ]
             show = sub_rows[edit_cols].copy()
 
-            # Force numeric columns to show as numbers (not strings/dates)
             for c in ["purchase_total", "grading_fee_initial", "additional_costs", "psa9_price", "psa10_price"]:
                 if c in show.columns:
                     show[c] = show[c].apply(lambda v: safe_float(v, 0.0))
 
             edited = st.data_editor(show, use_container_width=True, hide_index=True, num_rows="fixed")
 
-
-            # Single action: Save updates
             save = st.button("Save updates", type="primary", use_container_width=True)
 
             if save:
@@ -1368,13 +1181,11 @@ with tab_update:
                     updated.at[idx, "returned_date"] = safe_str(e.get("returned_date", "")).strip()
                     updated.at[idx, "received_grade"] = safe_str(e.get("received_grade", "")).strip()
 
-                    # Auto-mark RETURNED if user entered either returned_date or received_grade
-                    if (not is_blank(updated.at[idx, "returned_date"])) or (not is_blank(updated.at[idx, "received_grade"])):
+                    if (not is_blank(updated.at[idx, "returned_date"])) or (not is_blank(updated.at[idx, "received_grade"]))):
                         updated.at[idx, "status"] = "RETURNED"
 
                     updated.at[idx, "updated_at"] = datetime.utcnow().isoformat()
 
-                    # If RETURNED, flip inventory back to ACTIVE + mark graded fields
                     if str(updated.at[idx, "status"]).upper() == "RETURNED":
                         inv_id = safe_str(updated.at[idx, "inventory_id"])
                         update_inventory_status(inv_id, STATUS_ACTIVE)
