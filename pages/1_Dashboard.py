@@ -2140,6 +2140,8 @@ with tab_forecast:
 
     # -------------------------
     # Chart 1: Sales vs Expenses by Month (+ TOTAL)
+    #   - adds dotted profit/loss shaded area between sales & expenses
+    #   - adds labels on bars + profit/loss delta label
     # -------------------------
     with top_l:
         st.markdown("### Sales vs Expenses (Monthly)")
@@ -2191,7 +2193,11 @@ with tab_forecast:
             max_m = max([x.max() for x in allm])
             months = pd.date_range(min_m, max_m, freq="MS")
         else:
-            months = pd.date_range(pd.Timestamp(date.today().replace(day=1)), pd.Timestamp(date.today().replace(day=1)), freq="MS")
+            months = pd.date_range(
+                pd.Timestamp(date.today().replace(day=1)),
+                pd.Timestamp(date.today().replace(day=1)),
+                freq="MS",
+            )
 
         base_m = pd.DataFrame({"month": months})
         base_m = base_m.merge(sales_m, on="month", how="left")
@@ -2205,41 +2211,110 @@ with tab_forecast:
             base_m[c] = base_m[c].fillna(0.0)
 
         base_m["expenses"] = base_m["inv_expense"] + base_m["misc_expense"] + base_m["grading_expense"]
+        base_m["profit"] = base_m["sales"] - base_m["expenses"]
 
         # Add TOTAL row at end
         total_row = pd.DataFrame([{
             "month": pd.NaT,
             "sales": float(base_m["sales"].sum()),
             "expenses": float(base_m["expenses"].sum()),
+            "profit": float(base_m["profit"].sum()),
             "__label": "TOTAL"
         }])
 
-        plot_m = base_m[["month", "sales", "expenses"]].copy()
+        plot_m = base_m[["month", "sales", "expenses", "profit"]].copy()
         plot_m["__label"] = plot_m["month"].dt.strftime("%Y-%m")
         plot_m = pd.concat([plot_m, total_row], ignore_index=True)
 
-        plot_long = plot_m.melt(id_vars=["__label"], value_vars=["sales", "expenses"], var_name="series", value_name="value")
+        # long for grouped bars
+        plot_long = plot_m.melt(
+            id_vars=["__label", "profit"],
+            value_vars=["sales", "expenses"],
+            var_name="series",
+            value_name="value",
+        )
         plot_long["series"] = plot_long["series"].map({"sales": "Sales", "expenses": "Expenses"})
 
+        # dotted shaded box between bars (profit/loss area)
+        rect_df = plot_m.copy()
+        rect_df["y1"] = rect_df[["sales", "expenses"]].min(axis=1)
+        rect_df["y2"] = rect_df[["sales", "expenses"]].max(axis=1)
+        rect_df["mid"] = (rect_df["y1"] + rect_df["y2"]) / 2.0
+        rect_df["pl_sign"] = np.where(rect_df["profit"] >= 0, "Profit", "Loss")
+
+        # Bars
         bar = alt.Chart(plot_long).mark_bar().encode(
             x=alt.X("__label:N", sort=None, title="Month"),
             y=alt.Y("value:Q", title="$"),
             xOffset="series:N",
-            color=alt.Color("series:N", scale=alt.Scale(range=["#2563eb", "#22c55e"]), legend=alt.Legend(title="")),
+            color=alt.Color(
+                "series:N",
+                scale=alt.Scale(domain=["Sales", "Expenses"], range=["#2563eb", "#22c55e"]),
+                legend=alt.Legend(title=""),
+            ),
             tooltip=[
                 alt.Tooltip("__label:N", title="Month"),
                 alt.Tooltip("series:N", title="Series"),
                 alt.Tooltip("value:Q", title="Value", format=",.2f"),
             ],
-        ).properties(height=340)
+        )
 
-        st.altair_chart(bar, use_container_width=True)
+        # Data labels on bars
+        bar_labels = alt.Chart(plot_long).mark_text(dy=-8, fontSize=11).encode(
+            x=alt.X("__label:N", sort=None),
+            y="value:Q",
+            xOffset="series:N",
+            text=alt.Text("value:Q", format=",.0f"),
+            color=alt.value("#0f172a"),
+        )
+
+        # Dotted shaded area (green if profit, red if loss)
+        rect = alt.Chart(rect_df).mark_rect(
+            opacity=0.18,
+            strokeWidth=2,
+            strokeDash=[6, 6],
+        ).encode(
+            x=alt.X("__label:N", sort=None),
+            y=alt.Y("y1:Q"),
+            y2=alt.Y2("y2:Q"),
+            color=alt.Color(
+                "pl_sign:N",
+                scale=alt.Scale(domain=["Profit", "Loss"], range=["#22c55e", "#ef4444"]),
+                legend=None,
+            ),
+            tooltip=[
+                alt.Tooltip("__label:N", title="Month"),
+                alt.Tooltip("profit:Q", title="Sales - Expenses", format=",.2f"),
+            ],
+        )
+
+        # Profit/Loss delta label centered in the dotted area
+        rect_label = alt.Chart(rect_df).mark_text(fontSize=12, fontWeight="bold").encode(
+            x=alt.X("__label:N", sort=None),
+            y=alt.Y("mid:Q"),
+            text=alt.Text("profit:Q", format=",+.0f"),
+            color=alt.Color(
+                "pl_sign:N",
+                scale=alt.Scale(domain=["Profit", "Loss"], range=["#15803d", "#b91c1c"]),
+                legend=None,
+            ),
+        )
+
+        final = (bar + rect + bar_labels + rect_label).properties(height=340).interactive()
+        st.altair_chart(final, use_container_width=True)
 
     # -------------------------
-    # Chart 2: Net Profit Trend (Actual + dotted forecast from grading)
+    # Chart 2: Net Profit Trend (Actual + dotted upside/downside)
+    #   - actual line only through current month
+    #   - actual segments colored green for profit / red for loss
+    #   - dotted upside/downside from current month forward
+    #   - dotted segments colored green if value >=0 else red
+    #   - labels on points (actual + forecast)
     # -------------------------
     with top_r:
         st.markdown("### Net Profit Trend")
+
+        current_month = pd.Timestamp(date.today().replace(day=1))
 
         # Actual net profit by month (based on sold transactions)
         profit_m = pd.DataFrame(columns=["month", "profit"])
@@ -2255,6 +2330,8 @@ with tab_forecast:
                    .rename(columns={"__sold_month": "month", "__profit": "profit"})
             )
 
+        profit_m = profit_m[profit_m["month"] <= current_month].copy()
+
         # Forecast profit by return month from grading (psa9/psa10 minus (purchase_total + grading_cost))
         forecast_up = pd.DataFrame(columns=["month", "profit_up"])
         forecast_dn = pd.DataFrame(columns=["month", "profit_dn"])
@@ -2262,7 +2339,6 @@ with tab_forecast:
         if not open_grading_2.empty and "__est_return_month" in open_grading_2.columns:
             og = open_grading_2.dropna(subset=["__est_return_month"]).copy()
 
-            # projected profit assumptions
             og["__base_cost"] = (_to_num(og.get("__purchase_total", 0.0)) + _to_num(og.get("__grading_cost", 0.0))).fillna(0.0)
             og["__profit_up"] = (_to_num(og.get("__psa10", 0.0)) - og["__base_cost"]).fillna(0.0)
             og["__profit_dn"] = (_to_num(og.get("__psa9", 0.0)) - og["__base_cost"]).fillna(0.0)
@@ -2273,6 +2349,10 @@ with tab_forecast:
             forecast_dn = og.groupby("__est_return_month", as_index=False)["__profit_dn"].sum().rename(
                 columns={"__est_return_month": "month", "__profit_dn": "profit_dn"}
             )
+
+        next_month = current_month + pd.offsets.MonthBegin(1)
+        forecast_up = forecast_up[forecast_up["month"] >= next_month].copy()
+        forecast_dn = forecast_dn[forecast_dn["month"] >= next_month].copy()
 
         # Build a combined month backbone (include future grading months)
         allm2 = []
@@ -2285,55 +2365,147 @@ with tab_forecast:
             max_m2 = max([x.max() for x in allm2])
             months2 = pd.date_range(min_m2, max_m2, freq="MS")
         else:
-            months2 = pd.date_range(pd.Timestamp(date.today().replace(day=1)), pd.Timestamp(date.today().replace(day=1)), freq="MS")
+            months2 = pd.date_range(current_month, current_month, freq="MS")
 
         trend = pd.DataFrame({"month": months2})
         trend = trend.merge(profit_m, on="month", how="left").merge(forecast_up, on="month", how="left").merge(forecast_dn, on="month", how="left")
-        trend["profit"] = trend["profit"].fillna(0.0)
-        trend["profit_up"] = trend["profit_up"].fillna(0.0)
-        trend["profit_dn"] = trend["profit_dn"].fillna(0.0)
 
-        # Only show dotted forecast for future months (next month onward)
-        current_month = pd.Timestamp(date.today().replace(day=1))
-        next_month = current_month + pd.offsets.MonthBegin(1)
-        trend["__is_future"] = trend["month"] >= next_month
+        # Actual line stops after current month
+        trend["profit"] = trend["profit"].astype(float)
+        trend.loc[trend["month"] > current_month, "profit"] = np.nan
 
-        # Plot data
-        actual_line_df = trend.copy()
-        actual_line_df["series"] = "Actual"
-        actual_line_df["value"] = actual_line_df["profit"]
+        # Only show forecasts for future months
+        trend.loc[trend["month"] <= current_month, "profit_up"] = np.nan
+        trend.loc[trend["month"] <= current_month, "profit_dn"] = np.nan
 
-        up_df = trend[trend["__is_future"]].copy()
-        up_df["series"] = "Upside (All PSA 10s)"
-        up_df["value"] = up_df["profit_up"]
+        # -------------------------
+        # Build ACTUAL segmented line (green if profit, red if loss)
+        # -------------------------
+        segs = []
+        actual_pts = trend.dropna(subset=["profit"]).sort_values("month").copy()
+        if len(actual_pts) >= 2:
+            for i in range(1, len(actual_pts)):
+                a = actual_pts.iloc[i - 1]
+                b = actual_pts.iloc[i]
+                segs.append({
+                    "x1": a["month"],
+                    "y1": float(a["profit"]),
+                    "x2": b["month"],
+                    "y2": float(b["profit"]),
+                    "sign": "Profit" if float(b["profit"]) >= 0 else "Loss",
+                })
+        seg_df = pd.DataFrame(segs)
 
-        dn_df = trend[trend["__is_future"]].copy()
-        dn_df["series"] = "Downside (All PSA 9s)"
-        dn_df["value"] = dn_df["profit_dn"]
+        actual_points_df = actual_pts.copy()
+        if not actual_points_df.empty:
+            actual_points_df["sign"] = np.where(actual_points_df["profit"] >= 0, "Profit", "Loss")
 
-        plot_trend = pd.concat([actual_line_df[["month", "series", "value"]], up_df[["month", "series", "value"]], dn_df[["month", "series", "value"]]], ignore_index=True)
-
-        line_actual = alt.Chart(plot_trend[plot_trend["series"] == "Actual"]).mark_line(size=3).encode(
-            x=alt.X("month:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
-            y=alt.Y("value:Q", title="$"),
+        seg_line = alt.Chart(seg_df).mark_rule(strokeWidth=3).encode(
+            x=alt.X("x1:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
+            x2="x2:T",
+            y=alt.Y("y1:Q", title="$"),
+            y2="y2:Q",
+            color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#22c55e", "#ef4444"]), legend=None),
             tooltip=[
-                alt.Tooltip("month:T", title="Month", format="%Y-%m"),
-                alt.Tooltip("value:Q", title="Net Profit", format=",.2f"),
+                alt.Tooltip("x2:T", title="Month", format="%Y-%m"),
+                alt.Tooltip("y2:Q", title="Net Profit", format=",.2f"),
             ],
         )
 
-        line_forecast = alt.Chart(plot_trend[plot_trend["series"] != "Actual"]).mark_line(size=2, strokeDash=[6, 6]).encode(
+        actual_points = alt.Chart(actual_points_df).mark_point(size=70, filled=True).encode(
             x="month:T",
-            y="value:Q",
-            color=alt.Color("series:N", legend=alt.Legend(title="")),
+            y="profit:Q",
+            color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#22c55e", "#ef4444"]), legend=None),
             tooltip=[
                 alt.Tooltip("month:T", title="Month", format="%Y-%m"),
-                alt.Tooltip("series:N", title="Forecast"),
-                alt.Tooltip("value:Q", title="Projected Profit", format=",.2f"),
+                alt.Tooltip("profit:Q", title="Net Profit", format=",.2f"),
             ],
         )
 
-        st.altair_chart((line_actual + line_forecast).properties(height=340).interactive(), use_container_width=True)
+        actual_labels = alt.Chart(actual_points_df).mark_text(dy=-10, fontSize=11, fontWeight="bold").encode(
+            x="month:T",
+            y="profit:Q",
+            text=alt.Text("profit:Q", format=",.0f"),
+            color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#15803d", "#b91c1c"]), legend=None),
+        )
+
+        # -------------------------
+        # Forecast dotted lines (Upside/Downside) with sign-based coloring
+        # -------------------------
+        def _build_forecast_segments(value_col: str):
+            pts = trend.dropna(subset=[value_col]).sort_values("month").copy()
+            if pts.empty:
+                return pd.DataFrame(), pd.DataFrame()
+            pts = pts.rename(columns={value_col: "value"})
+            pts["sign"] = np.where(pts["value"] >= 0, "Profit", "Loss")
+
+            # anchor at last actual point so forecasts extend from the current-month line
+            if not actual_pts.empty:
+                anchor = actual_pts.sort_values("month").iloc[-1]
+                anchor_row = pd.DataFrame([{
+                    "month": anchor["month"],
+                    "value": float(anchor["profit"]),
+                    "sign": "Profit" if float(anchor["profit"]) >= 0 else "Loss",
+                    "__anchor": True
+                }])
+                pts["__anchor"] = False
+                pts = pd.concat([anchor_row, pts], ignore_index=True).sort_values("month")
+
+            segs_local = []
+            if len(pts) >= 2:
+                for i in range(1, len(pts)):
+                    a = pts.iloc[i - 1]
+                    b = pts.iloc[i]
+                    segs_local.append({
+                        "x1": a["month"],
+                        "y1": float(a["value"]),
+                        "x2": b["month"],
+                        "y2": float(b["value"]),
+                        "sign": "Profit" if float(b["value"]) >= 0 else "Loss",
+                    })
+            return pd.DataFrame(segs_local), pts
+
+        seg_up, pts_up = _build_forecast_segments("profit_up")
+        seg_dn, pts_dn = _build_forecast_segments("profit_dn")
+
+        def _forecast_layer(seg_df_in, pts_df_in, label_name: str):
+            if seg_df_in is None or seg_df_in.empty:
+                return alt.Chart(pd.DataFrame({"x":[0], "y":[0]})).mark_point(opacity=0)
+
+            seg_layer = alt.Chart(seg_df_in).mark_rule(strokeWidth=2, strokeDash=[6, 6]).encode(
+                x="x1:T",
+                x2="x2:T",
+                y="y1:Q",
+                y2="y2:Q",
+                color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#22c55e", "#ef4444"]), legend=None),
+                tooltip=[
+                    alt.Tooltip("x2:T", title="Month", format="%Y-%m"),
+                    alt.Tooltip("y2:Q", title=label_name, format=",.2f"),
+                ],
+            )
+
+            pts_only = pts_df_in[pts_df_in["month"] > current_month].copy()
+
+            pts_layer = alt.Chart(pts_only).mark_point(size=55, filled=True).encode(
+                x="month:T",
+                y="value:Q",
+                color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#22c55e", "#ef4444"]), legend=None),
+            )
+
+            labels_layer = alt.Chart(pts_only).mark_text(dy=-10, fontSize=10).encode(
+                x="month:T",
+                y="value:Q",
+                text=alt.Text("value:Q", format=",.0f"),
+                color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#15803d", "#b91c1c"]), legend=None),
+            )
+
+            return seg_layer + pts_layer + labels_layer
+
+        forecast_up_layer = _forecast_layer(seg_up, pts_up, "Upside (All PSA 10s)")
+        forecast_dn_layer = _forecast_layer(seg_dn, pts_dn, "Downside (All PSA 9s)")
+
+        chart = (seg_line + actual_points + actual_labels + forecast_up_layer + forecast_dn_layer).properties(height=340).interactive()
+        st.altair_chart(chart, use_container_width=True)
 
     st.markdown("---")
 
@@ -2343,7 +2515,7 @@ with tab_forecast:
     b1, b2 = st.columns([1.0, 1.4])
 
     # -------------------------
-    # Bottom Left: Profit by Purchased From
+    # Bottom Left: Profit by Purchased From (with data labels)
     # -------------------------
     with b1:
         st.markdown("### Profit by Purchased From")
@@ -2368,10 +2540,17 @@ with tab_forecast:
                 ],
             ).properties(height=320)
 
-            st.altair_chart(chart_pf, use_container_width=True)
+            pf_labels = alt.Chart(pf).mark_text(dx=6, align="left", fontSize=11, fontWeight="bold").encode(
+                x="profit:Q",
+                y=alt.Y("purchased_from:N", sort="-x"),
+                text=alt.Text("profit:Q", format=",.0f"),
+                color=alt.condition(alt.datum.profit >= 0, alt.value("#15803d"), alt.value("#b91c1c")),
+            )
+
+            st.altair_chart(chart_pf + pf_labels, use_container_width=True)
 
     # -------------------------
-    # Bottom Right: Market KPIs + Expense Breakdown
+    # Bottom Right: Market KPIs + Expense Breakdown (with data labels)
     # -------------------------
     with b2:
         st.markdown("### Operating Metrics")
@@ -2475,7 +2654,6 @@ with tab_forecast:
                     return "Supplies"
                 if s in {"other", ""}:
                     return "Other"
-                # if it's already one of the named ones, keep it
                 for k in bucket_order:
                     if s == k.lower():
                         return k
@@ -2504,7 +2682,14 @@ with tab_forecast:
                     ],
                 ).properties(height=320)
 
-                st.altair_chart(chart_exp, use_container_width=True)
+                exp_labels = alt.Chart(exp_df).mark_text(dy=-8, fontSize=11, fontWeight="bold").encode(
+                    x=alt.X("expense_type:N", sort=bucket_order),
+                    y="amount:Q",
+                    text=alt.Text("amount:Q", format=",.0f"),
+                    color=alt.value("#0f172a"),
+                )
+
+                st.altair_chart(chart_exp + exp_labels, use_container_width=True)
             else:
                 st.info("No expenses found for the selected filters.")
 
