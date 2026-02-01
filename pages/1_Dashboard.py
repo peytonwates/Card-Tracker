@@ -1974,7 +1974,7 @@ with tab_forecast:
 
         month_choice_2 = st.selectbox("Month", options=month_opts_2, index=0, key="dash_month")
 
-    # Purchased From options (from inventory)
+    # Purchased From options (from inventory) -> use "All" like Year/Month
     purchased_from_opts_2 = []
     if not inv.empty and inv_purchased_from_col in inv.columns:
         purchased_from_opts_2 = sorted({
@@ -1982,16 +1982,17 @@ with tab_forecast:
             for x in inv[inv_purchased_from_col].dropna().tolist()
             if _safe_str(x).strip()
         })
+    purchased_from_opts_2 = ["All"] + purchased_from_opts_2
 
     with f3:
-        purchased_from_choice_2 = st.multiselect(
+        purchased_from_choice_2 = st.selectbox(
             "Purchased From",
             options=purchased_from_opts_2,
-            default=purchased_from_opts_2,
+            index=0,
             key="dash_purchased_from",
         )
 
-    # Product type options (from inventory)
+    # Product type options (from inventory) -> use "All"
     product_type_opts_2 = []
     if not inv.empty and inv_product_type_col in inv.columns:
         product_type_opts_2 = sorted({
@@ -1999,20 +2000,23 @@ with tab_forecast:
             for x in inv[inv_product_type_col].dropna().tolist()
             if _safe_str(x).strip()
         })
+    product_type_opts_2 = ["All"] + product_type_opts_2
 
     with f4:
-        product_type_choice_2 = st.multiselect(
+        product_type_choice_2 = st.selectbox(
             "Product Type",
             options=product_type_opts_2,
-            default=product_type_opts_2,
+            index=0,
             key="dash_product_type",
         )
 
+    # Card type -> use "All"
+    card_type_opts_2 = ["All", "Pokemon", "Sports"]
     with f5:
-        card_type_choice_2 = st.multiselect(
+        card_type_choice_2 = st.selectbox(
             "Card Type",
-            options=["Pokemon", "Sports"],
-            default=["Pokemon", "Sports"],
+            options=card_type_opts_2,
+            index=0,
             key="dash_card_type",
         )
 
@@ -2031,17 +2035,17 @@ with tab_forecast:
     # -------------------------
     if not inv_f2.empty:
         # Purchased From filter
-        if purchased_from_choice_2 and inv_purchased_from_col in inv_f2.columns:
-            inv_f2 = inv_f2[inv_f2[inv_purchased_from_col].astype(str).str.strip().isin(purchased_from_choice_2)].copy()
+        if purchased_from_choice_2 != "All" and inv_purchased_from_col in inv_f2.columns:
+            inv_f2 = inv_f2[inv_f2[inv_purchased_from_col].astype(str).str.strip() == purchased_from_choice_2].copy()
 
         # Product type filter
-        if product_type_choice_2 and inv_product_type_col in inv_f2.columns:
-            inv_f2 = inv_f2[inv_f2[inv_product_type_col].astype(str).str.strip().isin(product_type_choice_2)].copy()
+        if product_type_choice_2 != "All" and inv_product_type_col in inv_f2.columns:
+            inv_f2 = inv_f2[inv_f2[inv_product_type_col].astype(str).str.strip() == product_type_choice_2].copy()
 
         # Card type filter
-        if card_type_choice_2 and inv_card_type_col in inv_f2.columns:
+        if card_type_choice_2 != "All" and inv_card_type_col in inv_f2.columns:
             inv_f2["__ct"] = inv_f2[inv_card_type_col].apply(_normalize_card_type)
-            inv_f2 = inv_f2[inv_f2["__ct"].isin(card_type_choice_2)].copy()
+            inv_f2 = inv_f2[inv_f2["__ct"] == card_type_choice_2].copy()
 
     # Allowed inventory ids for other tables
     allowed_ids_2 = set()
@@ -2052,14 +2056,14 @@ with tab_forecast:
         # Build allowed IDs from the UNFILTERED inv, but apply the SAME dimension filters (not date)
         mask = pd.Series(True, index=inv_all_tmp.index)
 
-        if purchased_from_choice_2 and inv_purchased_from_col in inv_all_tmp.columns:
-            mask &= inv_all_tmp[inv_purchased_from_col].astype(str).str.strip().isin(purchased_from_choice_2)
+        if purchased_from_choice_2 != "All" and inv_purchased_from_col in inv_all_tmp.columns:
+            mask &= inv_all_tmp[inv_purchased_from_col].astype(str).str.strip() == purchased_from_choice_2
 
-        if product_type_choice_2 and inv_product_type_col in inv_all_tmp.columns:
-            mask &= inv_all_tmp[inv_product_type_col].astype(str).str.strip().isin(product_type_choice_2)
+        if product_type_choice_2 != "All" and inv_product_type_col in inv_all_tmp.columns:
+            mask &= inv_all_tmp[inv_product_type_col].astype(str).str.strip() == product_type_choice_2
 
-        if card_type_choice_2 and inv_card_type_col in inv_all_tmp.columns:
-            mask &= inv_all_tmp[inv_card_type_col].apply(_normalize_card_type).isin(card_type_choice_2)
+        if card_type_choice_2 != "All" and inv_card_type_col in inv_all_tmp.columns:
+            mask &= inv_all_tmp[inv_card_type_col].apply(_normalize_card_type) == card_type_choice_2
 
         allowed_ids_2 = set(inv_all_tmp.loc[mask, inv_id_col].astype(str).str.strip().tolist())
 
@@ -2140,8 +2144,8 @@ with tab_forecast:
 
     # -------------------------
     # Chart 1: Sales vs Expenses by Month (+ TOTAL)
-    #   - adds dotted profit/loss shaded area between sales & expenses
-    #   - adds labels on bars + profit/loss delta label
+    #   - dotted profit/loss shaded area between sales & expenses (profit=green, loss=red)
+    #   - labels on bars + shaded diff label
     # -------------------------
     with top_l:
         st.markdown("### Sales vs Expenses (Monthly)")
@@ -2193,11 +2197,7 @@ with tab_forecast:
             max_m = max([x.max() for x in allm])
             months = pd.date_range(min_m, max_m, freq="MS")
         else:
-            months = pd.date_range(
-                pd.Timestamp(date.today().replace(day=1)),
-                pd.Timestamp(date.today().replace(day=1)),
-                freq="MS",
-            )
+            months = pd.date_range(pd.Timestamp(date.today().replace(day=1)), pd.Timestamp(date.today().replace(day=1)), freq="MS")
 
         base_m = pd.DataFrame({"month": months})
         base_m = base_m.merge(sales_m, on="month", how="left")
@@ -2211,24 +2211,24 @@ with tab_forecast:
             base_m[c] = base_m[c].fillna(0.0)
 
         base_m["expenses"] = base_m["inv_expense"] + base_m["misc_expense"] + base_m["grading_expense"]
-        base_m["profit"] = base_m["sales"] - base_m["expenses"]
+        base_m["diff"] = base_m["sales"] - base_m["expenses"]  # profit/loss for the month
 
         # Add TOTAL row at end
         total_row = pd.DataFrame([{
             "month": pd.NaT,
             "sales": float(base_m["sales"].sum()),
             "expenses": float(base_m["expenses"].sum()),
-            "profit": float(base_m["profit"].sum()),
+            "diff": float(base_m["diff"].sum()),
             "__label": "TOTAL"
         }])
 
-        plot_m = base_m[["month", "sales", "expenses", "profit"]].copy()
+        plot_m = base_m[["month", "sales", "expenses", "diff"]].copy()
         plot_m["__label"] = plot_m["month"].dt.strftime("%Y-%m")
         plot_m = pd.concat([plot_m, total_row], ignore_index=True)
 
         # long for grouped bars
         plot_long = plot_m.melt(
-            id_vars=["__label", "profit"],
+            id_vars=["__label", "diff"],
             value_vars=["sales", "expenses"],
             var_name="series",
             value_name="value",
@@ -2240,7 +2240,8 @@ with tab_forecast:
         rect_df["y1"] = rect_df[["sales", "expenses"]].min(axis=1)
         rect_df["y2"] = rect_df[["sales", "expenses"]].max(axis=1)
         rect_df["mid"] = (rect_df["y1"] + rect_df["y2"]) / 2.0
-        rect_df["pl_sign"] = np.where(rect_df["profit"] >= 0, "Profit", "Loss")
+        rect_df["pl_sign"] = np.where(rect_df["diff"] >= 0, "Profit", "Loss")
+        rect_df["__diff_label"] = rect_df["diff"].apply(lambda v: f"{v:+,.0f}")
 
         # Bars
         bar = alt.Chart(plot_long).mark_bar().encode(
@@ -2284,15 +2285,15 @@ with tab_forecast:
             ),
             tooltip=[
                 alt.Tooltip("__label:N", title="Month"),
-                alt.Tooltip("profit:Q", title="Sales - Expenses", format=",.2f"),
+                alt.Tooltip("diff:Q", title="Sales - Expenses", format=",.2f"),
             ],
         )
 
-        # Profit/Loss delta label centered in the dotted area
+        # Diff label centered in the shaded area (green if profit, red if loss)
         rect_label = alt.Chart(rect_df).mark_text(fontSize=12, fontWeight="bold").encode(
             x=alt.X("__label:N", sort=None),
             y=alt.Y("mid:Q"),
-            text=alt.Text("profit:Q", format=",+.0f"),
+            text=alt.Text("__diff_label:N"),
             color=alt.Color(
                 "pl_sign:N",
                 scale=alt.Scale(domain=["Profit", "Loss"], range=["#15803d", "#b91c1c"]),
@@ -2300,63 +2301,75 @@ with tab_forecast:
             ),
         )
 
-        final = (bar + rect + bar_labels + rect_label).properties(height=340).interactive()
+        final = alt.layer(bar, rect, bar_labels, rect_label).resolve_scale(color="independent").properties(height=340).interactive()
         st.altair_chart(final, use_container_width=True)
 
     # -------------------------
-    # Chart 2: Net Profit Trend (Actual + dotted upside/downside)
-    #   - actual line only through current month
-    #   - actual segments colored green for profit / red for loss
-    #   - dotted upside/downside from current month forward
-    #   - dotted segments colored green if value >=0 else red
-    #   - labels on points (actual + forecast)
+    # Chart 2: Net Profit Trend (CUMULATIVE actual through current month + dotted upside/downside)
+    #   - cumulative = cumulative(Sales - Expenses) up to current month
+    #   - dotted forecasts = cumulative + cumulative(market value of open grading by est return month)
     # -------------------------
     with top_r:
         st.markdown("### Net Profit Trend")
 
         current_month = pd.Timestamp(date.today().replace(day=1))
+        next_month = current_month + pd.offsets.MonthBegin(1)
 
-        # Actual net profit by month (based on sold transactions)
-        profit_m = pd.DataFrame(columns=["month", "profit"])
+        # --- Reuse monthly sales/expenses logic for cumulative net
+        sales_m2 = pd.DataFrame(columns=["month", "sales"])
         if not txn_f2.empty and "__sold_month" in txn_f2.columns:
-            txp = txn_f2.copy()
-            txp["__cogs"] = txp["__inventory_id"].apply(_cogs_for_inv_id_2)
-            txp["__profit"] = (txp["__net"] - txp["__cogs"]).fillna(0.0)
-
-            profit_m = (
-                txp.dropna(subset=["__sold_month"])
-                   .groupby("__sold_month", as_index=False)["__profit"]
-                   .sum()
-                   .rename(columns={"__sold_month": "month", "__profit": "profit"})
+            sales_m2 = (
+                txn_f2.dropna(subset=["__sold_month"])
+                     .groupby("__sold_month", as_index=False)["__dollar_sales"]
+                     .sum()
+                     .rename(columns={"__sold_month": "month", "__dollar_sales": "sales"})
             )
 
-        profit_m = profit_m[profit_m["month"] <= current_month].copy()
+        inv_m2 = pd.DataFrame(columns=["month", "inv_expense"])
+        if not inv_f2.empty and "__purchase_dt" in inv_f2.columns:
+            inv_m2 = (
+                inv_f2.dropna(subset=["__purchase_dt"])
+                     .assign(month=_month_start(inv_f2["__purchase_dt"]))
+                     .groupby("month", as_index=False)[inv_total_col]
+                     .sum()
+                     .rename(columns={inv_total_col: "inv_expense"})
+            )
 
-        # Forecast profit by return month from grading (psa9/psa10 minus (purchase_total + grading_cost))
-        forecast_up = pd.DataFrame(columns=["month", "profit_up"])
-        forecast_dn = pd.DataFrame(columns=["month", "profit_dn"])
+        misc_m2 = pd.DataFrame(columns=["month", "misc_expense"])
+        if not misc_f2.empty and "__month" in misc_f2.columns:
+            misc_m2 = (
+                misc_f2.groupby("__month", as_index=False)["__amount"]
+                       .sum()
+                       .rename(columns={"__month": "month", "__amount": "misc_expense"})
+            )
+
+        grd_m2 = pd.DataFrame(columns=["month", "grading_expense"])
+        if not grd_f2.empty and "__grading_month" in grd_f2.columns:
+            grd_m2 = (
+                grd_f2.groupby("__grading_month", as_index=False)["__grading_cost"]
+                      .sum()
+                      .rename(columns={"__grading_month": "month", "__grading_cost": "grading_expense"})
+            )
+
+        # Forecast market value by est return month (open submissions only)
+        mv_up = pd.DataFrame(columns=["month", "mv_up"])
+        mv_dn = pd.DataFrame(columns=["month", "mv_dn"])
 
         if not open_grading_2.empty and "__est_return_month" in open_grading_2.columns:
             og = open_grading_2.dropna(subset=["__est_return_month"]).copy()
+            og["__mv_up"] = _to_num(og.get("__psa10", 0.0)).fillna(0.0)  # market value upside
+            og["__mv_dn"] = _to_num(og.get("__psa9", 0.0)).fillna(0.0)   # market value downside
 
-            og["__base_cost"] = (_to_num(og.get("__purchase_total", 0.0)) + _to_num(og.get("__grading_cost", 0.0))).fillna(0.0)
-            og["__profit_up"] = (_to_num(og.get("__psa10", 0.0)) - og["__base_cost"]).fillna(0.0)
-            og["__profit_dn"] = (_to_num(og.get("__psa9", 0.0)) - og["__base_cost"]).fillna(0.0)
-
-            forecast_up = og.groupby("__est_return_month", as_index=False)["__profit_up"].sum().rename(
-                columns={"__est_return_month": "month", "__profit_up": "profit_up"}
+            mv_up = og.groupby("__est_return_month", as_index=False)["__mv_up"].sum().rename(
+                columns={"__est_return_month": "month", "__mv_up": "mv_up"}
             )
-            forecast_dn = og.groupby("__est_return_month", as_index=False)["__profit_dn"].sum().rename(
-                columns={"__est_return_month": "month", "__profit_dn": "profit_dn"}
+            mv_dn = og.groupby("__est_return_month", as_index=False)["__mv_dn"].sum().rename(
+                columns={"__est_return_month": "month", "__mv_dn": "mv_dn"}
             )
 
-        next_month = current_month + pd.offsets.MonthBegin(1)
-        forecast_up = forecast_up[forecast_up["month"] >= next_month].copy()
-        forecast_dn = forecast_dn[forecast_dn["month"] >= next_month].copy()
-
-        # Build a combined month backbone (include future grading months)
+        # Build month backbone for trend (include forecast months)
         allm2 = []
-        for s in [profit_m.get("month"), forecast_up.get("month"), forecast_dn.get("month")]:
+        for s in [sales_m2.get("month"), inv_m2.get("month"), misc_m2.get("month"), grd_m2.get("month"), mv_up.get("month"), mv_dn.get("month")]:
             if isinstance(s, pd.Series) and not s.empty:
                 allm2.append(s.dropna())
 
@@ -2368,37 +2381,54 @@ with tab_forecast:
             months2 = pd.date_range(current_month, current_month, freq="MS")
 
         trend = pd.DataFrame({"month": months2})
-        trend = trend.merge(profit_m, on="month", how="left").merge(forecast_up, on="month", how="left").merge(forecast_dn, on="month", how="left")
+        trend = trend.merge(sales_m2, on="month", how="left")
+        trend = trend.merge(inv_m2, on="month", how="left")
+        trend = trend.merge(misc_m2, on="month", how="left")
+        trend = trend.merge(grd_m2, on="month", how="left")
+        trend = trend.merge(mv_up, on="month", how="left")
+        trend = trend.merge(mv_dn, on="month", how="left")
 
-        # Actual line stops after current month
-        trend["profit"] = trend["profit"].astype(float)
-        trend.loc[trend["month"] > current_month, "profit"] = np.nan
+        for c in ["sales", "inv_expense", "misc_expense", "grading_expense", "mv_up", "mv_dn"]:
+            if c not in trend.columns:
+                trend[c] = 0.0
+            trend[c] = trend[c].fillna(0.0)
 
-        # Only show forecasts for future months
-        trend.loc[trend["month"] <= current_month, "profit_up"] = np.nan
-        trend.loc[trend["month"] <= current_month, "profit_dn"] = np.nan
+        trend["expenses"] = trend["inv_expense"] + trend["misc_expense"] + trend["grading_expense"]
+        trend["net"] = trend["sales"] - trend["expenses"]
 
-        # -------------------------
-        # Build ACTUAL segmented line (green if profit, red if loss)
-        # -------------------------
+        # cumulative actual net through current month (future months don't add unknown sales/expenses)
+        trend = trend.sort_values("month").copy()
+        trend["net_actual_piece"] = np.where(trend["month"] <= current_month, trend["net"], 0.0)
+        trend["cum_actual"] = trend["net_actual_piece"].cumsum()
+
+        # anchor (value at current month)
+        cum_at_current = float(trend.loc[trend["month"] == current_month, "cum_actual"].iloc[0]) if (trend["month"] == current_month).any() else float(trend["cum_actual"].iloc[-1])
+
+        # Forecast cumulative (market value adds on return months)
+        trend["mv_up_piece"] = np.where(trend["month"] >= next_month, trend["mv_up"], 0.0)
+        trend["mv_dn_piece"] = np.where(trend["month"] >= next_month, trend["mv_dn"], 0.0)
+
+        trend["cum_up"] = cum_at_current + trend["mv_up_piece"].cumsum()
+        trend["cum_dn"] = cum_at_current + trend["mv_dn_piece"].cumsum()
+
+        # ---- Build ACTUAL segmented line (green if >=0, red if <0), stops after current month
+        actual_pts = trend[trend["month"] <= current_month].copy()
+        actual_pts = actual_pts[actual_pts["month"].notna()].sort_values("month")
+        actual_pts["value"] = actual_pts["cum_actual"]
+        actual_pts["sign"] = np.where(actual_pts["value"] >= 0, "Profit", "Loss")
+        actual_pts["__lbl"] = actual_pts["value"].apply(lambda v: f"{v:,.0f}")
+
         segs = []
-        actual_pts = trend.dropna(subset=["profit"]).sort_values("month").copy()
         if len(actual_pts) >= 2:
             for i in range(1, len(actual_pts)):
                 a = actual_pts.iloc[i - 1]
                 b = actual_pts.iloc[i]
                 segs.append({
-                    "x1": a["month"],
-                    "y1": float(a["profit"]),
-                    "x2": b["month"],
-                    "y2": float(b["profit"]),
-                    "sign": "Profit" if float(b["profit"]) >= 0 else "Loss",
+                    "x1": a["month"], "y1": float(a["value"]),
+                    "x2": b["month"], "y2": float(b["value"]),
+                    "sign": "Profit" if float(b["value"]) >= 0 else "Loss",
                 })
         seg_df = pd.DataFrame(segs)
-
-        actual_points_df = actual_pts.copy()
-        if not actual_points_df.empty:
-            actual_points_df["sign"] = np.where(actual_points_df["profit"] >= 0, "Profit", "Loss")
 
         seg_line = alt.Chart(seg_df).mark_rule(strokeWidth=3).encode(
             x=alt.X("x1:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
@@ -2408,71 +2438,50 @@ with tab_forecast:
             color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#22c55e", "#ef4444"]), legend=None),
             tooltip=[
                 alt.Tooltip("x2:T", title="Month", format="%Y-%m"),
-                alt.Tooltip("y2:Q", title="Net Profit", format=",.2f"),
+                alt.Tooltip("y2:Q", title="Cumulative Net", format=",.2f"),
             ],
         )
 
-        actual_points = alt.Chart(actual_points_df).mark_point(size=70, filled=True).encode(
+        actual_points = alt.Chart(actual_pts).mark_point(size=70, filled=True).encode(
             x="month:T",
-            y="profit:Q",
+            y="value:Q",
             color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#22c55e", "#ef4444"]), legend=None),
             tooltip=[
                 alt.Tooltip("month:T", title="Month", format="%Y-%m"),
-                alt.Tooltip("profit:Q", title="Net Profit", format=",.2f"),
+                alt.Tooltip("value:Q", title="Cumulative Net", format=",.2f"),
             ],
         )
 
-        actual_labels = alt.Chart(actual_points_df).mark_text(dy=-10, fontSize=11, fontWeight="bold").encode(
+        actual_labels = alt.Chart(actual_pts).mark_text(dy=-10, fontSize=11, fontWeight="bold").encode(
             x="month:T",
-            y="profit:Q",
-            text=alt.Text("profit:Q", format=",.0f"),
+            y="value:Q",
+            text=alt.Text("__lbl:N"),
             color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#15803d", "#b91c1c"]), legend=None),
         )
 
-        # -------------------------
-        # Forecast dotted lines (Upside/Downside) with sign-based coloring
-        # -------------------------
-        def _build_forecast_segments(value_col: str):
-            pts = trend.dropna(subset=[value_col]).sort_values("month").copy()
-            if pts.empty:
-                return pd.DataFrame(), pd.DataFrame()
-            pts = pts.rename(columns={value_col: "value"})
+        # ---- Forecast dotted lines (Upside/Downside) with sign-based coloring
+        def _forecast_segments_from_col(colname: str, label_name: str):
+            # include current month anchor point + future months
+            pts = trend[trend["month"] >= current_month].copy()
+            pts["value"] = pts[colname]
+            pts = pts.sort_values("month")
             pts["sign"] = np.where(pts["value"] >= 0, "Profit", "Loss")
+            pts["__lbl"] = pts["value"].apply(lambda v: f"{v:,.0f}")
 
-            # anchor at last actual point so forecasts extend from the current-month line
-            if not actual_pts.empty:
-                anchor = actual_pts.sort_values("month").iloc[-1]
-                anchor_row = pd.DataFrame([{
-                    "month": anchor["month"],
-                    "value": float(anchor["profit"]),
-                    "sign": "Profit" if float(anchor["profit"]) >= 0 else "Loss",
-                    "__anchor": True
-                }])
-                pts["__anchor"] = False
-                pts = pd.concat([anchor_row, pts], ignore_index=True).sort_values("month")
-
+            # segments
             segs_local = []
             if len(pts) >= 2:
                 for i in range(1, len(pts)):
                     a = pts.iloc[i - 1]
                     b = pts.iloc[i]
                     segs_local.append({
-                        "x1": a["month"],
-                        "y1": float(a["value"]),
-                        "x2": b["month"],
-                        "y2": float(b["value"]),
+                        "x1": a["month"], "y1": float(a["value"]),
+                        "x2": b["month"], "y2": float(b["value"]),
                         "sign": "Profit" if float(b["value"]) >= 0 else "Loss",
                     })
-            return pd.DataFrame(segs_local), pts
+            seg_df_local = pd.DataFrame(segs_local)
 
-        seg_up, pts_up = _build_forecast_segments("profit_up")
-        seg_dn, pts_dn = _build_forecast_segments("profit_dn")
-
-        def _forecast_layer(seg_df_in, pts_df_in, label_name: str):
-            if seg_df_in is None or seg_df_in.empty:
-                return alt.Chart(pd.DataFrame({"x":[0], "y":[0]})).mark_point(opacity=0)
-
-            seg_layer = alt.Chart(seg_df_in).mark_rule(strokeWidth=2, strokeDash=[6, 6]).encode(
+            seg_layer = alt.Chart(seg_df_local).mark_rule(strokeWidth=2, strokeDash=[6, 6]).encode(
                 x="x1:T",
                 x2="x2:T",
                 y="y1:Q",
@@ -2484,7 +2493,7 @@ with tab_forecast:
                 ],
             )
 
-            pts_only = pts_df_in[pts_df_in["month"] > current_month].copy()
+            pts_only = pts[pts["month"] >= next_month].copy()
 
             pts_layer = alt.Chart(pts_only).mark_point(size=55, filled=True).encode(
                 x="month:T",
@@ -2495,14 +2504,14 @@ with tab_forecast:
             labels_layer = alt.Chart(pts_only).mark_text(dy=-10, fontSize=10).encode(
                 x="month:T",
                 y="value:Q",
-                text=alt.Text("value:Q", format=",.0f"),
+                text=alt.Text("__lbl:N"),
                 color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#15803d", "#b91c1c"]), legend=None),
             )
 
             return seg_layer + pts_layer + labels_layer
 
-        forecast_up_layer = _forecast_layer(seg_up, pts_up, "Upside (All PSA 10s)")
-        forecast_dn_layer = _forecast_layer(seg_dn, pts_dn, "Downside (All PSA 9s)")
+        forecast_up_layer = _forecast_segments_from_col("cum_up", "Upside (Market Value)")
+        forecast_dn_layer = _forecast_segments_from_col("cum_dn", "Downside (Market Value)")
 
         chart = (seg_line + actual_points + actual_labels + forecast_up_layer + forecast_dn_layer).properties(height=340).interactive()
         st.altair_chart(chart, use_container_width=True)
@@ -2551,6 +2560,7 @@ with tab_forecast:
 
     # -------------------------
     # Bottom Right: Market KPIs + Expense Breakdown (with data labels)
+    #   - metrics turn green when meeting target, red when not
     # -------------------------
     with b2:
         st.markdown("### Operating Metrics")
@@ -2559,7 +2569,7 @@ with tab_forecast:
 
         # ---- KPI block (left)
         with mleft:
-            # Avg dwell (Cards only) — target 14 days
+            # Avg dwell (Cards only) — target 14 days (lower is better)
             avg_dwell = None
             if not txn_f2.empty:
                 t = txn_f2.copy()
@@ -2573,14 +2583,20 @@ with tab_forecast:
                 if not t.empty:
                     avg_dwell = float(t["__dwell_days"].mean())
 
+            target_dwell = 14.0
             dwell_str = f"{avg_dwell:,.1f} days" if avg_dwell is not None else "—"
-            dwell_delta = None
-            if avg_dwell is not None:
-                dwell_delta = f"Target ≤ 14"
+            if avg_dwell is None:
+                st.metric("Avg Dwell (Cards Only)", dwell_str)
+            else:
+                dwell_delta_val = avg_dwell - target_dwell  # <=0 is good
+                st.metric(
+                    "Avg Dwell (Cards Only)",
+                    dwell_str,
+                    delta=f"{dwell_delta_val:+.1f} vs target",
+                    delta_color="normal",
+                )
 
-            st.metric("Avg Dwell (Cards Only)", dwell_str, delta=dwell_delta)
-
-            # Pokemon gradable rate = # sent in / # purchased (Pokemon cards only) target 50%
+            # Pokemon gradable rate = # sent in / # purchased (Pokemon cards only) target 50% (higher is better)
             pokemon_purchased = 0
             pokemon_sent = 0
 
@@ -2601,7 +2617,14 @@ with tab_forecast:
                     pokemon_sent = int(g[g["__inv_id"].isin(pokemon_ids)]["__inv_id"].nunique())
 
             grade_rate = (pokemon_sent / pokemon_purchased) if pokemon_purchased else 0.0
-            st.metric("Pokemon Grade Rate (Sent / Purchased)", f"{grade_rate*100:,.1f}%", delta="Target 50%")
+            target_grade = 0.50
+            grade_delta_val = grade_rate - target_grade
+            st.metric(
+                "Pokemon Grade Rate (Sent / Purchased)",
+                f"{grade_rate*100:,.1f}%",
+                delta=f"{grade_delta_val*100:+.1f} pts vs target",
+                delta_color="normal",
+            )
 
             # Avg purchase margin vs market (Cards only): (total_cost - market_price) / market_price
             avg_buy_margin = None
