@@ -1350,7 +1350,7 @@ year_opts, month_opts_all = _build_year_month_options()
 # =========================
 # Tabs
 # =========================
-tab_bs, tab_forecast, tab_bench = st.tabs(["Balance Sheet", "Expenses + Forecast", "Benchmarks"])
+tab_bs, tab_forecast = st.tabs(["Balance Sheet", "Expenses + Forecast"])
 
 
 # =========================================================
@@ -2718,45 +2718,3 @@ with tab_forecast:
 
 
 
-# =========================================================
-# TAB 3: Benchmarks
-# =========================================================
-with tab_bench:
-    st.subheader("Benchmarks vs Targets")
-
-    target_gem_rate = 0.75
-    gem_rate = None
-
-    if not grd.empty:
-        got = grd.copy()
-        grade_col = None
-        for cand in ["received_grade", "returned_grade", "grade"]:
-            c = _pick_col(got, cand, None)
-            if c and c in got.columns:
-                grade_col = c
-                break
-        status_col = _pick_col(got, "status", "status")
-
-        if grade_col and grade_col in got.columns:
-            got["__grade"] = got[grade_col].astype(str).str.strip().str.upper()
-            got["__is_returned"] = got[status_col].astype(str).str.upper().eq("RETURNED")
-            returned = got[got["__is_returned"]].copy()
-            if len(returned):
-                returned["__gem"] = returned["__grade"].isin(["10", "PRISTINE 10", "BLACK LABEL 10"])
-                gem_rate = returned["__gem"].mean()
-
-    inv_count = len(inv) if not inv.empty else 0
-    graded_count = len(grd) if not grd.empty else 0
-    target_grade_rate = 0.50
-    grade_rate = (graded_count / inv_count) if inv_count else 0.0
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Inventory Items", f"{inv_count:,}")
-    c2.metric("Cards Submitted for Grading", f"{graded_count:,}")
-    c3.metric("Grade Rate (Submitted / Inventory)", f"{grade_rate*100:,.1f}%", delta=f"Target {target_grade_rate*100:.0f}%")
-
-    st.markdown("---")
-    if gem_rate is None:
-        st.info("Gem rate will populate once you have RETURNED submissions with a received grade.")
-    else:
-        st.metric("Gem Rate (10 / Returned)", f"{gem_rate*100:,.1f}%", delta=f"Target {target_gem_rate*100:.0f}%")
