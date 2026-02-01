@@ -1111,14 +1111,25 @@ if not txn.empty:
         txn["__status"] = txn[tx_status_col].astype(str).str.upper().str.strip()
         txn = txn[txn["__status"].eq("SOLD")].copy()
 
+    # Always capture shipping (used in tables even if net_proceeds exists)
+    if tx_ship_charged_col and tx_ship_charged_col in txn.columns:
+        txn["__ship_charged"] = _to_num(txn[tx_ship_charged_col])
+    else:
+        txn["__ship_charged"] = 0.0
+
+    # Proceeds (what you actually walk away with)
+    # If you have a net_proceeds column, trust it.
     if tx_net_proceeds_col and tx_net_proceeds_col in txn.columns:
         txn["__net"] = _to_num(txn[tx_net_proceeds_col])
     else:
-        if tx_ship_charged_col and tx_ship_charged_col in txn.columns:
-            txn["__ship_charged"] = _to_num(txn[tx_ship_charged_col])
-        else:
-            txn["__ship_charged"] = 0.0
-        txn["__net"] = (txn["__sold_price"] - txn["__fees"] + txn["__ship_charged"]).fillna(0.0)
+        # Otherwise compute proceeds as sold_price - fees - shipping_charged
+        txn["__net"] = (txn["__sold_price"] - txn["__fees"] - txn["__ship_charged"]).fillna(0.0)
+
+    # Total fees (fees + shipping)
+    txn["__total_fees"] = (txn["__fees"] + txn["__ship_charged"]).fillna(0.0)
+
+    # Dollar sales (gross item price; change later if you want to include buyer-paid shipping as revenue)
+    txn["__dollar_sales"] = _to_num(txn["__sold_price"])
 
     # ✅ FIX: fallback “sold rows only” guard even if status col was missing upstream
     txn = txn[~(txn["__sold_dt"].isna() & (txn["__sold_price"] <= 0) & (txn["__net"] <= 0))].copy()
@@ -1133,7 +1144,19 @@ if not txn.empty:
 else:
     tx_date_col = None
     tx_inv_col = None
-    txn = pd.DataFrame(columns=["__sold_dt", "__sold_month", "__inventory_id", "__sold_price", "__fees", "__net", "__txn_card_type"])
+    txn = pd.DataFrame(columns=[
+        "__sold_dt",
+        "__sold_month",
+        "__inventory_id",
+        "__sold_price",
+        "__fees",
+        "__ship_charged",
+        "__total_fees",
+        "__dollar_sales",
+        "__net",
+        "__txn_card_type",
+    ])
+
 
 
 # =========================
@@ -1552,11 +1575,12 @@ with tab_bs:
     # SALES (right side)
     # -------------------------
     with right:
-        st.markdown("### Sales")
+        st.markdown("### Listings")
 
         # TOP TABLE: Listed Items overview
+        # TOP TABLE: Listed Items overview
         if inv_holdings.empty:
-            listed_df = pd.DataFrame(columns=["Listed Items", "# of items", "List Price Total", "Market Value"])
+            listed_df = pd.DataFrame(columns=["Listed Items", "# of items", "Cost of Goods", "List Price Total", "Market Value"])
         else:
             inv_listed = inv_holdings.copy()
             inv_listed["__status_upper"] = inv_listed[inv_status_col].astype(str).str.upper().str.strip()
@@ -1566,6 +1590,7 @@ with tab_bs:
                 listed_df = pd.DataFrame([{
                     "Listed Items": "Totals",
                     "# of items": 0,
+                    "Cost of Goods": 0.0,
                     "List Price Total": 0.0,
                     "Market Value": 0.0,
                 }])
@@ -1576,20 +1601,31 @@ with tab_bs:
                 inv_listed["__inv_id_key"] = inv_listed[inv_id_col].apply(lambda x: _safe_str(x).strip())
                 inv_listed["__list_price"] = inv_listed["__inv_id_key"].map(list_price_by_inv_id).fillna(0.0)
 
+                # Cost of goods = inventory total + any unsynced grading costs tied to that inventory_id
+                inv_listed["__grading_cost_unsynced"] = inv_listed["__inv_id_key"].map(grading_cost_by_inv_id).fillna(0.0)
+                inv_listed["__cogs"] = _to_num(inv_listed[inv_total_col]) + _to_num(inv_listed["__grading_cost_unsynced"])
+
                 rows = []
                 for ct in ["Sports", "Pokemon"]:
                     sub = inv_listed[inv_listed["__card_type"].str.upper() == ct.upper()].copy()
                     if sub.empty:
                         continue
-                    rows.append([ct, int(len(sub)), float(sub["__list_price"].sum()), float(sub["__mv"].sum())])
+                    rows.append([
+                        ct,
+                        int(len(sub)),
+                        float(sub["__cogs"].sum()),
+                        float(sub["__list_price"].sum()),
+                        float(sub["__mv"].sum())
+                    ])
 
-                listed_df = pd.DataFrame(rows, columns=["Listed Items", "# of items", "List Price Total", "Market Value"])
+                listed_df = pd.DataFrame(rows, columns=["Listed Items", "# of items", "Cost of Goods", "List Price Total", "Market Value"])
                 listed_df = pd.concat(
                     [
                         listed_df,
                         pd.DataFrame([{
                             "Listed Items": "Totals",
                             "# of items": int(len(inv_listed)),
+                            "Cost of Goods": float(inv_listed["__cogs"].sum()),
                             "List Price Total": float(inv_listed["__list_price"].sum()),
                             "Market Value": float(inv_listed["__mv"].sum()),
                         }])
@@ -1597,28 +1633,58 @@ with tab_bs:
                     ignore_index=True
                 )
 
+
         sty_listed = (
             _style_group_and_total_rows(listed_df, "Listed Items")
-            .format({"List Price Total": "${:,.2f}", "Market Value": "${:,.2f}"})
+            .format({"Cost of Goods": "${:,.2f}", "List Price Total": "${:,.2f}", "Market Value": "${:,.2f}"})
             .set_table_styles(_styler_table_header())
         )
+
         st.dataframe(sty_listed, use_container_width=True, hide_index=True)
 
         # BOTTOM TABLE: Sales (Net proceeds in period)
+        # BOTTOM TABLE: Sales (in period)
+        st.markdown("### Sales")
         if txn_f.empty:
             st.info("No sales in selected period.")
-            sales_df = pd.DataFrame(columns=["Sales", "# of Sales", "Dollar Sales"])
+            sales_df = pd.DataFrame(columns=["Sales", "# of Sales", "Cost of Goods", "Dollar Sales", "Total Fees", "Proceeds", "Profit"])
             fees_total = 0.0
             net_total = 0.0
+            gross_total = 0.0
+            cogs_total = 0.0
+            profit_total = 0.0
             sales_count_total = 0
         else:
             tx = txn_f.copy()
             tx["__card_type"] = tx.apply(_tx_card_type_rowaware, axis=1)
             tx["__bucket"] = tx["__inventory_id"].map(_tx_product_bucket).fillna("Cards")
 
+            # Ensure these exist (older cached frames, etc.)
+            if "__dollar_sales" not in tx.columns:
+                tx["__dollar_sales"] = _to_num(tx.get("__sold_price", 0.0))
+            if "__total_fees" not in tx.columns:
+                tx["__total_fees"] = _to_num(tx.get("__fees", 0.0)) + _to_num(tx.get("__ship_charged", 0.0))
+            if "__net" not in tx.columns:
+                tx["__net"] = (tx["__dollar_sales"] - tx["__total_fees"]).fillna(0.0)
+
+            # COGS per sold line from inventory (plus unsynced grading)
+            def _cogs_for_inv_id(inv_id: str) -> float:
+                k = _safe_str(inv_id).strip()
+                rec = inv_by_id.get(k)
+                base = 0.0
+                if rec is not None:
+                    base = _to_num(rec.get(inv_total_col, 0.0))
+                add = float(grading_cost_by_inv_id.get(k, 0.0) or 0.0)
+                return float(base + add)
+
+            tx["__cogs"] = tx["__inventory_id"].apply(_cogs_for_inv_id)
+
             sales_count_total = int(len(tx))
-            fees_total = float(tx["__fees"].sum())
+            gross_total = float(tx["__dollar_sales"].sum())
+            fees_total = float(tx["__total_fees"].sum())
             net_total = float(tx["__net"].sum())
+            cogs_total = float(tx["__cogs"].sum())
+            profit_total = float((tx["__net"] - tx["__cogs"]).sum())
 
             rows = []
             for ct in ["Sports", "Pokemon"]:
@@ -1626,13 +1692,29 @@ with tab_bs:
                 if sub.empty:
                     continue
 
-                rows.append([ct, int(len(sub)), float(sub["__net"].sum())])
+                rows.append([
+                    ct,
+                    int(len(sub)),
+                    float(sub["__cogs"].sum()),
+                    float(sub["__dollar_sales"].sum()),
+                    float(sub["__total_fees"].sum()),
+                    float(sub["__net"].sum()),
+                    float((sub["__net"] - sub["__cogs"]).sum()),
+                ])
 
                 for b in ["Cards", "Graded Cards", "Sealed"]:
                     sb = sub[sub["__bucket"] == b]
-                    rows.append([f"  {b}", int(len(sb)), float(sb["__net"].sum())])
+                    rows.append([
+                        f"  {b}",
+                        int(len(sb)),
+                        float(sb["__cogs"].sum()),
+                        float(sb["__dollar_sales"].sum()),
+                        float(sb["__total_fees"].sum()),
+                        float(sb["__net"].sum()),
+                        float((sb["__net"] - sb["__cogs"]).sum()),
+                    ])
 
-            sales_df = pd.DataFrame(rows, columns=["Sales", "# of Sales", "Dollar Sales"])
+            sales_df = pd.DataFrame(rows, columns=["Sales", "# of Sales", "Cost of Goods", "Dollar Sales", "Total Fees", "Proceeds", "Profit"])
 
             if not sales_df.empty:
                 sales_df = pd.concat(
@@ -1641,7 +1723,11 @@ with tab_bs:
                         pd.DataFrame([{
                             "Sales": "Totals",
                             "# of Sales": sales_count_total,
-                            "Dollar Sales": net_total,
+                            "Cost of Goods": cogs_total,
+                            "Dollar Sales": gross_total,
+                            "Total Fees": fees_total,
+                            "Proceeds": net_total,
+                            "Profit": profit_total,
                         }])
                     ],
                     ignore_index=True
@@ -1649,12 +1735,20 @@ with tab_bs:
 
         sty3 = (
             _style_group_and_total_rows(sales_df, "Sales")
-            .format({"Dollar Sales": "${:,.2f}"})
+            .format({
+                "Cost of Goods": "${:,.2f}",
+                "Dollar Sales": "${:,.2f}",
+                "Total Fees": "${:,.2f}",
+                "Proceeds": "${:,.2f}",
+                "Profit": "${:,.2f}",
+            })
+            .applymap(_style_red_green, subset=["Profit"])
             .set_table_styles(_styler_table_header())
         )
         st.dataframe(sty3, use_container_width=True, hide_index=True)
 
-        st.markdown("### Summary")
+
+        st.markdown("### Busienss  Summary")
 
         if not inv_f.empty:
             tmp_inv = inv_f.copy()
@@ -1687,9 +1781,10 @@ with tab_bs:
             else:
                 exp_ct = 0.0
 
-            sales_ct = float(tx_ct["__net"].sum()) if not tx_ct.empty else 0.0
-            fees_ct = float(tx_ct["__fees"].sum()) if not tx_ct.empty else 0.0
+            sales_ct = float(tx_ct["__dollar_sales"].sum()) if (not tx_ct.empty and "__dollar_sales" in tx_ct.columns) else 0.0
+            fees_ct = float(tx_ct["__total_fees"].sum()) if (not tx_ct.empty and "__total_fees" in tx_ct.columns) else float(tx_ct.get("__fees", 0.0).sum()) if not tx_ct.empty else 0.0
             net_ct = float(tx_ct["__net"].sum()) if not tx_ct.empty else 0.0
+
 
             if exp_ct == 0.0 and sales_ct == 0.0:
                 continue
