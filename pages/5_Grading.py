@@ -944,6 +944,264 @@ if not eligible_inv.empty:
 
 
 # =========================================================
+# WATCH LIST + GEMRATES (Analysis tab overhaul)
+# =========================================================
+
+WATCHLIST_WS_NAME = st.secrets.get("grading_watchlist_worksheet", "grading_watch_list")
+GEMRATES_WS_NAME = st.secrets.get("gemrates_worksheet", "gemrates")
+
+def _norm(s) -> str:
+    return "" if s is None else str(s).strip()
+
+def _norm_key(*parts) -> str:
+    # simple stable join key
+    out = []
+    for p in parts:
+        out.append(_norm(p).lower())
+    return "|".join(out)
+
+def _safe_num(x, default=0.0) -> float:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip().replace("$", "").replace(",", "")
+        if s == "":
+            return default
+        # handle "39%" style
+        if s.endswith("%"):
+            return float(s[:-1]) / 100.0
+        return float(s)
+    except Exception:
+        return default
+
+def _get_ws_or_create(sheet, name: str, headers: list[str], cols_hint: int = 26, rows_hint: int = 2000):
+    """
+    Creates worksheet if missing; writes header row once.
+    This is ONE-TIME setup; no repeated header "repair" to avoid quota issues.
+    """
+    try:
+        ws = sheet.worksheet(name)
+        return ws
+    except Exception:
+        ws = sheet.add_worksheet(title=name, rows=str(rows_hint), cols=str(max(cols_hint, len(headers) + 5)))
+        ws.update(range_name="1:1", values=[headers], value_input_option="RAW")
+        return ws
+
+def _read_sheet_df(ws) -> pd.DataFrame:
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame()
+    header = [str(h).strip() for h in values[0]]
+    rows = values[1:]
+    if not header or all(h == "" for h in header):
+        return pd.DataFrame()
+    # pad / trim rows
+    out_rows = []
+    for r in rows:
+        if len(r) < len(header):
+            r = r + [""] * (len(header) - len(r))
+        elif len(r) > len(header):
+            r = r[:len(header)]
+        out_rows.append(r)
+    return pd.DataFrame(out_rows, columns=header)
+
+def _batch_write_sheet(ws, df: pd.DataFrame, header: list[str]):
+    """
+    Quota-friendly: ONE update call for entire table.
+    """
+    if df is None:
+        return
+    df2 = df.copy()
+    # ensure all header cols exist
+    for c in header:
+        if c not in df2.columns:
+            df2[c] = ""
+    df2 = df2[header]
+    values = [header] + df2.astype(str).fillna("").values.tolist()
+    last_col = a1_col_letter(len(header))
+    ws.update(range_name=f"A1:{last_col}{len(values)}", values=values, value_input_option="RAW")
+
+def _col(df: pd.DataFrame, *names, default=""):
+    """
+    Pick first existing column from names (case/space tolerant).
+    """
+    if df is None or df.empty:
+        return pd.Series([default] * 0)
+
+    norm_map = {str(c).strip().lower(): c for c in df.columns}
+    for n in names:
+        if n is None:
+            continue
+        key = str(n).strip().lower()
+        if key in norm_map:
+            return df[norm_map[key]]
+    # fuzzy contains match (useful for "Gem Rate - All Time")
+    for n in names:
+        key = str(n).strip().lower()
+        for k, real in norm_map.items():
+            if key and key in k:
+                return df[real]
+    return pd.Series([default] * len(df))
+
+@st.cache_data(ttl=60)
+def load_watchlist_and_gemrates():
+    client = get_gspread_client()
+    sh = client.open_by_key(st.secrets["spreadsheet_id"])
+
+    # minimal starter headers to create sheets if missing
+    watch_headers = ["Generation", "Set", "Card Name", "Card No", "Link", "Parallel", "Target Buy Price", "Max Buy Price", "Notes"]
+    gem_headers = ["Key", "Generation", "Set Name", "Parallel", "Card #", "Card Description", "Gems", "Total", "Gem Rate - All Time"]
+
+    watch_ws = _get_ws_or_create(sh, WATCHLIST_WS_NAME, watch_headers, cols_hint=30)
+    gem_ws = _get_ws_or_create(sh, GEMRATES_WS_NAME, gem_headers, cols_hint=30)
+
+    wdf = _read_sheet_df(watch_ws)
+    gdf = _read_sheet_df(gem_ws)
+
+    return wdf, gdf
+
+def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, grading_fee_assumption: float):
+    """
+    Returns a dataframe to display:
+    - base watch list columns
+    - merged gemrate stats
+    - pricecharting prices (raw/psa9/psa10)
+    """
+    if wdf is None or wdf.empty:
+        return pd.DataFrame()
+
+    out = wdf.copy()
+
+    # normalize / ensure required columns exist
+    for c in ["Generation", "Set", "Card Name", "Card No", "Link", "Parallel", "Target Buy Price", "Max Buy Price", "Notes"]:
+        if c not in out.columns:
+            out[c] = ""
+
+    # -------------------------
+    # Build GemRates aggregation
+    # -------------------------
+    gem_agg = pd.DataFrame()
+    if gdf is not None and not gdf.empty:
+        gen = _col(gdf, "Generation")
+        setn = _col(gdf, "Set Name", "Set")
+        cardno = _col(gdf, "Card #", "Card No")
+        par = _col(gdf, "Parallel", "Variant")
+
+        gems = _col(gdf, "Gems")
+        total = _col(gdf, "Total")
+        # if the sheet already has a % string column we can still recompute from Gems/Total
+        gems_f = gems.apply(lambda x: _safe_num(x, 0.0))
+        total_f = total.apply(lambda x: _safe_num(x, 0.0))
+
+        tmp = pd.DataFrame({
+            "__gen": gen.astype(str),
+            "__set": setn.astype(str),
+            "__cardno": cardno.astype(str),
+            "__par": par.astype(str),
+            "__gems": gems_f,
+            "__total": total_f,
+        })
+
+        # aggregate by gen/set/cardno (and parallel when present)
+        tmp["__k_full"] = tmp.apply(lambda r: _norm_key(r["__gen"], r["__set"], r["__cardno"], r["__par"]), axis=1)
+        tmp["__k_base"] = tmp.apply(lambda r: _norm_key(r["__gen"], r["__set"], r["__cardno"]), axis=1)
+
+        # full key aggregation (parallel-specific)
+        full = tmp.groupby("__k_full", as_index=False).agg(
+            total_graded=("__total", "sum"),
+            psa10_count=("__gems", "sum"),
+        )
+        full["gem_rate"] = full.apply(lambda r: (r["psa10_count"] / r["total_graded"]) if r["total_graded"] else 0.0, axis=1)
+
+        # base key aggregation (all parallels combined) — fallback if watchlist has no Parallel
+        base = tmp.groupby("__k_base", as_index=False).agg(
+            total_graded=("__total", "sum"),
+            psa10_count=("__gems", "sum"),
+        )
+        base["gem_rate"] = base.apply(lambda r: (r["psa10_count"] / r["total_graded"]) if r["total_graded"] else 0.0, axis=1)
+
+        gem_agg = {"full": full, "base": base}
+
+    # build watch keys
+    out["__k_full"] = out.apply(lambda r: _norm_key(r["Generation"], r["Set"], r["Card No"], r.get("Parallel", "")), axis=1)
+    out["__k_base"] = out.apply(lambda r: _norm_key(r["Generation"], r["Set"], r["Card No"]), axis=1)
+
+    # merge in gemrates (prefer full, else base)
+    out["Total Graded"] = 0.0
+    out["# PSA 10"] = 0.0
+    out["Gem Rate"] = 0.0
+
+    if isinstance(gem_agg, dict):
+        full = gem_agg["full"].set_index("__k_full")
+        base = gem_agg["base"].set_index("__k_base")
+
+        def _pick(row, col):
+            kf = row["__k_full"]
+            kb = row["__k_base"]
+            if kf in full.index:
+                return float(full.loc[kf, col])
+            if kb in base.index:
+                return float(base.loc[kb, col])
+            return 0.0
+
+        out["Total Graded"] = out.apply(lambda r: _pick(r, "total_graded"), axis=1)
+        out["# PSA 10"] = out.apply(lambda r: _pick(r, "psa10_count"), axis=1)
+        out["Gem Rate"] = out.apply(lambda r: _pick(r, "gem_rate"), axis=1)
+
+    # -------------------------
+    # PriceCharting pull (raw/psa9/psa10)
+    # -------------------------
+    out["Ungraded"] = 0.0
+    out["PSA 9"] = 0.0
+    out["PSA 10"] = 0.0
+
+    # IMPORTANT: do NOT fetch in a tight loop every rerun unless user asks;
+    # we’ll populate lazily using cache + only for valid links.
+    def _get_prices(link):
+        link = _norm(link)
+        if not link or "pricecharting.com" not in link.lower():
+            return (0.0, 0.0, 0.0)
+        p = fetch_pricecharting_prices(link)
+        return (float(p.get("raw", 0.0) or 0.0), float(p.get("psa9", 0.0) or 0.0), float(p.get("psa10", 0.0) or 0.0))
+
+    prices = out["Link"].apply(_get_prices)
+    out["Ungraded"] = prices.apply(lambda t: float(t[0]))
+    out["PSA 9"] = prices.apply(lambda t: float(t[1]))
+    out["PSA 10"] = prices.apply(lambda t: float(t[2]))
+
+    # Basic derived column (you said ignore all the other calc columns for now)
+    out["Ungraded + Fee"] = out["Ungraded"].apply(float) + float(grading_fee_assumption)
+
+    # keep display clean
+    out = out.drop(columns=["__k_full", "__k_base"], errors="ignore")
+    return out
+
+def save_watchlist_from_editor(edited_df: pd.DataFrame):
+    if edited_df is None:
+        return
+    client = get_gspread_client()
+    sh = client.open_by_key(st.secrets["spreadsheet_id"])
+    ws = sh.worksheet(WATCHLIST_WS_NAME)
+
+    # Only write back the "source" columns (not computed columns)
+    source_cols = ["Generation", "Set", "Card Name", "Card No", "Link", "Parallel", "Target Buy Price", "Max Buy Price", "Notes"]
+    for c in source_cols:
+        if c not in edited_df.columns:
+            edited_df[c] = ""
+
+    # keep only source columns
+    out = edited_df[source_cols].copy()
+
+    # Write in ONE call
+    _batch_write_sheet(ws, out, source_cols)
+
+    # clear cache so Analysis updates immediately
+    load_watchlist_and_gemrates.clear()
+
+
+# =========================================================
 # UI TABS
 # =========================================================
 
@@ -955,52 +1213,48 @@ tab_analysis, tab_submit, tab_update, tab_summary = st.tabs(
 # Analysis
 # -------------------------
 with tab_analysis:
-    st.subheader("Analysis (pull PSA 9/10 from PriceCharting)")
+    st.subheader("Grading Watch List (GemRates + PriceCharting)")
 
-    if eligible_inv.empty:
-        st.info("No eligible ACTIVE inventory items to analyze.")
+    fee_assumption = st.number_input(
+        "Assumed grading fee (per card)",
+        min_value=0.0,
+        value=float(st.secrets.get("default_grading_fee_per_card", 28.0)),
+        step=1.0,
+        format="%.2f",
+    )
+
+    wdf, gdf = load_watchlist_and_gemrates()
+
+    if wdf is None or wdf.empty:
+        st.info(f"No rows found in '{WATCHLIST_WS_NAME}'. Paste your watch list data into that sheet (headers in row 1).")
     else:
-        records = eligible_inv.to_dict("records")
+        view = build_watchlist_view(wdf, gdf, fee_assumption)
 
-        def label(r):
-            return f"{r.get('inventory_id','')} — {r.get('card_name','')} ({r.get('set_name','')} {r.get('year','')}) — Cost ${safe_float(r.get('total_price'),0):,.2f}"
-
-        idx = st.selectbox("Select an item", options=list(range(len(records))), format_func=lambda i: label(records[i]))
-        r = records[idx]
-
-        link = safe_str(r.get("reference_link", "")).strip()
-        purchase_total = safe_float(r.get("total_price", 0.0), 0.0)
-
-        st.write("**Purchased from:**", safe_str(r.get("purchased_from", "")))
-        st.write("**Purchase date:**", safe_str(r.get("purchase_date", "")))
-        st.write("**Reference link:**", link if link else "(none)")
-
-        fee = st.number_input(
-            "Assumed grading fee (per card)",
-            min_value=0.0,
-            value=DEFAULT_GRADING_FEE_PER_CARD,
-            step=1.0,
-            format="%.2f",
+        st.caption(
+            "Edit the watch list fields (Generation/Set/Card No/Link/etc). "
+            "GemRates + PriceCharting columns are computed."
         )
 
-        psa9 = 0.0
-        psa10 = 0.0
-        if link and "pricecharting.com" in link.lower():
-            prices = fetch_pricecharting_prices(link)
-            psa9 = prices["psa9"]
-            psa10 = prices["psa10"]
+        # Show an editor with both source + computed columns
+        edited = st.data_editor(
+            view,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+        )
 
-        profit9 = psa9 - (purchase_total + fee)
-        profit10 = psa10 - (purchase_total + fee)
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            if st.button("💾 Save Watch List", type="primary", use_container_width=True):
+                save_watchlist_from_editor(edited)
+                st.success("Saved to Google Sheets.")
+                st.rerun()
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("PSA 9", f"${psa9:,.2f}")
-        c2.metric("PSA 10", f"${psa10:,.2f}")
-        c3.metric("Purchase Total", f"${purchase_total:,.2f}")
+        with c2:
+            if st.button("🔄 Refresh (re-pull GemRates + PriceCharting)", use_container_width=True):
+                load_watchlist_and_gemrates.clear()
+                st.rerun()
 
-        d1, d2 = st.columns(2)
-        d1.metric("Profit if PSA 9", f"${profit9:,.2f}")
-        d2.metric("Profit if PSA 10", f"${profit10:,.2f}")
 
 
 # -------------------------
