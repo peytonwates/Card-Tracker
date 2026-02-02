@@ -1498,13 +1498,88 @@ with tab_analysis:
     else:
         view = build_watchlist_view(wdf, gdf, sdf, fee_assumption)
 
+        # --- Quick filter/sort controls ---
+        st.markdown("### Filter / Sort")
+
+        cfa, cfb, cfc, cfd = st.columns([1.1, 1.1, 1.1, 1.0])
+
+        with cfa:
+            search = st.text_input("Search (name / set / #)", value="").strip().lower()
+
+        with cfb:
+            min_score = st.number_input("Min Grading Score", min_value=0.0, value=0.0, step=1.0)
+
+        with cfc:
+            max_all_in = st.number_input(
+                "Max All-in Cost",
+                min_value=0.0,
+                value=9999.0,
+                step=5.0,
+                format="%.2f",
+            )
+
+        with cfd:
+            sort_col = st.selectbox(
+                "Sort by",
+                options=[
+                    "Grading Score",
+                    "Profit PSA 10",
+                    "Profit PSA 9",
+                    "All-in Cost (Buy+Fee)",
+                    "Buy Basis (Raw)",
+                    "ROI PSA 10",
+                    "ROI PSA 9",
+                    "Gem Rate",
+                    "Total Graded",
+                    "psa10_avg_30d",
+                    "psa9_avg_30d",
+                    "ungraded_avg_30d",
+                ],
+                index=0,
+            )
+            sort_desc = st.checkbox("Descending", value=True)
+
+        # apply filters
+        filtered = view.copy()
+
+        # numeric filters
+        if "Grading Score" in filtered.columns:
+            filtered = filtered[filtered["Grading Score"].apply(lambda x: safe_float(x, 0.0)) >= float(min_score)]
+
+        if "All-in Cost (Buy+Fee)" in filtered.columns:
+            filtered = filtered[filtered["All-in Cost (Buy+Fee)"].apply(lambda x: safe_float(x, 0.0)) <= float(max_all_in)]
+
+        # text search
+        if search:
+            def _row_match(r):
+                blob = " ".join([
+                    safe_str(r.get("Card Name", "")),
+                    safe_str(r.get("Set", "")),
+                    safe_str(r.get("Card No", "")),
+                    safe_str(r.get("Generation", "")),
+                    safe_str(r.get("Parallel", "")),
+                ]).lower()
+                return search in blob
+
+            filtered = filtered[filtered.apply(_row_match, axis=1)]
+
+        # sort
+        if sort_col in filtered.columns:
+            filtered = filtered.sort_values(
+                by=sort_col,
+                ascending=not sort_desc,
+                key=lambda s: s.apply(lambda v: safe_float(v, 0.0) if str(v).replace(".","",1).replace("-","",1).isdigit() else safe_str(v))
+            )
+
+        filtered = filtered.reset_index(drop=True)
+        
+
         img_cfg = {
             "Image": st.column_config.ImageColumn("Image", width="large"),
             "Link": st.column_config.LinkColumn("Link", display_text="PriceCharting"),
         }
 
-        edited = st.data_editor(
-            view.loc[:, ~view.columns.duplicated()].copy(),
+        edited = st.data_editor(filtered.loc[:, ~filtered.columns.duplicated()].copy(),
             width="stretch",
             hide_index=True,
             num_rows="dynamic",
