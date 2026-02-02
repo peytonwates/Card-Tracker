@@ -307,18 +307,22 @@ def load_grading_df():
     if not header_row:
         header_row = GRADING_CANON_COLS
 
+    # 🔥 CRITICAL: force unique/stable headers so pandas never has duplicate column labels
+    stable_headers = _build_stable_unique_headers(header_row)
+
     data_rows = []
     for r in values[1:]:
-        if len(r) < len(header_row):
-            r = r + [""] * (len(header_row) - len(r))
-        elif len(r) > len(header_row):
-            r = r[: len(header_row)]
+        if len(r) < len(stable_headers):
+            r = r + [""] * (len(stable_headers) - len(r))
+        elif len(r) > len(stable_headers):
+            r = r[: len(stable_headers)]
         data_rows.append(r)
 
-    df = pd.DataFrame(data_rows, columns=header_row)
+    df = pd.DataFrame(data_rows, columns=stable_headers)
     if df.empty:
         return pd.DataFrame(columns=GRADING_CANON_COLS)
 
+    # Ensure canonical cols exist
     for c in GRADING_CANON_COLS:
         if c not in df.columns:
             df[c] = ""
@@ -329,6 +333,12 @@ def load_grading_df():
             if _strip_dups(c) == base:
                 cols.append(c)
         return cols
+
+    def _as_series(x):
+        # If duplicate header sneaks in somehow, df[col] can be a DataFrame; take first col.
+        if isinstance(x, pd.DataFrame):
+            return x.iloc[:, 0].astype(str)
+        return x.astype(str)
 
     def _coalesce_into(base: str, fallbacks: list[str]):
         candidates = _cols_named(base)
@@ -345,13 +355,14 @@ def load_grading_df():
         if not ordered:
             return
 
-        s = df[ordered[0]].astype(str)
+        s = _as_series(df[ordered[0]])
         for c in ordered[1:]:
-            t = df[c].astype(str)
+            t = _as_series(df[c])
             s = s.where(s.str.strip() != "", t)
 
         df[base] = s
 
+    # Coalesce legacy → canonical
     _coalesce_into("grading_fee_initial", ["grading_fee_per_card"])
     _coalesce_into("additional_costs", ["extra_costs"])
     _coalesce_into("received_grade", ["returned_grade"])
@@ -364,6 +375,7 @@ def load_grading_df():
     df["status"] = df["status"].astype(str).replace("", "SUBMITTED")
 
     return df
+
 
 def refresh_all():
     load_inventory_df.clear()
@@ -568,6 +580,21 @@ SALES_HISTORY_HEADERS = [
     "psa10_avg_30d",
 ]
 
+
+WATCHLIST_ENRICH_COLS = [
+    # Gemrates
+    "Total Graded", "# PSA 10", "Gem Rate",
+    # PriceCharting current prices
+    "Ungraded", "PSA 9", "PSA 10",
+    # Sales stats (30d)
+    "ungraded_sales_30d", "ungraded_min_30d", "ungraded_max_30d", "ungraded_avg_30d",
+    "psa9_sales_30d", "psa9_min_30d", "psa9_max_30d", "psa9_avg_30d",
+    "psa10_sales_30d", "psa10_min_30d", "psa10_max_30d", "psa10_avg_30d",
+    # Image URL (we write into Pic unless user already filled it)
+    "Pic",
+]
+
+
 def _norm(s) -> str:
     return "" if s is None else str(s).strip()
 
@@ -733,6 +760,161 @@ def fetch_pricecharting_image_url(reference_link: str) -> str:
         return ""
     except Exception:
         return ""
+
+def refresh_and_write_watchlist_enrichment():
+    """
+    Re-pull GemRates + PriceCharting (prices, image, 30d sales stats)
+    and WRITE results into the grading_watch_list sheet.
+
+    Matching rules:
+      - GemRates match = Set + Card No (per your latest instruction)
+      - PriceCharting uses Link
+    Runs ONLY when the user clicks Refresh.
+    """
+    client = get_gspread_client()
+    sh = client.open_by_key(st.secrets["spreadsheet_id"])
+    watch_ws = _get_ws_or_create(sh, WATCHLIST_WS_NAME, WATCHLIST_HEADERS, cols_hint=80)
+    gem_ws = _get_ws_or_create(sh, GEMRATES_WS_NAME, GEMRATES_HEADERS, cols_hint=40)
+
+    # Read fresh
+    wdf = _read_sheet_df(watch_ws)
+    gdf = _read_sheet_df(gem_ws)
+
+    if wdf is None or wdf.empty:
+        return 0
+
+    # Ensure base watchlist columns exist in df
+    for c in WATCHLIST_HEADERS:
+        if c not in wdf.columns:
+            wdf[c] = ""
+
+    # Ensure enrichment columns exist in SHEET header (append if missing)
+    sheet_values = watch_ws.get_all_values()
+    sheet_header = sheet_values[0] if sheet_values and sheet_values[0] else WATCHLIST_HEADERS[:]
+    existing = [str(x).strip() for x in sheet_header]
+
+    for c in WATCHLIST_ENRICH_COLS:
+        if c not in existing:
+            existing.append(c)
+
+    # Write header if changed
+    if existing != sheet_header:
+        _gs_write_retry(watch_ws.update, values=[existing], range_name="1:1", value_input_option="RAW")
+        sheet_header = existing
+
+    # Build gemrates lookup by (set, card_no)
+    gem_lookup = {}
+    if gdf is not None and not gdf.empty:
+        set_col = _col(gdf, "Set Name", "Set").astype(str)
+        card_col = _col(gdf, "Card #", "Card No").astype(str)
+        gems_col = _col(gdf, "Gems").apply(lambda x: safe_float(x, 0.0))
+        total_col = _col(gdf, "Total").apply(lambda x: safe_float(x, 0.0))
+
+        tg = pd.DataFrame({
+            "__set": set_col,
+            "__card": card_col,
+            "__gems": gems_col,
+            "__total": total_col,
+        })
+
+        tg["__k"] = tg.apply(lambda r: _norm_key(_norm_set(r["__set"]), _norm(r["__card"])), axis=1)
+        grp = tg.groupby("__k", as_index=False).agg(
+            total_graded=("__total", "sum"),
+            psa10_count=("__gems", "sum"),
+        )
+        grp["gem_rate"] = grp.apply(lambda r: (r["psa10_count"] / r["total_graded"]) if r["total_graded"] else 0.0, axis=1)
+        gem_lookup = grp.set_index("__k").to_dict("index")
+
+    # Compute enrichment for each row
+    out_cols = {c: [] for c in WATCHLIST_ENRICH_COLS}
+
+    for _, r in wdf.iterrows():
+        set_name = _norm(r.get("Set", ""))
+        card_no = _norm(r.get("Card No", ""))
+        link = _norm(r.get("Link", ""))
+        pic_existing = _norm(r.get("Pic", ""))
+
+        # --- Gemrates (Set + Card No) ---
+        k = _norm_key(_norm_set(set_name), card_no)
+        g = gem_lookup.get(k, None)
+        total_graded = float(g["total_graded"]) if g else 0.0
+        psa10_count = float(g["psa10_count"]) if g else 0.0
+        gem_rate = float(g["gem_rate"]) if g else 0.0
+
+        out_cols["Total Graded"].append(total_graded)
+        out_cols["# PSA 10"].append(psa10_count)
+        out_cols["Gem Rate"].append(round(gem_rate, 6))
+
+        # --- PriceCharting prices + image ---
+        raw = 0.0
+        psa9 = 0.0
+        psa10 = 0.0
+        img = ""
+
+        if link and "pricecharting.com" in link.lower():
+            p = fetch_pricecharting_prices(link)
+            raw = float(p.get("raw", 0.0) or 0.0)
+            psa9 = float(p.get("psa9", 0.0) or 0.0)
+            psa10 = float(p.get("psa10", 0.0) or 0.0)
+
+            if not pic_existing:
+                img = fetch_pricecharting_image_url(link)
+
+        out_cols["Ungraded"].append(raw)
+        out_cols["PSA 9"].append(psa9)
+        out_cols["PSA 10"].append(psa10)
+
+        # Only overwrite Pic if blank in sheet
+        out_cols["Pic"].append(pic_existing if pic_existing else img)
+
+        # --- Sales stats (30d) ---
+        u_stats = {"count": 0, "min": 0.0, "max": 0.0, "avg": 0.0}
+        p9_stats = {"count": 0, "min": 0.0, "max": 0.0, "avg": 0.0}
+        p10_stats = {"count": 0, "min": 0.0, "max": 0.0, "avg": 0.0}
+
+        if link and "pricecharting.com" in link.lower():
+            sales = fetch_pricecharting_sold_sales_last_60d(link)
+            u_stats = _sales_stats_for_bucket(sales, "ungraded", days=30)
+            p9_stats = _sales_stats_for_bucket(sales, "psa9", days=30)
+            p10_stats = _sales_stats_for_bucket(sales, "psa10", days=30)
+
+        out_cols["ungraded_sales_30d"].append(int(u_stats["count"]))
+        out_cols["ungraded_min_30d"].append(round(float(u_stats["min"]), 2))
+        out_cols["ungraded_max_30d"].append(round(float(u_stats["max"]), 2))
+        out_cols["ungraded_avg_30d"].append(round(float(u_stats["avg"]), 2))
+
+        out_cols["psa9_sales_30d"].append(int(p9_stats["count"]))
+        out_cols["psa9_min_30d"].append(round(float(p9_stats["min"]), 2))
+        out_cols["psa9_max_30d"].append(round(float(p9_stats["max"]), 2))
+        out_cols["psa9_avg_30d"].append(round(float(p9_stats["avg"]), 2))
+
+        out_cols["psa10_sales_30d"].append(int(p10_stats["count"]))
+        out_cols["psa10_min_30d"].append(round(float(p10_stats["min"]), 2))
+        out_cols["psa10_max_30d"].append(round(float(p10_stats["max"]), 2))
+        out_cols["psa10_avg_30d"].append(round(float(p10_stats["avg"]), 2))
+
+    # Write each enrichment column back to the sheet (column-wise, fast + quota-friendly)
+    col_index = {str(h).strip(): i for i, h in enumerate(sheet_header)}
+    nrows = len(wdf)
+
+    updates = []
+    for col_name, vals in out_cols.items():
+        if col_name not in col_index:
+            continue
+        j = col_index[col_name]  # 0-based
+        col_letter = a1_col_letter(j + 1)
+        rng = f"{col_letter}2:{col_letter}{nrows + 1}"
+        col_vals = [[v] for v in vals]
+        updates.append({"range": rng, "values": col_vals})
+
+    # Batch update in chunks
+    chunk_size = 25
+    for i in range(0, len(updates), chunk_size):
+        chunk = updates[i:i + chunk_size]
+        _gs_write_retry(watch_ws.batch_update, chunk, value_input_option="RAW")
+
+    return nrows
+
 
 def downside_penalty_psa9(buy_total: float, psa9_value: float) -> float:
     buy_total = float(buy_total or 0.0)
@@ -1109,11 +1291,20 @@ with tab_analysis:
             st.rerun()
 
     with c2:
-        if st.button("🔄 Refresh (re-pull GemRates + PriceCharting)", use_container_width=True):
+        if st.button("🔄 Refresh (re-pull + WRITE into watchlist sheet)", use_container_width=True):
+            # Clear caches so it truly re-pulls
             load_watchlist_gemrates_sales.clear()
             fetch_pricecharting_prices.clear()
             fetch_pricecharting_image_url.clear()
+            fetch_pricecharting_sold_sales_last_60d.clear()
+
+            n = refresh_and_write_watchlist_enrichment()
+            st.success(f"Refreshed + wrote enrichment for {n} watchlist row(s).")
+
+            # Reload dataframes after write
+            load_watchlist_gemrates_sales.clear()
             st.rerun()
+
 
     with c3:
         st.caption("Tip: Fill **Parallel** (Base / Reverse Holo / SIR) to improve GemRates matching.")
