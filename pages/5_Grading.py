@@ -289,7 +289,7 @@ def _gs_write_retry(fn, *args, **kwargs):
                 time.sleep(base_sleep * (2 ** (attempt - 1)))
                 continue
             raise
-    raise APIError("APIError: [429] Quota exceeded (retries exhausted)")
+    raise RuntimeError("Google Sheets API quota exceeded (retries exhausted).")
 
 def ensure_headers(ws, needed_headers: list[str], *, write: bool = False):
     values = ws.get_all_values()
@@ -475,7 +475,6 @@ def fetch_pricecharting_image_url(reference_link: str) -> str:
 def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 60) -> list[dict]:
     """
     Scrape a PriceCharting product page and return recent sold sales.
-    We attempt structured parsing first (tables/lists), then fall back to text scanning.
 
     Output rows:
       { sale_date: date, price: float, grade_bucket: 'ungraded'|'psa9'|'psa10', title: str, sale_key: str }
@@ -493,14 +492,59 @@ def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 60) 
 
     sales = []
     price_re = re.compile(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-    # PriceCharting often shows YYYY-MM-DD in recent sales blocks; keep that primary.
+
+    # date formats seen on PriceCharting:
+    # - 2026-01-31
+    # - 01/31/2026 or 1/3/26
+    # - Jan 31, 2026
     iso_date_re = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
+    slash_date_re = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b")
+    month_date_re = re.compile(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+20\d{2}\b", re.IGNORECASE)
+
+    def _parse_any_date(text: str):
+        if not text:
+            return None
+
+        m = iso_date_re.search(text)
+        if m:
+            d = _parse_iso_date(m.group(1))
+            if d:
+                return d
+
+        m = slash_date_re.search(text)
+        if m:
+            try:
+                d = pd.to_datetime(m.group(1), errors="coerce")
+                if pd.notna(d):
+                    return d.date()
+            except Exception:
+                pass
+
+        m = month_date_re.search(text)
+        if m:
+            try:
+                d = pd.to_datetime(m.group(0), errors="coerce")
+                if pd.notna(d):
+                    return d.date()
+            except Exception:
+                pass
+
+        # last resort: try pandas on the whole line (but keep it conservative)
+        try:
+            d = pd.to_datetime(text, errors="coerce")
+            if pd.notna(d):
+                # guard against “today” guesses by pandas on random text
+                if d.year >= 2000:
+                    return d.date()
+        except Exception:
+            pass
+
+        return None
 
     def _emit(title: str, sale_date: date, price: float):
         if not title or not sale_date or not price or price <= 0:
             return
         bucket = _classify_grade_from_title(title)
-        # stable-ish key (date + price + bucket + normalized short title)
         sale_key = f"{sale_date.isoformat()}|{price:.2f}|{bucket}|{title[:90].strip().lower()}"
         sales.append({
             "sale_date": sale_date,
@@ -510,42 +554,43 @@ def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 60) 
             "sale_key": sale_key,
         })
 
-    # ---------- Attempt 1: parse any obvious "recent sales" table rows ----------
-    # Common pattern: rows containing a date + title + price.
-    # We'll scan all rows and try to infer.
+    # ---------- Attempt 1: parse table rows ----------
     for tr in soup.select("tr"):
         t = tr.get_text(" ", strip=True)
         if not t or "$" not in t:
             continue
-        dm = iso_date_re.search(t)
+
         pm = price_re.search(t)
-        if not dm or not pm:
+        if not pm:
             continue
 
-        d = _parse_iso_date(dm.group(1))
+        d = _parse_any_date(t)
+        if not d:
+            continue
+
         p = _to_float_price(pm.group(1))
 
-        # try to extract a decent title from the row:
-        # - prefer the longest cell text that is not date/price
         cells = [td.get_text(" ", strip=True) for td in tr.select("td")]
         cells = [c for c in cells if c]
+
         title = ""
         if cells:
-            # remove exact date cell and exact price cell if present
+            # remove pieces that look like date/price
             filtered = []
             for c in cells:
-                if dm.group(1) in c:
+                if "$" in c and price_re.search(c):
                     continue
-                if pm.group(0) in c or pm.group(1) in c:
+                if _parse_any_date(c):
                     continue
                 filtered.append(c)
-            # choose the longest remaining, else fallback to row text
             title = max(filtered, key=len) if filtered else t
+        else:
+            title = t
 
-        if d and p > 0:
+        if p > 0:
             _emit(title, d, p)
 
-    # ---------- Attempt 2: fallback text scan (your original approach, improved) ----------
+    # ---------- Attempt 2: fallback text scan ----------
     if len(sales) < 5:
         text = soup.get_text("\n", strip=True)
         lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
@@ -557,20 +602,22 @@ def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 60) 
             if not pm:
                 continue
 
-            # title heuristics: text before a bracket source like [eBay], or full line
-            title = ln.split("[", 1)[0].strip() if "[" in ln else ln.strip()
             price = _to_float_price(pm.group(1))
+            if price <= 0:
+                continue
 
+            # try find a date in a small neighborhood
             sale_date = None
-            # search a small window near the line for an ISO date
-            for j in range(i, min(i + 6, len(lines))):
-                dm = iso_date_re.search(lines[j])
-                if dm:
-                    sale_date = _parse_iso_date(dm.group(1))
+            for j in range(max(0, i - 2), min(i + 6, len(lines))):
+                sale_date = _parse_any_date(lines[j])
+                if sale_date:
                     break
 
-            if sale_date and price > 0:
-                _emit(title, sale_date, price)
+            if not sale_date:
+                continue
+
+            title = ln.split("[", 1)[0].strip() if "[" in ln else ln.strip()
+            _emit(title, sale_date, price)
 
     # de-dupe by sale_key
     by_key = {}
@@ -578,6 +625,8 @@ def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 60) 
         if s.get("sale_key"):
             by_key[s["sale_key"]] = s
     sales2 = list(by_key.values())
+
+    # newest first
     sales2.sort(key=lambda x: (x["sale_date"], x["price"]), reverse=True)
     return sales2[: max(1, int(limit))]
 
@@ -1475,15 +1524,26 @@ with tab_analysis:
 
     wdf, gdf, sdf = load_watchlist_gemrates_sales()
 
+    if sdf is None or sdf.empty:
+        st.warning("Sales history sheet is empty. Click '📈 Refresh sales history' to populate.")
+    else:
+        st.caption(f"Sales history rows loaded: {len(sdf):,}")
+        if "updated_utc" in sdf.columns:
+            latest_ts = pd.to_datetime(sdf["updated_utc"], errors="coerce").max()
+            if pd.notna(latest_ts):
+                st.caption(f"Latest sales refresh (UTC): {latest_ts}")
+
+
+
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
-        if st.button("📈 Refresh sales history (keep last 10 per link per condition)", width="stretch", disabled=(wdf is None or wdf.empty)):
+        if st.button("📈 Refresh sales history (keep last 10 per link per condition)", use_container_width=True, disabled=(wdf is None or wdf.empty)):
             n = update_sales_history_incremental(wdf, keep_n=10)
             st.success(f"Updated sales history for {n} link(s).")
             st.rerun()
 
     with c2:
-        if st.button("🔄 Refresh & write Watchlist (prices + gemrates + comps + image + score)", width="stretch", disabled=(wdf is None or wdf.empty)):
+        if st.button("🔄 Refresh & write Watchlist (prices + gemrates + comps + image + score)", use_container_width=True, disabled=(wdf is None or wdf.empty)):
             _ = update_sales_history_incremental(wdf, keep_n=10)
             wdf2, gdf2, sdf2 = load_watchlist_gemrates_sales()
             view = build_watchlist_view(wdf2, gdf2, sdf2, fee_assumption)
@@ -1591,37 +1651,59 @@ with tab_analysis:
         # --- BIGGER images + freeze Image column + better sort/filter UX ---
         # NOTE: Streamlit's st.data_editor cannot freeze/pin columns while scrolling horizontally.
         # To get "Image" frozen left, we switch this table to AgGrid which supports pinned columns.
-        from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
-
+        # --- BIGGER images + freeze Image column + correct rendering ---
         img_renderer = JsCode("""
         function(params) {
             if (!params.value) return '';
-            return `<img src="${params.value}"
-                        style="height:180px; width:auto; border-radius:10px;" />`;
+            const url = String(params.value);
+
+            // build a real DOM node so AgGrid doesn't treat HTML as plain text
+            const eDiv = document.createElement('div');
+            eDiv.style.display = 'flex';
+            eDiv.style.alignItems = 'center';
+            eDiv.style.justifyContent = 'center';
+
+            const img = document.createElement('img');
+            img.src = url;
+            img.style.height = '260px';   // ~3x bigger than typical default
+            img.style.width = 'auto';
+            img.style.borderRadius = '10px';
+            img.style.objectFit = 'contain';
+
+            eDiv.appendChild(img);
+            return eDiv;
         }
         """)
 
         link_renderer = JsCode("""
         function(params) {
             if (!params.value) return '';
-            return `<a href="${params.value}" target="_blank" rel="noopener noreferrer">PriceCharting</a>`;
+            const url = String(params.value);
+
+            const a = document.createElement('a');
+            a.href = url;
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            a.innerText = 'PriceCharting';
+            return a;
         }
         """)
 
         df_show = filtered.loc[:, ~filtered.columns.duplicated()].copy()
 
         gb = GridOptionsBuilder.from_dataframe(df_show)
-        gb.configure_default_column(sortable=True, filter=True, resizable=True, wrapText=True, autoHeight=True)
+        gb.configure_default_column(sortable=True, filter=True, resizable=True, wrapText=True)
 
         if "Image" in df_show.columns:
             gb.configure_column(
                 "Image",
                 header_name="Image",
-                pinned="left",      # freeze Image column while scrolling
-                width=300,          # wider col so image isn't cramped
+                pinned="left",     # freeze/pin Image column
+                width=340,
                 cellRenderer=img_renderer,
                 sortable=False,
                 filter=False,
+                suppressSizeToFit=True,
             )
 
         if "Link" in df_show.columns:
@@ -1632,22 +1714,21 @@ with tab_analysis:
                 width=150,
             )
 
-        # row height ~ 3x-ish vs default so images look big
-        gb.configure_grid_options(rowHeight=220)
+        # match taller images
+        gb.configure_grid_options(rowHeight=300)
 
         grid_options = gb.build()
 
         AgGrid(
             df_show,
             gridOptions=grid_options,
-            height=750,
+            height=780,
             theme="streamlit",
             allow_unsafe_jscode=True,
             update_mode=GridUpdateMode.NO_UPDATE,
             fit_columns_on_grid_load=False,
         )
 
-        st.caption("Image column is pinned (frozen) on the left. Use column menus to filter/sort, or the controls above.")
 
         # If you still want manual edits + save-back, keep your existing st.data_editor below
         # (but note: it won't have pinned columns). Commented out for now.
@@ -1710,7 +1791,7 @@ with tab_submit:
 
         notes = st.text_area("Notes (optional)", height=80)
 
-        if st.button("Create submission", type="primary", width="stretch", disabled=(len(selected) == 0)):
+        if st.button("Create submission", type="primary", use_container_width=True, disabled=(len(selected) == 0)):
             sub_id = str(int(datetime.utcnow().timestamp()))
             est_return = add_business_days(submission_date, int(business_days))
 
@@ -1812,9 +1893,9 @@ with tab_update:
             for c in ["purchase_total", "grading_fee_initial", "additional_costs", "psa9_price", "psa10_price"]:
                 show[c] = show[c].apply(lambda v: safe_float(v, 0.0))
 
-            edited = st.data_editor(show, width="stretch", hide_index=True, num_rows="fixed")
+            edited = st.data_editor(show, use_container_width=True, hide_index=True, num_rows="fixed")
 
-            if st.button("Save updates", type="primary", width="stretch"):
+            if st.button("Save updates", type="primary", use_container_width=True):
                 updated = sub_rows.copy()
                 ed_map = {str(r["grading_row_id"]): r for _, r in edited.iterrows()}
 
@@ -1873,7 +1954,7 @@ with tab_summary:
         for c in ["purchase_cost", "grading_cost", "psa9_value", "psa10_value", "profit_all_psa9", "profit_all_psa10"]:
             show[c] = show[c].apply(money)
 
-        st.dataframe(show, width="stretch", hide_index=True)
+        st.dataframe(show, use_container_width=True, hide_index=True)
 
-        if st.button("🔄 Refresh", width="stretch"):
+        if st.button("🔄 Refresh", use_container_width=True):
             refresh_all()
