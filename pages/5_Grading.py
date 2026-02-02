@@ -27,6 +27,10 @@ st.title("Grading")
 INVENTORY_WS_NAME = st.secrets.get("inventory_worksheet", "inventory")
 GRADING_WS_NAME = st.secrets.get("grading_worksheet", "grading")
 
+WATCHLIST_WS_NAME = st.secrets.get("grading_watchlist_worksheet", "grading_watch_list")
+GEMRATES_WS_NAME = st.secrets.get("gemrates_worksheet", "gemrates")
+GRADING_SALES_HISTORY_WS_NAME = st.secrets.get("grading_sales_history_worksheet", "grading_sales_history")
+
 STATUS_ACTIVE = "ACTIVE"
 STATUS_LISTED = "LISTED"
 STATUS_SOLD = "SOLD"
@@ -38,7 +42,7 @@ ELIGIBLE_INV_STATUSES = {STATUS_ACTIVE}
 DEFAULT_GRADING_FEE_PER_CARD = float(st.secrets.get("default_grading_fee_per_card", 28.0))
 DEFAULT_RETURN_BUSINESS_DAYS = int(st.secrets.get("default_business_days_return", 75))
 
-# Canonical grading columns we will USE.
+# Canonical grading columns we will use (and ONLY these get returned from loader to avoid duplicates)
 GRADING_CANON_COLS = [
     "grading_row_id",
     "submission_id",
@@ -65,6 +69,53 @@ GRADING_CANON_COLS = [
     "created_at",
     "updated_at",
     "synced_to_inventory",
+]
+
+WATCHLIST_BASE_HEADERS = [
+    "Generation",
+    "Set",
+    "Card Name",
+    "Card No",
+    "Link",
+    "Parallel",
+    "Pic",
+    "Release Year",
+    "Target Buy Price",
+    "Max Buy Price",
+    "Notes",
+]
+
+WATCHLIST_ENRICH_HEADERS = [
+    "Ungraded", "PSA 9", "PSA 10",
+    "Total Graded", "# PSA 10", "Gem Rate",
+    # names preserved (they now represent stats from last-10 stored sales)
+    "ungraded_sales_30d", "ungraded_min_30d", "ungraded_max_30d", "ungraded_avg_30d",
+    "psa9_sales_30d", "psa9_min_30d", "psa9_max_30d", "psa9_avg_30d",
+    "psa10_sales_30d", "psa10_min_30d", "psa10_max_30d", "psa10_avg_30d",
+    "Grading Score",
+    "Image",
+]
+
+GEMRATES_HEADERS = [
+    "Key",
+    "Generation",
+    "Set Name",
+    "Parallel",
+    "Card #",
+    "Card Description",
+    "Gems",
+    "Total",
+    "Gem Rate - All Time",
+]
+
+SALES_HISTORY_HEADERS_V2 = [
+    "reference_link",
+    "sale_key",       # stable key to detect new sales
+    "sale_date",      # YYYY-MM-DD
+    "price",          # numeric
+    "grade_bucket",   # ungraded/psa9/psa10
+    "title",          # title text
+    "updated_utc",    # last refresh timestamp
 ]
 
 
@@ -112,6 +163,67 @@ def a1_col_letter(n: int) -> str:
         letters = chr(65 + r) + letters
     return letters
 
+def _strip_dups(h: str) -> str:
+    return re.sub(r"(?:__dup\d+)+$", "", str(h or "").strip())
+
+def _build_stable_unique_headers(raw_headers: list[str]) -> list[str]:
+    cleaned = []
+    for i, h in enumerate(raw_headers, start=1):
+        hh = str(h or "").strip()
+        if hh == "":
+            hh = f"unnamed__col{i}"
+        cleaned.append(hh)
+
+    bases = [_strip_dups(h) for h in cleaned]
+    counts = {}
+    out = []
+    for b in bases:
+        counts[b] = counts.get(b, 0) + 1
+        out.append(b if counts[b] == 1 else f"{b}__dup{counts[b]}")
+    return out
+
+def _append_missing_canon_headers(stable_headers: list[str], canon_headers: list[str]) -> list[str]:
+    existing_bases = {_strip_dups(h) for h in stable_headers}
+    out = list(stable_headers)
+    for h in canon_headers:
+        b = _strip_dups(h)
+        if b not in existing_bases:
+            out.append(b)
+            existing_bases.add(b)
+    return _build_stable_unique_headers(out)
+
+def _norm(s) -> str:
+    return "" if s is None else str(s).strip()
+
+def _norm_set(s: str) -> str:
+    t = _norm(s).lower()
+    t = re.sub(r"\s+", " ", t)
+    t = t.replace("’", "'")
+    return t
+
+def _norm_key(*parts) -> str:
+    out = []
+    for p in parts:
+        out.append(_norm(p).lower())
+    return "|".join(out)
+
+def _to_float_price(s: str) -> float:
+    try:
+        if s is None:
+            return 0.0
+        t = str(s).replace("$", "").replace(",", "").strip()
+        return float(t) if t else 0.0
+    except Exception:
+        return 0.0
+
+def _classify_grade_from_title(title: str) -> str:
+    t = (title or "").upper()
+    if re.search(r"\bPSA\s*10\b", t) or re.search(r"\bGEM\s*MINT\s*10\b", t) or re.search(r"\bGEM\s*MT\s*10\b", t):
+        return "psa10"
+    if re.search(r"\bPSA\s*9\b", t) or re.search(r"\bMINT\s*9\b", t):
+        return "psa9"
+    return "ungraded"
+
 
 # =========================================================
 # GOOGLE SHEETS AUTH
@@ -153,15 +265,7 @@ def get_ws(ws_name: str):
     sh = client.open_by_key(st.secrets["spreadsheet_id"])
     return sh.worksheet(ws_name)
 
-
-# =========================================================
-# QUOTA-SAFE WRITE WRAPPERS
-# =========================================================
-
 def _gs_write_retry(fn, *args, **kwargs):
-    """
-    Retry gspread write calls on 429 with exponential backoff.
-    """
     max_tries = 6
     base_sleep = 0.8
     for attempt in range(1, max_tries + 1):
@@ -174,40 +278,6 @@ def _gs_write_retry(fn, *args, **kwargs):
                 continue
             raise
     raise APIError("APIError: [429] Quota exceeded (retries exhausted)")
-
-
-# =========================================================
-# HEADER NORMALIZATION / REPAIR
-# =========================================================
-
-def _strip_dups(h: str) -> str:
-    return re.sub(r"(?:__dup\d+)+$", "", str(h or "").strip())
-
-def _build_stable_unique_headers(raw_headers: list[str]) -> list[str]:
-    cleaned = []
-    for i, h in enumerate(raw_headers, start=1):
-        hh = str(h or "").strip()
-        if hh == "":
-            hh = f"unnamed__col{i}"
-        cleaned.append(hh)
-
-    bases = [_strip_dups(h) for h in cleaned]
-    counts = {}
-    out = []
-    for b in bases:
-        counts[b] = counts.get(b, 0) + 1
-        out.append(b if counts[b] == 1 else f"{b}__dup{counts[b]}")
-    return out
-
-def _append_missing_canon_headers(stable_headers: list[str], canon_headers: list[str]) -> list[str]:
-    existing_bases = {_strip_dups(h) for h in stable_headers}
-    out = list(stable_headers)
-    for h in canon_headers:
-        b = _strip_dups(h)
-        if b not in existing_bases:
-            out.append(b)
-            existing_bases.add(b)
-    return _build_stable_unique_headers(out)
 
 def ensure_headers(ws, needed_headers: list[str], *, write: bool = False):
     values = ws.get_all_values()
@@ -230,29 +300,66 @@ def ensure_headers(ws, needed_headers: list[str], *, write: bool = False):
 
     return stable
 
+def _get_ws_or_create(sheet, name: str, headers: list[str], cols_hint: int = 26, rows_hint: int = 2000):
+    try:
+        ws = sheet.worksheet(name)
+        vals = ws.get_all_values()
+        if not vals or not vals[0] or all(str(x).strip() == "" for x in vals[0]):
+            ws.update(range_name="1:1", values=[headers], value_input_option="RAW")
+        else:
+            current = [str(x).strip() for x in vals[0]]
+            missing = [h for h in headers if h not in current]
+            if missing:
+                ws.update(range_name="1:1", values=[current + missing], value_input_option="RAW")
+        return ws
+    except Exception:
+        ws = sheet.add_worksheet(title=name, rows=str(rows_hint), cols=str(max(cols_hint, len(headers) + 5)))
+        ws.update(range_name="1:1", values=[headers], value_input_option="RAW")
+        return ws
+
+def _read_sheet_df(ws) -> pd.DataFrame:
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame()
+    header = [str(h).strip() for h in values[0]]
+    rows = values[1:]
+    if not header or all(h == "" for h in header):
+        return pd.DataFrame()
+    out_rows = []
+    for r in rows:
+        if len(r) < len(header):
+            r = r + [""] * (len(header) - len(r))
+        elif len(r) > len(header):
+            r = r[:len(header)]
+        out_rows.append(r)
+    return pd.DataFrame(out_rows, columns=header)
+
+def _batch_write_sheet(ws, df: pd.DataFrame, header: list[str]):
+    df2 = df.copy()
+    for c in header:
+        if c not in df2.columns:
+            df2[c] = ""
+    df2 = df2[header]
+    values = [header] + df2.astype(str).fillna("").values.tolist()
+    last_col = a1_col_letter(len(header))
+    ws.update(range_name=f"A1:{last_col}{len(values)}", values=values, value_input_option="RAW")
+
 
 # =========================================================
-# HTTP (PRICECHARTING) — FIX 429 + BACKOFF
+# HTTP — BACKOFF (429-safe)
 # =========================================================
 
 @st.cache_resource
 def get_http_session():
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (CardTracker; Streamlit)"
-    })
+    s.headers.update({"User-Agent": "Mozilla/5.0 (CardTracker; Streamlit)"})
     return s
 
 def http_get_with_backoff(url: str, *, timeout=20, max_tries=6):
-    """
-    GET with retry/backoff on 429 and transient 5xx.
-    Returns Response or raises on non-retriable errors.
-    """
     sess = get_http_session()
     sleep_s = 1.0
     for _ in range(max_tries):
         r = sess.get(url, timeout=timeout)
-
         if r.status_code == 200:
             return r
 
@@ -264,7 +371,7 @@ def http_get_with_backoff(url: str, *, timeout=20, max_tries=6):
                 except Exception:
                     pass
             time.sleep(sleep_s)
-            sleep_s = min(sleep_s * 1.8, 20.0)
+            sleep_s = min(sleep_s * 1.8, 25.0)
             continue
 
         if r.status_code in {500, 502, 503, 504}:
@@ -283,20 +390,14 @@ def http_get_with_backoff(url: str, *, timeout=20, max_tries=6):
 
 @st.cache_data(ttl=60 * 60 * 12)
 def fetch_pricecharting_prices(reference_link: str) -> dict:
-    """
-    Slots (matches your old ImportXML indexing):
-      raw  = slot 1 -> prices[0]
-      psa9 = slot 4 -> prices[3]
-      psa10= slot 6 -> prices[5]
-    """
     out = {"raw": 0.0, "psa9": 0.0, "psa10": 0.0}
-    if not reference_link or "pricecharting.com" not in reference_link.lower():
+    link = (reference_link or "").strip()
+    if not link or "pricecharting.com" not in link.lower():
         return out
 
     try:
-        r = http_get_with_backoff(reference_link.strip(), timeout=20, max_tries=6)
+        r = http_get_with_backoff(link, timeout=25, max_tries=6)
         soup = BeautifulSoup(r.text, "lxml")
-
         nodes = soup.select(".price.js-price")
         prices = []
         for n in nodes:
@@ -316,19 +417,95 @@ def fetch_pricecharting_image_url(reference_link: str) -> str:
     link = (reference_link or "").strip()
     if not link or "pricecharting.com" not in link.lower():
         return ""
+
     try:
-        r = http_get_with_backoff(link, timeout=20, max_tries=6)
+        r = http_get_with_backoff(link, timeout=25, max_tries=6)
         soup = BeautifulSoup(r.text, "lxml")
+
+        # 1) og:image (most reliable)
         meta = soup.find("meta", attrs={"property": "og:image"})
         if meta and meta.get("content"):
             return str(meta.get("content")).strip()
+
+        # 2) common image locations (inventory-like scraping)
+        selectors = [
+            "img#product_image",
+            "img.product_image",
+            "img[itemprop='image']",
+            ".product-image img",
+            ".product_image img",
+            "img[src*='media.pricecharting.com']",
+        ]
+        for sel in selectors:
+            tag = soup.select_one(sel)
+            if tag and tag.get("src"):
+                return str(tag.get("src")).strip()
+
+        # 3) last resort: first large-ish img
+        imgs = soup.select("img[src]")
+        for img in imgs[:20]:
+            src = str(img.get("src")).strip()
+            if "pricecharting" in src and ("jpg" in src or "png" in src or "webp" in src):
+                return src
+
         return ""
     except Exception:
         return ""
 
 
 # =========================================================
-# LOADERS (CACHED) — READ-ONLY (NO WRITES)
+# PRICECHARTING — SOLD SALES (latest rows)
+# =========================================================
+
+@st.cache_data(ttl=60 * 60 * 6)
+def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 15) -> list[dict]:
+    link = (reference_link or "").strip()
+    if not link or "pricecharting.com" not in link.lower():
+        return []
+
+    try:
+        r = http_get_with_backoff(link, timeout=25, max_tries=6)
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(r.text, "lxml")
+    text = soup.get_text("\n", strip=True)
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+
+    sales = []
+    date_re = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
+    price_re = re.compile(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+
+    for i, ln in enumerate(lines):
+        if ("$" in ln) and ("[EBAY]" in ln.upper() or "[GOLDIN]" in ln.upper() or "[PWCC]" in ln.upper() or "[TCGPLAYER]" in ln.upper()):
+            title = ln.split("[", 1)[0].strip()
+            pm = price_re.search(ln)
+            price = _to_float_price(pm.group(1)) if pm else 0.0
+
+            sale_date = None
+            for j in range(i, min(i + 4, len(lines))):
+                dm = date_re.search(lines[j])
+                if dm:
+                    sale_date = pd.to_datetime(dm.group(1), errors="coerce").date()
+                    break
+
+            if sale_date and price > 0:
+                bucket = _classify_grade_from_title(title)
+                sale_key = f"{sale_date.isoformat()}|{price:.2f}|{bucket}|{title[:80].strip().lower()}"
+                sales.append({
+                    "sale_date": sale_date,
+                    "price": float(price),
+                    "grade_bucket": bucket,
+                    "title": title,
+                    "sale_key": sale_key,
+                })
+
+    sales = sorted(sales, key=lambda x: (x["sale_date"], x["price"]), reverse=True)
+    return sales[: max(1, int(limit))]
+
+
+# =========================================================
+# LOADERS
 # =========================================================
 
 @st.cache_data(ttl=30)
@@ -341,7 +518,6 @@ def load_inventory_df():
 
     if "inventory_status" not in df.columns:
         df["inventory_status"] = STATUS_ACTIVE
-    df["inventory_status"] = df["inventory_status"].astype(str).replace("", STATUS_ACTIVE)
 
     for c in [
         "inventory_id", "reference_link", "card_name", "set_name", "year", "total_price",
@@ -354,6 +530,7 @@ def load_inventory_df():
     df["year"] = df["year"].astype(str).replace({"nan": "", "None": "", "<NA>": ""}).str.strip()
     df["total_price"] = pd.to_numeric(df["total_price"], errors="coerce").fillna(0.0)
     df["product_type"] = df["product_type"].astype(str)
+    df["inventory_status"] = df["inventory_status"].astype(str).replace("", STATUS_ACTIVE)
 
     return df
 
@@ -364,27 +541,30 @@ def load_grading_df():
     if not values or len(values) < 1:
         return pd.DataFrame(columns=GRADING_CANON_COLS)
 
-    header_row = values[0] if values else GRADING_CANON_COLS
-    if not header_row:
-        header_row = GRADING_CANON_COLS
+    raw_header = values[0] if values else []
+    if not raw_header:
+        return pd.DataFrame(columns=GRADING_CANON_COLS)
+
+    header = _build_stable_unique_headers(raw_header)
 
     data_rows = []
     for r in values[1:]:
-        if len(r) < len(header_row):
-            r = r + [""] * (len(header_row) - len(r))
-        elif len(r) > len(header_row):
-            r = r[: len(header_row)]
+        if len(r) < len(header):
+            r = r + [""] * (len(header) - len(r))
+        elif len(r) > len(header):
+            r = r[: len(header)]
         data_rows.append(r)
 
-    df = pd.DataFrame(data_rows, columns=header_row)
+    df = pd.DataFrame(data_rows, columns=header)
     if df.empty:
         return pd.DataFrame(columns=GRADING_CANON_COLS)
 
+    # Ensure canon bases exist
     for c in GRADING_CANON_COLS:
-        if c not in df.columns:
+        if c not in df.columns and c not in {_strip_dups(x) for x in df.columns}:
             df[c] = ""
 
-    # ---- FIX: duplicates in headers can make df[col] return a DataFrame.
+    # helper: return first column if duplicates exist
     def _as_series(colname: str) -> pd.Series:
         obj = df.loc[:, colname]
         if isinstance(obj, pd.DataFrame):
@@ -403,13 +583,13 @@ def load_grading_df():
         for fb in fallbacks:
             candidates += _cols_named(fb)
 
+        # unique keep order
         seen = set()
         ordered = []
         for c in candidates:
             if c not in seen:
                 ordered.append(c)
                 seen.add(c)
-
         if not ordered:
             return
 
@@ -417,21 +597,48 @@ def load_grading_df():
         for c in ordered[1:]:
             t = _as_series(c)
             s = s.where(s.str.strip() != "", t)
-
         df[base] = s
 
+    # unify legacy -> canon
     _coalesce_into("grading_fee_initial", ["grading_fee_per_card"])
     _coalesce_into("additional_costs", ["extra_costs"])
     _coalesce_into("received_grade", ["returned_grade"])
 
+    # numeric fields
     for c in ["purchase_total", "grading_fee_initial", "additional_costs", "psa9_price", "psa10_price"]:
-        df[c] = df[c].apply(lambda v: safe_float(v, 0.0))
+        if c in df.columns:
+            df[c] = df[c].apply(lambda v: safe_float(v, 0.0))
 
-    df["grading_row_id"] = df["grading_row_id"].astype(str)
-    df["submission_id"] = df["submission_id"].astype(str)
-    df["status"] = df["status"].astype(str).replace("", "SUBMITTED")
+    # IMPORTANT: return ONLY canonical cols so Streamlit data_editor never sees dup column names
+    out = pd.DataFrame()
+    for c in GRADING_CANON_COLS:
+        if c in df.columns:
+            out[c] = df[c]
+        else:
+            # look for base match
+            matches = [col for col in df.columns if _strip_dups(col) == c]
+            out[c] = df[matches[0]] if matches else ""
 
-    return df
+    out["grading_row_id"] = out["grading_row_id"].astype(str)
+    out["submission_id"] = out["submission_id"].astype(str)
+    out["status"] = out["status"].astype(str).replace("", "SUBMITTED")
+
+    return out
+
+@st.cache_data(ttl=60)
+def load_watchlist_gemrates_sales():
+    client = get_gspread_client()
+    sh = client.open_by_key(st.secrets["spreadsheet_id"])
+
+    watch_ws = _get_ws_or_create(sh, WATCHLIST_WS_NAME, WATCHLIST_BASE_HEADERS + WATCHLIST_ENRICH_HEADERS, cols_hint=70)
+    gem_ws = _get_ws_or_create(sh, GEMRATES_WS_NAME, GEMRATES_HEADERS, cols_hint=40)
+    sales_ws = _get_ws_or_create(sh, GRADING_SALES_HISTORY_WS_NAME, SALES_HISTORY_HEADERS_V2, cols_hint=60, rows_hint=4000)
+
+    wdf = _read_sheet_df(watch_ws)
+    gdf = _read_sheet_df(gem_ws)
+    sdf = _read_sheet_df(sales_ws)
+
+    return wdf, gdf, sdf
 
 def refresh_all():
     load_inventory_df.clear()
@@ -444,7 +651,7 @@ def refresh_all():
 
 
 # =========================================================
-# WRITES (GRADING SHEET)
+# WRITES (GRADING + INVENTORY)
 # =========================================================
 
 def append_grading_rows(rows: list[dict]):
@@ -543,9 +750,8 @@ def update_grading_rows(df_rows: pd.DataFrame):
     if not data_updates:
         return
 
-    chunk_size = 50
-    for i in range(0, len(data_updates), chunk_size):
-        chunk = data_updates[i:i + chunk_size]
+    for i in range(0, len(data_updates), 50):
+        chunk = data_updates[i:i + 50]
         _gs_write_retry(ws.batch_update, chunk, value_input_option="RAW")
 
 def update_inventory_status(inventory_id: str, new_status: str):
@@ -556,6 +762,7 @@ def update_inventory_status(inventory_id: str, new_status: str):
 
     headers = values[0]
     idx = { _strip_dups(h): j for j, h in enumerate(headers) }
+
     if "inventory_id" not in idx or "inventory_status" not in idx:
         ensure_headers(inv_ws, ["inventory_id", "inventory_status"], write=True)
         values = inv_ws.get_all_values()
@@ -582,290 +789,16 @@ def update_inventory_status(inventory_id: str, new_status: str):
 
 
 # =========================================================
-# WATCH LIST + GEMRATES + SALES HISTORY (Last 10 sales, incremental)
+# SALES HISTORY (last 10 per link, incremental)
 # =========================================================
-
-WATCHLIST_WS_NAME = st.secrets.get("grading_watchlist_worksheet", "grading_watch_list")
-GEMRATES_WS_NAME = st.secrets.get("gemrates_worksheet", "gemrates")
-GRADING_SALES_HISTORY_WS_NAME = st.secrets.get("grading_sales_history_worksheet", "grading_sales_history")
-
-WATCHLIST_BASE_HEADERS = [
-    "Generation",
-    "Set",
-    "Card Name",
-    "Card No",
-    "Link",
-    "Parallel",
-    "Pic",
-    "Release Year",
-    "Target Buy Price",
-    "Max Buy Price",
-    "Notes",
-]
-
-# We will write enrichment into the watchlist sheet too.
-WATCHLIST_ENRICH_HEADERS = [
-    "Ungraded", "PSA 9", "PSA 10",
-    "Total Graded", "# PSA 10", "Gem Rate",
-    # these names stay the same so your sheet keeps working;
-    # they now represent "from last 10 sales" (not 30d).
-    "ungraded_sales_30d", "ungraded_min_30d", "ungraded_max_30d", "ungraded_avg_30d",
-    "psa9_sales_30d", "psa9_min_30d", "psa9_max_30d", "psa9_avg_30d",
-    "psa10_sales_30d", "psa10_min_30d", "psa10_max_30d", "psa10_avg_30d",
-    "Grading Score",
-    "Image",
-]
-
-GEMRATES_HEADERS = [
-    "Key",
-    "Generation",
-    "Set Name",
-    "Parallel",
-    "Card #",
-    "Card Description",
-    "Gems",
-    "Total",
-    "Gem Rate - All Time",
-]
-
-# Sales history now stores each sale row (up to 10 per link).
-SALES_HISTORY_HEADERS_V2 = [
-    "reference_link",
-    "sale_key",       # stable key to detect new sales
-    "sale_date",      # YYYY-MM-DD
-    "price",          # numeric
-    "grade_bucket",   # ungraded/psa9/psa10
-    "title",          # listing title text
-    "updated_utc",    # last refresh timestamp
-]
-
-def _norm(s) -> str:
-    return "" if s is None else str(s).strip()
-
-def _norm_set(s: str) -> str:
-    t = _norm(s).lower()
-    t = re.sub(r"\s+", " ", t)
-    t = t.replace("’", "'")
-    return t
-
-def _norm_key(*parts) -> str:
-    out = []
-    for p in parts:
-        out.append(_norm(p).lower())
-    return "|".join(out)
-
-def _get_ws_or_create(sheet, name: str, headers: list[str], cols_hint: int = 26, rows_hint: int = 2000):
-    try:
-        ws = sheet.worksheet(name)
-        vals = ws.get_all_values()
-        if not vals or not vals[0] or all(str(x).strip() == "" for x in vals[0]):
-            ws.update(range_name="1:1", values=[headers], value_input_option="RAW")
-        else:
-            # Ensure missing headers are appended (backward compatible)
-            current = [str(x).strip() for x in vals[0]]
-            missing = [h for h in headers if h not in current]
-            if missing:
-                ws.update(range_name="1:1", values=[current + missing], value_input_option="RAW")
-        return ws
-    except Exception:
-        ws = sheet.add_worksheet(title=name, rows=str(rows_hint), cols=str(max(cols_hint, len(headers) + 5)))
-        ws.update(range_name="1:1", values=[headers], value_input_option="RAW")
-        return ws
-
-def _read_sheet_df(ws) -> pd.DataFrame:
-    values = ws.get_all_values()
-    if not values:
-        return pd.DataFrame()
-    header = [str(h).strip() for h in values[0]]
-    rows = values[1:]
-    if not header or all(h == "" for h in header):
-        return pd.DataFrame()
-    out_rows = []
-    for r in rows:
-        if len(r) < len(header):
-            r = r + [""] * (len(header) - len(r))
-        elif len(r) > len(header):
-            r = r[:len(header)]
-        out_rows.append(r)
-    return pd.DataFrame(out_rows, columns=header)
-
-def _batch_write_sheet(ws, df: pd.DataFrame, header: list[str]):
-    if df is None:
-        return
-    df2 = df.copy()
-    for c in header:
-        if c not in df2.columns:
-            df2[c] = ""
-    df2 = df2[header]
-    values = [header] + df2.astype(str).fillna("").values.tolist()
-    last_col = a1_col_letter(len(header))
-    ws.update(range_name=f"A1:{last_col}{len(values)}", values=values, value_input_option="RAW")
-
-def _col(df: pd.DataFrame, *names, default=""):
-    if df is None or df.empty:
-        return pd.Series([default] * 0)
-
-    norm_map = {str(c).strip().lower(): c for c in df.columns}
-    for n in names:
-        if n is None:
-            continue
-        key = str(n).strip().lower()
-        if key in norm_map:
-            return df[norm_map[key]]
-
-    for n in names:
-        key = str(n).strip().lower()
-        for k, real in norm_map.items():
-            if key and key in k:
-                return df[real]
-    return pd.Series([default] * len(df))
-
-def _to_float_price(s: str) -> float:
-    try:
-        if s is None:
-            return 0.0
-        t = str(s).replace("$", "").replace(",", "").strip()
-        return float(t) if t else 0.0
-    except Exception:
-        return 0.0
-
-def _classify_grade_from_title(title: str) -> str:
-    t = (title or "").upper()
-    if re.search(r"\bPSA\s*10\b", t) or re.search(r"\bGEM\s*MINT\s*10\b", t) or re.search(r"\bGEM\s*MT\s*10\b", t):
-        return "psa10"
-    if re.search(r"\bPSA\s*9\b", t) or re.search(r"\bMINT\s*9\b", t):
-        return "psa9"
-    return "ungraded"
-
-def downside_penalty_psa9(buy_total: float, psa9_value: float) -> float:
-    buy_total = float(buy_total or 0.0)
-    psa9_value = float(psa9_value or 0.0)
-    if buy_total <= 0:
-        return 0.0
-    profit9 = psa9_value - buy_total
-    roi9 = profit9 / buy_total
-    if roi9 >= 0:
-        return 0.0
-    return float(min(65.0, abs(roi9) * 200.0))
-
-
-# ---------------------------
-# Sales fetch: latest rows
-# ---------------------------
-
-@st.cache_data(ttl=60 * 60 * 6)
-def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 15) -> list[dict]:
-    """
-    Fetch latest sold sales rows from PriceCharting page text.
-    Returns list sorted newest->oldest (best-effort).
-    We fetch >10 so we can detect "new" and then trim to 10 after merge.
-    """
-    link = (reference_link or "").strip()
-    if not link or "pricecharting.com" not in link.lower():
-        return []
-
-    try:
-        r = http_get_with_backoff(link, timeout=25, max_tries=6)
-    except Exception:
-        return []
-
-    soup = BeautifulSoup(r.text, "lxml")
-    text = soup.get_text("\n", strip=True)
-    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
-
-    sales = []
-    date_re = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
-    price_re = re.compile(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-
-    i = 0
-    while i < len(lines):
-        ln = lines[i]
-        if ("$" in ln) and ("[EBAY]" in ln.upper() or "[GOLDIN]" in ln.upper() or "[PWCC]" in ln.upper() or "[TCGPLAYER]" in ln.upper()):
-            title = ln.split("[", 1)[0].strip()
-            pm = price_re.search(ln)
-            price = _to_float_price(pm.group(1)) if pm else 0.0
-
-            sale_date = None
-            for j in range(i, min(i + 4, len(lines))):
-                dm = date_re.search(lines[j])
-                if dm:
-                    sale_date = pd.to_datetime(dm.group(1), errors="coerce").date()
-                    break
-
-            if sale_date and price > 0:
-                bucket = _classify_grade_from_title(title)
-                # sale_key must be stable across refreshes
-                sale_key = f"{sale_date.isoformat()}|{price:.2f}|{bucket}|{title[:80].strip().lower()}"
-                sales.append({
-                    "sale_date": sale_date,
-                    "price": float(price),
-                    "grade_bucket": bucket,
-                    "title": title,
-                    "sale_key": sale_key,
-                })
-        i += 1
-
-    # newest first (best effort)
-    sales = sorted(sales, key=lambda x: (x["sale_date"], x["price"]), reverse=True)
-    return sales[: max(1, int(limit))]
-
-
-# ---------------------------
-# Load watchlist + gemrates + sales history
-# ---------------------------
-
-@st.cache_data(ttl=60)
-def load_watchlist_gemrates_sales():
-    client = get_gspread_client()
-    sh = client.open_by_key(st.secrets["spreadsheet_id"])
-
-    watch_ws = _get_ws_or_create(sh, WATCHLIST_WS_NAME, WATCHLIST_BASE_HEADERS + WATCHLIST_ENRICH_HEADERS, cols_hint=60)
-    gem_ws = _get_ws_or_create(sh, GEMRATES_WS_NAME, GEMRATES_HEADERS, cols_hint=40)
-    sales_ws = _get_ws_or_create(sh, GRADING_SALES_HISTORY_WS_NAME, SALES_HISTORY_HEADERS_V2, cols_hint=60, rows_hint=4000)
-
-    wdf = _read_sheet_df(watch_ws)
-    gdf = _read_sheet_df(gem_ws)
-    sdf = _read_sheet_df(sales_ws)
-
-    return wdf, gdf, sdf
-
-
-# =========================================================
-# Incremental sales history update (keep last 10)
-# =========================================================
-
-def _ensure_sales_history_headers(sales_ws):
-    vals = sales_ws.get_all_values()
-    if not vals:
-        sales_ws.update(range_name="1:1", values=[SALES_HISTORY_HEADERS_V2], value_input_option="RAW")
-        return SALES_HISTORY_HEADERS_V2
-
-    current = [str(x).strip() for x in vals[0]]
-    if not current or all(x == "" for x in current):
-        sales_ws.update(range_name="1:1", values=[SALES_HISTORY_HEADERS_V2], value_input_option="RAW")
-        return SALES_HISTORY_HEADERS_V2
-
-    missing = [h for h in SALES_HISTORY_HEADERS_V2 if h not in current]
-    if missing:
-        sales_ws.update(range_name="1:1", values=[current + missing], value_input_option="RAW")
-        return current + missing
-    return current
 
 def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> int:
-    """
-    For each unique Link in watchlist:
-      - fetch latest ~15 sold rows
-      - compare against existing sales history by sale_key
-      - if new sales exist: merge, keep only most recent keep_n per link
-    Returns number of links updated.
-    """
-    if wdf is None or wdf.empty:
+    if wdf is None or wdf.empty or "Link" not in wdf.columns:
         return 0
 
     client = get_gspread_client()
     sh = client.open_by_key(st.secrets["spreadsheet_id"])
     sales_ws = _get_ws_or_create(sh, GRADING_SALES_HISTORY_WS_NAME, SALES_HISTORY_HEADERS_V2, cols_hint=60, rows_hint=4000)
-    _ensure_sales_history_headers(sales_ws)
 
     sdf = _read_sheet_df(sales_ws)
     if sdf is None or sdf.empty:
@@ -877,20 +810,12 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
     sdf["reference_link"] = sdf["reference_link"].astype(str).str.strip()
     sdf["sale_key"] = sdf["sale_key"].astype(str).str.strip()
 
-    # Map existing sales keys per link
     existing = {}
     if not sdf.empty:
         for lk, grp in sdf.groupby("reference_link"):
-            keys = set(grp["sale_key"].astype(str).tolist())
-            existing[lk] = keys
+            existing[lk] = set(grp["sale_key"].astype(str).tolist())
 
-    # Unique links from watchlist
-    if "Link" not in wdf.columns:
-        return 0
-    links = (
-        wdf["Link"].astype(str).str.strip().tolist()
-        if "Link" in wdf.columns else []
-    )
+    links = wdf["Link"].astype(str).str.strip().tolist()
     uniq = []
     seen = set()
     for lk in links:
@@ -901,13 +826,10 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
             uniq.append(lk)
 
     updated_links = 0
-    out_rows = []
-
-    # We'll build a new sdf_out by starting with existing sdf and replacing per link that changed.
     sdf_out = sdf.copy()
 
     for idx, lk in enumerate(uniq, start=1):
-        # throttle to reduce 429
+        # gentle throttle to reduce 429
         if idx > 1:
             time.sleep(1.1)
 
@@ -921,11 +843,9 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
         if not new_sales and lk in existing:
             continue
 
-        # Build merged list: existing rows (from sdf_out) + new sales, then keep most recent keep_n
         old = sdf_out[sdf_out["reference_link"].astype(str).str.strip() == lk].copy()
         merged = []
 
-        # include existing rows
         if not old.empty:
             for _, r in old.iterrows():
                 merged.append({
@@ -950,7 +870,6 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
                 "updated_utc": now_utc,
             })
 
-        # de-dupe by sale_key, then sort newest->oldest by sale_date
         by_key = {}
         for m in merged:
             if m["sale_key"]:
@@ -966,42 +885,28 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
         merged2.sort(key=lambda x: (_parse_date(x.get("sale_date")) or date(1900,1,1), float(x.get("price", 0.0))), reverse=True)
         merged2 = merged2[: int(keep_n)]
 
-        # remove old rows for lk, append merged2
         sdf_out = sdf_out[sdf_out["reference_link"].astype(str).str.strip() != lk].copy()
         sdf_out = pd.concat([sdf_out, pd.DataFrame(merged2)], ignore_index=True)
-
         updated_links += 1
 
-    # Write back if anything changed
     if updated_links > 0:
-        # Normalize columns and write
         for c in SALES_HISTORY_HEADERS_V2:
             if c not in sdf_out.columns:
                 sdf_out[c] = ""
         sdf_out = sdf_out[SALES_HISTORY_HEADERS_V2].copy()
 
-        # Sort by link then sale_date desc for readability
-        try:
-            sdf_out["__d"] = pd.to_datetime(sdf_out["sale_date"], errors="coerce")
-            sdf_out = sdf_out.sort_values(["reference_link", "__d"], ascending=[True, False]).drop(columns=["__d"])
-        except Exception:
-            pass
-
+        # write sheet (header + data)
         _batch_write_sheet(sales_ws, sdf_out, SALES_HISTORY_HEADERS_V2)
-
         load_watchlist_gemrates_sales.clear()
 
     return updated_links
 
 
 # =========================================================
-# Build watchlist view and scoring
+# WATCHLIST VIEW BUILD
 # =========================================================
 
 def _sales_stats_from_last10(sdf: pd.DataFrame, link: str, bucket: str) -> dict:
-    """
-    Compute stats from the stored last-10 rows for that link (not time-windowed).
-    """
     if sdf is None or sdf.empty or not link:
         return {"count": 0, "min": 0.0, "max": 0.0, "avg": 0.0}
 
@@ -1034,42 +939,51 @@ def _sales_stats_from_last10(sdf: pd.DataFrame, link: str, bucket: str) -> dict:
         "avg": float(sum(prices) / len(prices)),
     }
 
+def downside_penalty_psa9(buy_total: float, psa9_value: float) -> float:
+    buy_total = float(buy_total or 0.0)
+    psa9_value = float(psa9_value or 0.0)
+    if buy_total <= 0:
+        return 0.0
+    profit9 = psa9_value - buy_total
+    roi9 = profit9 / buy_total
+    if roi9 >= 0:
+        return 0.0
+    return float(min(65.0, abs(roi9) * 200.0))
+
 def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame, grading_fee_assumption: float):
     if wdf is None or wdf.empty:
         return pd.DataFrame()
 
     out = wdf.copy()
-    # Ensure base headers
+
+    # Make sure no duplicate columns reach st.data_editor
+    out = out.loc[:, ~out.columns.duplicated()].copy()
+
     for c in WATCHLIST_BASE_HEADERS:
         if c not in out.columns:
             out[c] = ""
 
-    # --- Gemrates matching: ONLY Set + Card No (your request) ---
+    # ---- GemRates match: Set + Card No (Parallel optional) ----
     base_lookup = {}
-    tmp = None
-
     if gdf is not None and not gdf.empty:
-        g_set = _col(gdf, "Set Name", "Set").astype(str)
-        g_cardno = _col(gdf, "Card #", "Card No").astype(str)
-        g_par = _col(gdf, "Parallel", "Variant").astype(str)
-        g_desc = _col(gdf, "Card Description", "Description").astype(str)
-        gems = _col(gdf, "Gems")
-        total = _col(gdf, "Total")
+        g = gdf.loc[:, ~gdf.columns.duplicated()].copy()
+        g_set = g.get("Set Name", g.get("Set", ""))
+        g_cardno = g.get("Card #", g.get("Card No", ""))
+        g_par = g.get("Parallel", g.get("Variant", ""))
+        g_desc = g.get("Card Description", g.get("Description", ""))
 
-        g_gems = gems.apply(lambda x: safe_float(x, 0.0))
-        g_total = total.apply(lambda x: safe_float(x, 0.0))
+        gems = g.get("Gems", 0)
+        total = g.get("Total", 0)
 
         tmp = pd.DataFrame({
-            "__set": g_set,
-            "__cardno": g_cardno,
-            "__par": g_par,
-            "__desc": g_desc,
-            "__gems": g_gems,
-            "__total": g_total,
+            "__set": g_set.astype(str),
+            "__cardno": g_cardno.astype(str),
+            "__par": g_par.astype(str),
+            "__desc": g_desc.astype(str),
+            "__gems": pd.Series(gems).apply(lambda x: safe_float(x, 0.0)),
+            "__total": pd.Series(total).apply(lambda x: safe_float(x, 0.0)),
         })
-
         tmp["__k_base"] = tmp.apply(lambda r: _norm_key(_norm_set(r["__set"]), _norm(r["__cardno"])), axis=1)
-
         base = tmp.groupby("__k_base", as_index=False).agg(
             total_graded=("__total", "sum"),
             psa10_count=("__gems", "sum"),
@@ -1077,49 +991,39 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
         base["gem_rate"] = base.apply(lambda r: (r["psa10_count"] / r["total_graded"]) if r["total_graded"] else 0.0, axis=1)
         base_lookup = base.set_index("__k_base").to_dict("index")
 
-    def _pick_gem_stats(wrow):
-        setn = _norm_set(wrow.get("Set", ""))
-        cardno = _norm(wrow.get("Card No", ""))
-        par = _norm(wrow.get("Parallel", ""))
+        def _pick_gem_stats(wrow):
+            setn = _norm_set(wrow.get("Set", ""))
+            cardno = _norm(wrow.get("Card No", ""))
+            par = _norm(wrow.get("Parallel", ""))
 
-        kb = _norm_key(setn, cardno)
-        base_stats = base_lookup.get(kb)
+            kb = _norm_key(setn, cardno)
+            base_stats = base_lookup.get(kb)
+            if base_stats is None:
+                return 0.0, 0.0, 0.0
 
-        if tmp is None:
-            if base_stats:
-                return float(base_stats["total_graded"]), float(base_stats["psa10_count"]), float(base_stats["gem_rate"])
-            return 0.0, 0.0, 0.0
+            # optional filter by parallel within tmp
+            m = tmp[(tmp["__set"].apply(_norm_set) == setn) & (tmp["__cardno"].astype(str).str.strip() == cardno)].copy()
+            if not m.empty and par:
+                par_l = par.lower()
+                m2 = m[m["__par"].str.lower().str.contains(par_l, na=False) | m["__desc"].str.lower().str.contains(par_l, na=False)]
+                if not m2.empty:
+                    total_graded = float(m2["__total"].sum())
+                    psa10_count = float(m2["__gems"].sum())
+                    gem_rate = float((psa10_count / total_graded) if total_graded else 0.0)
+                    return total_graded, psa10_count, gem_rate
 
-        m = tmp[
-            (tmp["__set"].astype(str).apply(_norm_set) == setn)
-            & (tmp["__cardno"].astype(str).str.strip() == cardno)
-        ].copy()
+            return float(base_stats["total_graded"]), float(base_stats["psa10_count"]), float(base_stats["gem_rate"])
 
-        if m.empty:
-            if base_stats:
-                return float(base_stats["total_graded"]), float(base_stats["psa10_count"]), float(base_stats["gem_rate"])
-            return 0.0, 0.0, 0.0
+        picked = out.apply(_pick_gem_stats, axis=1)
+        out["Total Graded"] = picked.apply(lambda t: float(t[0]))
+        out["# PSA 10"] = picked.apply(lambda t: float(t[1]))
+        out["Gem Rate"] = picked.apply(lambda t: float(t[2]))
+    else:
+        out["Total Graded"] = 0.0
+        out["# PSA 10"] = 0.0
+        out["Gem Rate"] = 0.0
 
-        if par:
-            par_l = par.lower()
-            m2 = m[
-                m["__par"].astype(str).str.lower().str.contains(par_l, na=False)
-                | m["__desc"].astype(str).str.lower().str.contains(par_l, na=False)
-            ].copy()
-            if not m2.empty:
-                m = m2
-
-        total_graded = float(m["__total"].sum())
-        psa10_count = float(m["__gems"].sum())
-        gem_rate = float((psa10_count / total_graded) if total_graded else 0.0)
-        return total_graded, psa10_count, gem_rate
-
-    picked = out.apply(_pick_gem_stats, axis=1)
-    out["Total Graded"] = picked.apply(lambda t: float(t[0]))
-    out["# PSA 10"] = picked.apply(lambda t: float(t[1]))
-    out["Gem Rate"] = picked.apply(lambda t: float(t[2]))
-
-    # --- PriceCharting current prices ---
+    # ---- PriceCharting prices ----
     def _get_prices(link):
         link = _norm(link)
         if not link or "pricecharting.com" not in link.lower():
@@ -1132,13 +1036,14 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
     out["PSA 9"] = prices.apply(lambda t: float(t[1]))
     out["PSA 10"] = prices.apply(lambda t: float(t[2]))
 
-    # --- Sales stats from stored last-10 sales history ---
+    # ---- Sales stats from stored sales-history sheet (last 10) ----
     for c in [
         "ungraded_sales_30d", "ungraded_min_30d", "ungraded_max_30d", "ungraded_avg_30d",
         "psa9_sales_30d", "psa9_min_30d", "psa9_max_30d", "psa9_avg_30d",
         "psa10_sales_30d", "psa10_min_30d", "psa10_max_30d", "psa10_avg_30d",
     ]:
-        out[c] = 0.0
+        if c not in out.columns:
+            out[c] = 0.0
 
     def _fill_sales(row):
         link = _norm(row.get("Link", ""))
@@ -1162,7 +1067,7 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
     ]
     out[sales_cols] = out.apply(_fill_sales, axis=1)
 
-    # --- Image ---
+    # ---- Image (Pic first, otherwise scrape) ----
     def _img(row):
         pic = _norm(row.get("Pic", ""))
         if pic:
@@ -1174,7 +1079,7 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
 
     out["Image"] = out.apply(_img, axis=1)
 
-    # --- Buy basis + score ---
+    # ---- Scoring ----
     fee = float(grading_fee_assumption or 0.0)
     out["Target Buy Price"] = out["Target Buy Price"].apply(lambda v: safe_float(v, 0.0))
     out["Max Buy Price"] = out["Max Buy Price"].apply(lambda v: safe_float(v, 0.0))
@@ -1210,7 +1115,6 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
         profit9 = float(safe_float(row.get("Profit PSA 9"), 0.0))
         roi10 = float(safe_float(row.get("ROI PSA 10"), 0.0))
 
-        # now "sales" is from last 10 stored, not 30d
         psa10_sales = float(safe_float(row.get("psa10_sales_30d", 0.0), 0.0))
         total_graded = float(safe_float(row.get("Total Graded", 0.0), 0.0))
         gem_rate = float(safe_float(row.get("Gem Rate", 0.0), 0.0))
@@ -1256,86 +1160,42 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
         "ROI PSA 9", "ROI PSA 10",
         "Total Graded", "# PSA 10", "Gem Rate",
         "psa10_sales_30d", "psa9_sales_30d", "ungraded_sales_30d",
+        "psa10_min_30d", "psa10_max_30d", "psa10_avg_30d",
         "Grading Score",
         "Release Year",
         "Link", "Pic", "Notes",
     ]
     cols = [c for c in front if c in out.columns] + [c for c in out.columns if c not in front]
-    return out[cols]
+    out = out[cols].loc[:, ~out.columns.duplicated()].copy()
+    return out
 
-
-# =========================================================
-# Watchlist save/write
-# =========================================================
-
-def save_watchlist_from_editor(edited_df: pd.DataFrame):
-    """
-    Save watchlist back to sheet. Keep all sheet columns (including enrichment),
-    but only user-editable fields actually change in the editor.
-    """
-    if edited_df is None:
-        return
-
-    client = get_gspread_client()
-    sh = client.open_by_key(st.secrets["spreadsheet_id"])
-    ws = _get_ws_or_create(sh, WATCHLIST_WS_NAME, WATCHLIST_BASE_HEADERS + WATCHLIST_ENRICH_HEADERS, cols_hint=60)
-
-    # Use the sheet's header order (so we don't drop columns).
-    sheet_vals = ws.get_all_values()
-    sheet_header = []
-    if sheet_vals and sheet_vals[0]:
-        sheet_header = [str(x).strip() for x in sheet_vals[0] if str(x).strip() != ""]
-    if not sheet_header:
-        sheet_header = WATCHLIST_BASE_HEADERS + WATCHLIST_ENRICH_HEADERS
-
-    df2 = edited_df.copy()
-    for c in sheet_header:
-        if c not in df2.columns:
-            df2[c] = ""
-    df2 = df2[sheet_header].copy()
-
-    _batch_write_sheet(ws, df2, sheet_header)
-    load_watchlist_gemrates_sales.clear()
 
 def write_enriched_watchlist(view_df: pd.DataFrame):
-    """
-    When refresh is clicked, write the enriched fields (prices, gem stats, sales stats, score, image)
-    into the watchlist sheet too.
-    """
     if view_df is None or view_df.empty:
         return
 
     client = get_gspread_client()
     sh = client.open_by_key(st.secrets["spreadsheet_id"])
-    ws = _get_ws_or_create(sh, WATCHLIST_WS_NAME, WATCHLIST_BASE_HEADERS + WATCHLIST_ENRICH_HEADERS, cols_hint=60)
+    ws = _get_ws_or_create(sh, WATCHLIST_WS_NAME, WATCHLIST_BASE_HEADERS + WATCHLIST_ENRICH_HEADERS, cols_hint=70)
 
     sheet_vals = ws.get_all_values()
-    sheet_header = []
-    if sheet_vals and sheet_vals[0]:
-        sheet_header = [str(x).strip() for x in sheet_vals[0] if str(x).strip() != ""]
+    sheet_header = [str(x).strip() for x in (sheet_vals[0] if sheet_vals and sheet_vals[0] else []) if str(x).strip() != ""]
     if not sheet_header:
         sheet_header = WATCHLIST_BASE_HEADERS + WATCHLIST_ENRICH_HEADERS
 
-    df2 = view_df.copy()
-    # Ensure required columns exist in the sheet
+    df2 = view_df.copy().loc[:, ~view_df.columns.duplicated()].copy()
+
+    # guarantee enrich cols exist
     needed = set(WATCHLIST_BASE_HEADERS + WATCHLIST_ENRICH_HEADERS)
     for c in needed:
         if c not in df2.columns:
             df2[c] = ""
 
-    # Keep link column name consistent
-    if "Link" not in df2.columns and "reference_link" in df2.columns:
-        df2["Link"] = df2["reference_link"]
-
-    # Create/update final header that includes sheet header + any missing new columns
-    for c in df2.columns:
-        if c not in sheet_header and c in needed:
-            sheet_header.append(c)
-
-    # Reorder and write
+    # preserve sheet order (don’t drop cols)
     for c in sheet_header:
         if c not in df2.columns:
             df2[c] = ""
+
     df2 = df2[sheet_header].copy()
     _batch_write_sheet(ws, df2, sheet_header)
     load_watchlist_gemrates_sales.clear()
@@ -1356,23 +1216,20 @@ if not eligible_inv.empty:
 
 
 # =========================================================
-# UI TABS (ONLY ONCE)
+# UI
 # =========================================================
 
 tab_analysis, tab_submit, tab_update, tab_summary = st.tabs(
     ["Analysis", "Create Submission", "Update Returns", "Summary"]
 )
 
-# -------------------------
-# Analysis
-# -------------------------
 with tab_analysis:
     st.subheader("Grading Watch List (GemRates + PriceCharting + Last 10 Sales)")
 
     fee_assumption = st.number_input(
         "Assumed grading fee (per card)",
         min_value=0.0,
-        value=float(st.secrets.get("default_grading_fee_per_card", 28.0)),
+        value=float(DEFAULT_GRADING_FEE_PER_CARD),
         step=1.0,
         format="%.2f",
     )
@@ -1381,60 +1238,42 @@ with tab_analysis:
 
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
-        if st.button("📈 Refresh sales history (Last 10 per card)", use_container_width=True, disabled=(wdf is None or wdf.empty)):
+        if st.button("📈 Refresh sales history (keep last 10 per link)", width="stretch", disabled=(wdf is None or wdf.empty)):
             n = update_sales_history_incremental(wdf, keep_n=10)
-            st.success(f"Updated sales history for {n} card link(s).")
+            st.success(f"Updated sales history for {n} link(s).")
             st.rerun()
 
     with c2:
-        if st.button("🔄 Refresh & write Watchlist (GemRates + Prices + Sales + Score)", use_container_width=True, disabled=(wdf is None or wdf.empty)):
-            # clear caches so refresh truly re-pulls
-            load_watchlist_gemrates_sales.clear()
-            fetch_pricecharting_prices.clear()
-            fetch_pricecharting_image_url.clear()
-            fetch_pricecharting_sold_sales_latest.clear()
-
-            # reload and update sales incrementally (will throttle + not crash on 429)
+        if st.button("🔄 Refresh & write Watchlist (prices + gemrates + sales + image + score)", width="stretch", disabled=(wdf is None or wdf.empty)):
+            # refresh sales first (this populates your database sheet)
+            _ = update_sales_history_incremental(wdf, keep_n=10)
+            # reload sales df, then compute all stats
             wdf2, gdf2, sdf2 = load_watchlist_gemrates_sales()
-            _ = update_sales_history_incremental(wdf2, keep_n=10)
-
-            # rebuild view with updated sales store, then write back to watchlist sheet
-            wdf3, gdf3, sdf3 = load_watchlist_gemrates_sales()
-            view3 = build_watchlist_view(wdf3, gdf3, sdf3, fee_assumption)
-            write_enriched_watchlist(view3)
-
-            st.success("Watchlist updated (sheet populated).")
+            view = build_watchlist_view(wdf2, gdf2, sdf2, fee_assumption)
+            write_enriched_watchlist(view)
+            st.success("Watchlist updated and written to sheet.")
             st.rerun()
 
     with c3:
-        st.caption("Tip: Fill **Parallel** (Base / Reverse Holo / SIR) to improve GemRates matching.")
+        st.caption("If Image is blank, add a direct image URL in Pic, or click refresh again after throttling.")
 
     if wdf is None or wdf.empty:
-        st.info(
-            f"No rows found in '{WATCHLIST_WS_NAME}'. Paste your watch list data into that sheet (headers in row 1).\n\n"
-            f"Expected headers: {', '.join(WATCHLIST_BASE_HEADERS)}"
-        )
+        st.info(f"No rows found in '{WATCHLIST_WS_NAME}'. Expected headers: {', '.join(WATCHLIST_BASE_HEADERS)}")
     else:
         view = build_watchlist_view(wdf, gdf, sdf, fee_assumption)
 
         img_cfg = {
-            "Image": st.column_config.ImageColumn("Image", help="Pic column or PriceCharting image", width="large"),
+            "Image": st.column_config.ImageColumn("Image", width="large"),
             "Link": st.column_config.LinkColumn("Link", display_text="PriceCharting"),
         }
 
-        # Make sure editable columns exist
-        for c in WATCHLIST_BASE_HEADERS:
-            if c not in view.columns:
-                view[c] = ""
-
         edited = st.data_editor(
-            view,
-            use_container_width=True,
+            view.loc[:, ~view.columns.duplicated()].copy(),
+            width="stretch",
             hide_index=True,
             num_rows="dynamic",
             column_config=img_cfg,
             disabled=[
-                # computed fields
                 "Image",
                 "Buy Basis (Raw)", "All-in Cost (Buy+Fee)",
                 "Ungraded", "PSA 9", "PSA 10",
@@ -1448,18 +1287,13 @@ with tab_analysis:
             ],
         )
 
-        b1, b2 = st.columns([1, 1])
-        with b1:
-            if st.button("💾 Save Watch List", type="primary", use_container_width=True):
-                save_watchlist_from_editor(edited)
-                st.success("Saved to Google Sheets.")
-                st.rerun()
-        with b2:
-            st.caption("Sales stats are computed from the stored **last 10 sales** per card link.")
+        if st.button("💾 Save Watch List (manual edits only)", type="primary", width="stretch"):
+            # write back edited base+enrich columns; this does NOT re-scrape, it saves what you see
+            write_enriched_watchlist(edited)
+            st.success("Saved.")
+            st.rerun()
 
-# -------------------------
-# Create Submission
-# -------------------------
+
 with tab_submit:
     st.subheader("Create Submission")
 
@@ -1480,24 +1314,13 @@ with tab_submit:
         with c2:
             company = st.selectbox("Grading company", ["PSA", "CGC", "Beckett"])
         with c3:
-            fee_initial = st.number_input(
-                "Initial grading fee (per card)",
-                min_value=0.0,
-                value=DEFAULT_GRADING_FEE_PER_CARD,
-                step=1.0,
-                format="%.2f",
-            )
+            fee_initial = st.number_input("Initial grading fee (per card)", min_value=0.0, value=DEFAULT_GRADING_FEE_PER_CARD, step=1.0, format="%.2f")
         with c4:
-            business_days = st.number_input(
-                "Estimated return (business days)",
-                min_value=1,
-                value=DEFAULT_RETURN_BUSINESS_DAYS,
-                step=1,
-            )
+            business_days = st.number_input("Estimated return (business days)", min_value=1, value=DEFAULT_RETURN_BUSINESS_DAYS, step=1)
 
         notes = st.text_area("Notes (optional)", height=80)
 
-        if st.button("Create submission", type="primary", use_container_width=True, disabled=(len(selected) == 0)):
+        if st.button("Create submission", type="primary", width="stretch", disabled=(len(selected) == 0)):
             sub_id = str(int(datetime.utcnow().timestamp()))
             est_return = add_business_days(submission_date, int(business_days))
 
@@ -1551,16 +1374,14 @@ with tab_submit:
             st.success(f"Created submission {sub_id} with {len(rows)} card(s).")
             refresh_all()
 
-# -------------------------
-# Update Returns
-# -------------------------
+
 with tab_update:
     st.subheader("Update Returns / Add Costs")
 
     if grading_df.empty:
         st.info("No grading records yet.")
     else:
-        df = grading_df.copy()
+        df = grading_df.copy().loc[:, ~grading_df.columns.duplicated()].copy()
         df["submission_id"] = df["submission_id"].astype(str)
 
         open_df = df[df["status"].astype(str).str.upper().isin(["SUBMITTED", "IN_TRANSIT"])].copy()
@@ -1571,10 +1392,7 @@ with tab_update:
         else:
             meta = (
                 open_df.groupby("submission_id", dropna=False)
-                .agg(
-                    submission_date=("submission_date", "first"),
-                    cards=("grading_row_id", "count"),
-                )
+                .agg(submission_date=("submission_date", "first"), cards=("grading_row_id", "count"))
                 .reset_index()
             )
             meta["label"] = meta.apply(lambda r: f"{r['submission_id']} — {r['submission_date']} — {int(r['cards'])} card(s)", axis=1)
@@ -1583,10 +1401,8 @@ with tab_update:
             label_map = dict(zip(sub_ids, meta["label"].tolist()))
 
             pick = st.selectbox("Select open submission", options=sub_ids, format_func=lambda sid: label_map.get(sid, sid))
-
             sub_rows = open_df[open_df["submission_id"].astype(str) == str(pick)].copy()
 
-            st.caption("Edit the table, then click Save updates. Rows with a returned date or grade will be marked RETURNED automatically.")
             edit_cols = [
                 "grading_row_id",
                 "inventory_id",
@@ -1604,12 +1420,11 @@ with tab_update:
             show = sub_rows[edit_cols].copy()
 
             for c in ["purchase_total", "grading_fee_initial", "additional_costs", "psa9_price", "psa10_price"]:
-                if c in show.columns:
-                    show[c] = show[c].apply(lambda v: safe_float(v, 0.0))
+                show[c] = show[c].apply(lambda v: safe_float(v, 0.0))
 
-            edited = st.data_editor(show, use_container_width=True, hide_index=True, num_rows="fixed")
+            edited = st.data_editor(show, width="stretch", hide_index=True, num_rows="fixed")
 
-            if st.button("Save updates", type="primary", use_container_width=True):
+            if st.button("Save updates", type="primary", width="stretch"):
                 updated = sub_rows.copy()
                 ed_map = {str(r["grading_row_id"]): r for _, r in edited.iterrows()}
 
@@ -1633,9 +1448,7 @@ with tab_update:
                 st.success("Saved.")
                 refresh_all()
 
-# -------------------------
-# Summary
-# -------------------------
+
 with tab_summary:
     st.subheader("Summary (Submission totals)")
 
@@ -1643,8 +1456,6 @@ with tab_summary:
         st.info("No grading data.")
     else:
         df = grading_df.copy()
-        df["submission_id"] = df["submission_id"].astype(str)
-
         for c in ["purchase_total", "grading_fee_initial", "additional_costs", "psa9_price", "psa10_price"]:
             df[c] = df[c].apply(lambda v: safe_float(v, 0.0))
 
@@ -1672,7 +1483,7 @@ with tab_summary:
         for c in ["purchase_cost", "grading_cost", "psa9_value", "psa10_value", "profit_all_psa9", "profit_all_psa10"]:
             show[c] = show[c].apply(money)
 
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.dataframe(show, width="stretch", hide_index=True)
 
-        if st.button("🔄 Refresh", use_container_width=True):
+        if st.button("🔄 Refresh", width="stretch"):
             refresh_all()
