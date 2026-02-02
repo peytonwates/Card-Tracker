@@ -85,10 +85,11 @@ WATCHLIST_BASE_HEADERS = [
     "Notes",
 ]
 
+# NOTE: These names are preserved for backward compatibility with your sheet,
+# but they represent stats computed from "last-10 stored sales" (not necessarily 30 days).
 WATCHLIST_ENRICH_HEADERS = [
     "Ungraded", "PSA 9", "PSA 10",
     "Total Graded", "# PSA 10", "Gem Rate",
-    # names preserved (they now represent stats from last-10 stored sales)
     "ungraded_sales_30d", "ungraded_min_30d", "ungraded_max_30d", "ungraded_avg_30d",
     "psa9_sales_30d", "psa9_min_30d", "psa9_max_30d", "psa9_avg_30d",
     "psa10_sales_30d", "psa10_min_30d", "psa10_max_30d", "psa10_avg_30d",
@@ -108,6 +109,7 @@ GEMRATES_HEADERS = [
     "Gem Rate - All Time",
 ]
 
+# Sales history storage: one row per sale (we keep last N per link per grade_bucket)
 SALES_HISTORY_HEADERS_V2 = [
     "reference_link",
     "sale_key",       # stable key to detect new sales
@@ -223,6 +225,15 @@ def _classify_grade_from_title(title: str) -> str:
     if re.search(r"\bPSA\s*9\b", t) or re.search(r"\bMINT\s*9\b", t):
         return "psa9"
     return "ungraded"
+
+def _parse_iso_date(s: str):
+    try:
+        d = pd.to_datetime(s, errors="coerce")
+        if pd.isna(d):
+            return None
+        return d.date()
+    except Exception:
+        return None
 
 
 # =========================================================
@@ -390,6 +401,10 @@ def http_get_with_backoff(url: str, *, timeout=20, max_tries=6):
 
 @st.cache_data(ttl=60 * 60 * 12)
 def fetch_pricecharting_prices(reference_link: str) -> dict:
+    """
+    Returns "current" prices from the product page.
+    NOTE: PriceCharting HTML can change; this function is resilient but not guaranteed.
+    """
     out = {"raw": 0.0, "psa9": 0.0, "psa10": 0.0}
     link = (reference_link or "").strip()
     if not link or "pricecharting.com" not in link.lower():
@@ -405,6 +420,7 @@ def fetch_pricecharting_prices(reference_link: str) -> dict:
             m = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", t)
             prices.append(safe_float(m.group(1), 0.0) if m else 0.0)
 
+        # This indexing matches your original approach.
         out["raw"] = float(prices[0] if len(prices) >= 1 else 0.0)
         out["psa9"] = float(prices[3] if len(prices) >= 4 else 0.0)
         out["psa10"] = float(prices[5] if len(prices) >= 6 else 0.0)
@@ -422,12 +438,10 @@ def fetch_pricecharting_image_url(reference_link: str) -> str:
         r = http_get_with_backoff(link, timeout=25, max_tries=6)
         soup = BeautifulSoup(r.text, "lxml")
 
-        # 1) og:image (most reliable)
         meta = soup.find("meta", attrs={"property": "og:image"})
         if meta and meta.get("content"):
             return str(meta.get("content")).strip()
 
-        # 2) common image locations (inventory-like scraping)
         selectors = [
             "img#product_image",
             "img.product_image",
@@ -441,11 +455,10 @@ def fetch_pricecharting_image_url(reference_link: str) -> str:
             if tag and tag.get("src"):
                 return str(tag.get("src")).strip()
 
-        # 3) last resort: first large-ish img
         imgs = soup.select("img[src]")
-        for img in imgs[:20]:
+        for img in imgs[:25]:
             src = str(img.get("src")).strip()
-            if "pricecharting" in src and ("jpg" in src or "png" in src or "webp" in src):
+            if "pricecharting" in src and any(ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
                 return src
 
         return ""
@@ -458,7 +471,14 @@ def fetch_pricecharting_image_url(reference_link: str) -> str:
 # =========================================================
 
 @st.cache_data(ttl=60 * 60 * 6)
-def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 15) -> list[dict]:
+def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 60) -> list[dict]:
+    """
+    Scrape a PriceCharting product page and return recent sold sales.
+    We attempt structured parsing first (tables/lists), then fall back to text scanning.
+
+    Output rows:
+      { sale_date: date, price: float, grade_bucket: 'ungraded'|'psa9'|'psa10', title: str, sale_key: str }
+    """
     link = (reference_link or "").strip()
     if not link or "pricecharting.com" not in link.lower():
         return []
@@ -469,39 +489,96 @@ def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 15) 
         return []
 
     soup = BeautifulSoup(r.text, "lxml")
-    text = soup.get_text("\n", strip=True)
-    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
 
     sales = []
-    date_re = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
     price_re = re.compile(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+    # PriceCharting often shows YYYY-MM-DD in recent sales blocks; keep that primary.
+    iso_date_re = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 
-    for i, ln in enumerate(lines):
-        if ("$" in ln) and ("[EBAY]" in ln.upper() or "[GOLDIN]" in ln.upper() or "[PWCC]" in ln.upper() or "[TCGPLAYER]" in ln.upper()):
-            title = ln.split("[", 1)[0].strip()
+    def _emit(title: str, sale_date: date, price: float):
+        if not title or not sale_date or not price or price <= 0:
+            return
+        bucket = _classify_grade_from_title(title)
+        # stable-ish key (date + price + bucket + normalized short title)
+        sale_key = f"{sale_date.isoformat()}|{price:.2f}|{bucket}|{title[:90].strip().lower()}"
+        sales.append({
+            "sale_date": sale_date,
+            "price": float(price),
+            "grade_bucket": bucket,
+            "title": title.strip(),
+            "sale_key": sale_key,
+        })
+
+    # ---------- Attempt 1: parse any obvious "recent sales" table rows ----------
+    # Common pattern: rows containing a date + title + price.
+    # We'll scan all rows and try to infer.
+    for tr in soup.select("tr"):
+        t = tr.get_text(" ", strip=True)
+        if not t or "$" not in t:
+            continue
+        dm = iso_date_re.search(t)
+        pm = price_re.search(t)
+        if not dm or not pm:
+            continue
+
+        d = _parse_iso_date(dm.group(1))
+        p = _to_float_price(pm.group(1))
+
+        # try to extract a decent title from the row:
+        # - prefer the longest cell text that is not date/price
+        cells = [td.get_text(" ", strip=True) for td in tr.select("td")]
+        cells = [c for c in cells if c]
+        title = ""
+        if cells:
+            # remove exact date cell and exact price cell if present
+            filtered = []
+            for c in cells:
+                if dm.group(1) in c:
+                    continue
+                if pm.group(0) in c or pm.group(1) in c:
+                    continue
+                filtered.append(c)
+            # choose the longest remaining, else fallback to row text
+            title = max(filtered, key=len) if filtered else t
+
+        if d and p > 0:
+            _emit(title, d, p)
+
+    # ---------- Attempt 2: fallback text scan (your original approach, improved) ----------
+    if len(sales) < 5:
+        text = soup.get_text("\n", strip=True)
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+
+        for i, ln in enumerate(lines):
+            if "$" not in ln:
+                continue
             pm = price_re.search(ln)
-            price = _to_float_price(pm.group(1)) if pm else 0.0
+            if not pm:
+                continue
+
+            # title heuristics: text before a bracket source like [eBay], or full line
+            title = ln.split("[", 1)[0].strip() if "[" in ln else ln.strip()
+            price = _to_float_price(pm.group(1))
 
             sale_date = None
-            for j in range(i, min(i + 4, len(lines))):
-                dm = date_re.search(lines[j])
+            # search a small window near the line for an ISO date
+            for j in range(i, min(i + 6, len(lines))):
+                dm = iso_date_re.search(lines[j])
                 if dm:
-                    sale_date = pd.to_datetime(dm.group(1), errors="coerce").date()
+                    sale_date = _parse_iso_date(dm.group(1))
                     break
 
             if sale_date and price > 0:
-                bucket = _classify_grade_from_title(title)
-                sale_key = f"{sale_date.isoformat()}|{price:.2f}|{bucket}|{title[:80].strip().lower()}"
-                sales.append({
-                    "sale_date": sale_date,
-                    "price": float(price),
-                    "grade_bucket": bucket,
-                    "title": title,
-                    "sale_key": sale_key,
-                })
+                _emit(title, sale_date, price)
 
-    sales = sorted(sales, key=lambda x: (x["sale_date"], x["price"]), reverse=True)
-    return sales[: max(1, int(limit))]
+    # de-dupe by sale_key
+    by_key = {}
+    for s in sales:
+        if s.get("sale_key"):
+            by_key[s["sale_key"]] = s
+    sales2 = list(by_key.values())
+    sales2.sort(key=lambda x: (x["sale_date"], x["price"]), reverse=True)
+    return sales2[: max(1, int(limit))]
 
 
 # =========================================================
@@ -564,7 +641,6 @@ def load_grading_df():
         if c not in df.columns and c not in {_strip_dups(x) for x in df.columns}:
             df[c] = ""
 
-    # helper: return first column if duplicates exist
     def _as_series(colname: str) -> pd.Series:
         obj = df.loc[:, colname]
         if isinstance(obj, pd.DataFrame):
@@ -583,7 +659,6 @@ def load_grading_df():
         for fb in fallbacks:
             candidates += _cols_named(fb)
 
-        # unique keep order
         seen = set()
         ordered = []
         for c in candidates:
@@ -604,18 +679,15 @@ def load_grading_df():
     _coalesce_into("additional_costs", ["extra_costs"])
     _coalesce_into("received_grade", ["returned_grade"])
 
-    # numeric fields
     for c in ["purchase_total", "grading_fee_initial", "additional_costs", "psa9_price", "psa10_price"]:
         if c in df.columns:
             df[c] = df[c].apply(lambda v: safe_float(v, 0.0))
 
-    # IMPORTANT: return ONLY canonical cols so Streamlit data_editor never sees dup column names
     out = pd.DataFrame()
     for c in GRADING_CANON_COLS:
         if c in df.columns:
             out[c] = df[c]
         else:
-            # look for base match
             matches = [col for col in df.columns if _strip_dups(col) == c]
             out[c] = df[matches[0]] if matches else ""
 
@@ -789,10 +861,19 @@ def update_inventory_status(inventory_id: str, new_status: str):
 
 
 # =========================================================
-# SALES HISTORY (last 10 per link, incremental)
+# SALES HISTORY (keep last 10 per link PER grade bucket, incremental)
 # =========================================================
 
 def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> int:
+    """
+    For each PriceCharting Link in watchlist:
+      - fetch latest sales (up to ~60)
+      - add new sale rows to sales history sheet
+      - then keep ONLY last `keep_n` per (reference_link, grade_bucket)
+        so you end up with up to 30 rows per link (10 ungraded + 10 psa9 + 10 psa10)
+
+    Returns count of links updated.
+    """
     if wdf is None or wdf.empty or "Link" not in wdf.columns:
         return 0
 
@@ -809,6 +890,8 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
 
     sdf["reference_link"] = sdf["reference_link"].astype(str).str.strip()
     sdf["sale_key"] = sdf["sale_key"].astype(str).str.strip()
+    sdf["grade_bucket"] = sdf["grade_bucket"].astype(str).str.strip().str.lower()
+    sdf["sale_date"] = sdf["sale_date"].astype(str).str.strip()
 
     existing = {}
     if not sdf.empty:
@@ -833,19 +916,21 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
         if idx > 1:
             time.sleep(1.1)
 
-        latest = fetch_pricecharting_sold_sales_latest(lk, limit=15)
+        latest = fetch_pricecharting_sold_sales_latest(lk, limit=60)
         if not latest:
             continue
 
         ex_keys = existing.get(lk, set())
-        new_sales = [s for s in latest if s["sale_key"] not in ex_keys]
+        new_sales = [s for s in latest if s.get("sale_key") and s["sale_key"] not in ex_keys]
 
+        # If we already have link and nothing new, skip
         if not new_sales and lk in existing:
             continue
 
+        # pull old rows for link
         old = sdf_out[sdf_out["reference_link"].astype(str).str.strip() == lk].copy()
-        merged = []
 
+        merged = []
         if not old.empty:
             for _, r in old.iterrows():
                 merged.append({
@@ -853,7 +938,7 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
                     "sale_key": _norm(r.get("sale_key", "")),
                     "sale_date": _norm(r.get("sale_date", "")),
                     "price": safe_float(r.get("price", 0.0), 0.0),
-                    "grade_bucket": _norm(r.get("grade_bucket", "")),
+                    "grade_bucket": _norm(r.get("grade_bucket", "")).lower(),
                     "title": _norm(r.get("title", "")),
                     "updated_utc": _norm(r.get("updated_utc", "")),
                 })
@@ -863,30 +948,58 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
             merged.append({
                 "reference_link": lk,
                 "sale_key": s["sale_key"],
-                "sale_date": s["sale_date"].isoformat(),
+                "sale_date": s["sale_date"].isoformat() if hasattr(s["sale_date"], "isoformat") else str(s["sale_date"]),
                 "price": float(s["price"]),
-                "grade_bucket": s["grade_bucket"],
-                "title": s["title"],
+                "grade_bucket": (s.get("grade_bucket") or "ungraded").lower(),
+                "title": s.get("title", ""),
                 "updated_utc": now_utc,
             })
 
+        # de-dupe by sale_key
         by_key = {}
         for m in merged:
-            if m["sale_key"]:
+            if m.get("sale_key"):
                 by_key[m["sale_key"]] = m
         merged2 = list(by_key.values())
 
-        def _parse_date(d):
-            try:
-                return pd.to_datetime(d, errors="coerce").date()
-            except Exception:
-                return None
+        def _parse_date_safe(d):
+            dd = _parse_iso_date(d)
+            return dd or date(1900, 1, 1)
 
-        merged2.sort(key=lambda x: (_parse_date(x.get("sale_date")) or date(1900,1,1), float(x.get("price", 0.0))), reverse=True)
-        merged2 = merged2[: int(keep_n)]
+        # keep last N per bucket
+        dfm = pd.DataFrame(merged2)
+        if dfm.empty:
+            continue
+        if "grade_bucket" not in dfm.columns:
+            dfm["grade_bucket"] = "ungraded"
+        if "sale_date" not in dfm.columns:
+            dfm["sale_date"] = ""
 
+        dfm["grade_bucket"] = dfm["grade_bucket"].astype(str).str.strip().str.lower()
+        dfm["sale_date_dt"] = dfm["sale_date"].apply(_parse_date_safe)
+        dfm["price_f"] = dfm["price"].apply(lambda v: safe_float(v, 0.0))
+
+        # sort newest first
+        dfm = dfm.sort_values(["grade_bucket", "sale_date_dt", "price_f"], ascending=[True, False, False])
+
+        kept_parts = []
+        for bucket in ["ungraded", "psa9", "psa10"]:
+            part = dfm[dfm["grade_bucket"] == bucket].copy()
+            if not part.empty:
+                kept_parts.append(part.head(int(keep_n)))
+        # also keep any unknown bucket just in case (limited)
+        other = dfm[~dfm["grade_bucket"].isin(["ungraded", "psa9", "psa10"])].copy()
+        if not other.empty:
+            kept_parts.append(other.head(5))
+
+        kept = pd.concat(kept_parts, ignore_index=True) if kept_parts else dfm.head(int(keep_n))
+
+        kept = kept.drop(columns=["sale_date_dt", "price_f"], errors="ignore")
+
+        # replace link section in sdf_out
         sdf_out = sdf_out[sdf_out["reference_link"].astype(str).str.strip() != lk].copy()
-        sdf_out = pd.concat([sdf_out, pd.DataFrame(merged2)], ignore_index=True)
+        sdf_out = pd.concat([sdf_out, kept[SALES_HISTORY_HEADERS_V2]], ignore_index=True)
+
         updated_links += 1
 
     if updated_links > 0:
@@ -895,7 +1008,6 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
                 sdf_out[c] = ""
         sdf_out = sdf_out[SALES_HISTORY_HEADERS_V2].copy()
 
-        # write sheet (header + data)
         _batch_write_sheet(sales_ws, sdf_out, SALES_HISTORY_HEADERS_V2)
         load_watchlist_gemrates_sales.clear()
 
@@ -907,6 +1019,10 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
 # =========================================================
 
 def _sales_stats_from_last10(sdf: pd.DataFrame, link: str, bucket: str) -> dict:
+    """
+    Stats from the stored sales history sheet.
+    Because we keep last 10 per bucket per link, this is effectively "last 10".
+    """
     if sdf is None or sdf.empty or not link:
         return {"count": 0, "min": 0.0, "max": 0.0, "avg": 0.0}
 
@@ -950,13 +1066,39 @@ def downside_penalty_psa9(buy_total: float, psa9_value: float) -> float:
         return 0.0
     return float(min(65.0, abs(roi9) * 200.0))
 
+def _range_ratio(min_v: float, max_v: float, avg_v: float) -> float:
+    """
+    Volatility proxy: (max-min)/avg.
+    """
+    avg_v = float(avg_v or 0.0)
+    min_v = float(min_v or 0.0)
+    max_v = float(max_v or 0.0)
+    if avg_v <= 0 or max_v <= 0:
+        return 0.0
+    return max(0.0, (max_v - min_v) / avg_v)
+
+def _conf_log_scale(x: float, target: float) -> float:
+    """
+    0..1 confidence from count using log scaling.
+    """
+    x = float(x or 0.0)
+    target = float(target or 1.0)
+    if x <= 0:
+        return 0.0
+    return float(min(1.0, math.log1p(x) / math.log1p(target)))
+
 def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame, grading_fee_assumption: float):
+    """
+    Produces the Analysis tab table:
+      - current prices (PriceCharting)
+      - last-10 sales stats (min/max/avg/count) for ungraded/psa9/psa10
+      - gemrates (total graded, psa10 count, gem rate)
+      - computed score + profit estimates based on Buy Basis + grading fee
+    """
     if wdf is None or wdf.empty:
         return pd.DataFrame()
 
     out = wdf.copy()
-
-    # Make sure no duplicate columns reach st.data_editor
     out = out.loc[:, ~out.columns.duplicated()].copy()
 
     for c in WATCHLIST_BASE_HEADERS:
@@ -976,10 +1118,10 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
         total = g.get("Total", 0)
 
         tmp = pd.DataFrame({
-            "__set": g_set.astype(str),
-            "__cardno": g_cardno.astype(str),
-            "__par": g_par.astype(str),
-            "__desc": g_desc.astype(str),
+            "__set": pd.Series(g_set).astype(str),
+            "__cardno": pd.Series(g_cardno).astype(str),
+            "__par": pd.Series(g_par).astype(str),
+            "__desc": pd.Series(g_desc).astype(str),
             "__gems": pd.Series(gems).apply(lambda x: safe_float(x, 0.0)),
             "__total": pd.Series(total).apply(lambda x: safe_float(x, 0.0)),
         })
@@ -1001,7 +1143,7 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
             if base_stats is None:
                 return 0.0, 0.0, 0.0
 
-            # optional filter by parallel within tmp
+            # optional filter by parallel within tmp (contains match)
             m = tmp[(tmp["__set"].apply(_norm_set) == setn) & (tmp["__cardno"].astype(str).str.strip() == cardno)].copy()
             if not m.empty and par:
                 par_l = par.lower()
@@ -1023,7 +1165,7 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
         out["# PSA 10"] = 0.0
         out["Gem Rate"] = 0.0
 
-    # ---- PriceCharting prices ----
+    # ---- PriceCharting current prices ----
     def _get_prices(link):
         link = _norm(link)
         if not link or "pricecharting.com" not in link.lower():
@@ -1036,7 +1178,7 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
     out["PSA 9"] = prices.apply(lambda t: float(t[1]))
     out["PSA 10"] = prices.apply(lambda t: float(t[2]))
 
-    # ---- Sales stats from stored sales-history sheet (last 10) ----
+    # ---- Sales stats from stored sales-history sheet (last 10 per bucket) ----
     for c in [
         "ungraded_sales_30d", "ungraded_min_30d", "ungraded_max_30d", "ungraded_avg_30d",
         "psa9_sales_30d", "psa9_min_30d", "psa9_max_30d", "psa9_avg_30d",
@@ -1079,25 +1221,53 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
 
     out["Image"] = out.apply(_img, axis=1)
 
-    # ---- Scoring ----
+    # ---- Scoring / profitability ----
     fee = float(grading_fee_assumption or 0.0)
     out["Target Buy Price"] = out["Target Buy Price"].apply(lambda v: safe_float(v, 0.0))
     out["Max Buy Price"] = out["Max Buy Price"].apply(lambda v: safe_float(v, 0.0))
+
+    def _choose_market_value(row, bucket: str) -> float:
+        """
+        Use last-10 avg first (because it's *actual* sold comps),
+        fallback to PriceCharting current price.
+        """
+        if bucket == "ungraded":
+            v = safe_float(row.get("ungraded_avg_30d", 0.0), 0.0)
+            if v > 0:
+                return float(v)
+            return float(safe_float(row.get("Ungraded", 0.0), 0.0))
+        if bucket == "psa9":
+            v = safe_float(row.get("psa9_avg_30d", 0.0), 0.0)
+            if v > 0:
+                return float(v)
+            return float(safe_float(row.get("PSA 9", 0.0), 0.0))
+        if bucket == "psa10":
+            v = safe_float(row.get("psa10_avg_30d", 0.0), 0.0)
+            if v > 0:
+                return float(v)
+            return float(safe_float(row.get("PSA 10", 0.0), 0.0))
+        return 0.0
 
     def _buy_basis(row):
         tb = float(safe_float(row.get("Target Buy Price", 0.0), 0.0))
         if tb > 0:
             return tb
+        # fallback to last-10 ungraded avg
         uavg = float(safe_float(row.get("ungraded_avg_30d", 0.0), 0.0))
         if uavg > 0:
             return uavg
+        # fallback to current raw
         return float(safe_float(row.get("Ungraded", 0.0), 0.0))
 
     out["Buy Basis (Raw)"] = out.apply(_buy_basis, axis=1)
     out["All-in Cost (Buy+Fee)"] = (out["Buy Basis (Raw)"].astype(float) + fee).round(2)
 
-    out["Profit PSA 10"] = (out["PSA 10"].astype(float) - out["All-in Cost (Buy+Fee)"].astype(float)).round(2)
-    out["Profit PSA 9"] = (out["PSA 9"].astype(float) - out["All-in Cost (Buy+Fee)"].astype(float)).round(2)
+    # compute "expected" PSA9/PSA10 values from last-10 avg (fallback current)
+    out["_psa9_est"] = out.apply(lambda r: _choose_market_value(r, "psa9"), axis=1)
+    out["_psa10_est"] = out.apply(lambda r: _choose_market_value(r, "psa10"), axis=1)
+
+    out["Profit PSA 10"] = (out["_psa10_est"].astype(float) - out["All-in Cost (Buy+Fee)"].astype(float)).round(2)
+    out["Profit PSA 9"] = (out["_psa9_est"].astype(float) - out["All-in Cost (Buy+Fee)"].astype(float)).round(2)
 
     def _roi(profit, cost):
         cost = float(cost or 0.0)
@@ -1111,56 +1281,125 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
     current_year = date.today().year
 
     def _score(row) -> float:
+        """
+        Scoring philosophy aligned to your guidelines:
+
+        Positive drivers:
+          - upside: profit/ROI in PSA10
+          - downside coverage: PSA9 profit close to breakeven (or better)
+          - low capital requirement
+
+        Confidence multipliers / penalties:
+          - penalize low graded population (Total Graded)
+          - penalize low sales counts per bucket (especially psa10)
+          - penalize wide price ranges (volatility) in comps
+        """
         cost = float(safe_float(row.get("All-in Cost (Buy+Fee)"), 0.0))
+        if cost <= 0:
+            return 0.0
+
+        profit10 = float(safe_float(row.get("Profit PSA 10"), 0.0))
         profit9 = float(safe_float(row.get("Profit PSA 9"), 0.0))
         roi10 = float(safe_float(row.get("ROI PSA 10"), 0.0))
 
+        # counts
         psa10_sales = float(safe_float(row.get("psa10_sales_30d", 0.0), 0.0))
+        psa9_sales = float(safe_float(row.get("psa9_sales_30d", 0.0), 0.0))
+        raw_sales = float(safe_float(row.get("ungraded_sales_30d", 0.0), 0.0))
+
         total_graded = float(safe_float(row.get("Total Graded", 0.0), 0.0))
         gem_rate = float(safe_float(row.get("Gem Rate", 0.0), 0.0))
 
-        sales_conf = min(1.0, math.log1p(psa10_sales) / math.log1p(10.0)) if psa10_sales > 0 else 0.0
-        gem_conf = min(1.0, math.log1p(total_graded) / math.log1p(5000.0)) if total_graded > 0 else 0.0
+        # volatility proxies
+        u_rr = _range_ratio(
+            safe_float(row.get("ungraded_min_30d", 0.0), 0.0),
+            safe_float(row.get("ungraded_max_30d", 0.0), 0.0),
+            safe_float(row.get("ungraded_avg_30d", 0.0), 0.0),
+        )
+        p9_rr = _range_ratio(
+            safe_float(row.get("psa9_min_30d", 0.0), 0.0),
+            safe_float(row.get("psa9_max_30d", 0.0), 0.0),
+            safe_float(row.get("psa9_avg_30d", 0.0), 0.0),
+        )
+        p10_rr = _range_ratio(
+            safe_float(row.get("psa10_min_30d", 0.0), 0.0),
+            safe_float(row.get("psa10_max_30d", 0.0), 0.0),
+            safe_float(row.get("psa10_avg_30d", 0.0), 0.0),
+        )
 
+        # --- Base components (0..100-ish) ---
+        # Upside: focus on ROI and absolute profit (both matter)
         roi10_clamped = max(-0.50, min(3.00, roi10))
-        roi_component = (roi10_clamped + 0.50) * 40.0
-        roi_weighted = roi_component * (0.60 + 0.40 * sales_conf)
+        roi_component = (roi10_clamped + 0.50) * 30.0  # 0..105
+        profit_component = max(-40.0, min(60.0, profit10))  # -40..60
 
-        gem_component = (gem_rate * 30.0) * (0.40 + 0.60 * gem_conf)
-        sales_component = 20.0 * sales_conf
+        # Downside coverage: reward PSA9 being near breakeven
+        # Map profit9 from [-0.5*cost .. +0.25*cost] to [0..25]
+        p9_floor = -0.50 * cost
+        p9_ceil = 0.25 * cost
+        p9_norm = (profit9 - p9_floor) / (p9_ceil - p9_floor) if (p9_ceil - p9_floor) else 0.0
+        p9_component = max(0.0, min(1.0, p9_norm)) * 25.0
 
-        cap_component = 0.0
-        if cost > 0:
-            cap_component = 20.0 * (1.0 / (1.0 + (cost / 120.0)))
+        # Capital efficiency: cheaper all-in cost is better (softly)
+        cap_component = 20.0 * (1.0 / (1.0 + (cost / 120.0)))  # ~20 at small cost, decays
 
+        # Small gem-rate boost (only if you have pop)
+        gem_component = 0.0
+        if total_graded > 0:
+            gem_component = min(10.0, max(0.0, gem_rate) * 20.0)  # up to +10
+
+        base = roi_component + profit_component + p9_component + cap_component + gem_component
+
+        # --- Confidence multipliers ---
+        # graded population confidence (target: 2000 graded to be "high confidence")
+        pop_conf = _conf_log_scale(total_graded, 2000.0)
+        # sales confidence (target: 10 sales in each bucket)
+        s10_conf = _conf_log_scale(psa10_sales, 10.0)
+        s9_conf = _conf_log_scale(psa9_sales, 10.0)
+        sr_conf = _conf_log_scale(raw_sales, 10.0)
+
+        # prioritize psa10 sales confidence, then pop, then others
+        conf = 0.55 * s10_conf + 0.25 * pop_conf + 0.10 * s9_conf + 0.10 * sr_conf
+        conf = max(0.0, min(1.0, conf))
+
+        # --- Volatility penalty (wide range hurts confidence/score) ---
+        # Weight PSA10 comps most heavily.
+        vol = 0.55 * p10_rr + 0.25 * p9_rr + 0.20 * u_rr
+        # penalty grows quickly after ~0.6 range ratio
+        vol_pen = min(30.0, max(0.0, (vol - 0.30) * 35.0))
+
+        # --- Age penalty (optional; mild) ---
         rel_year = int(safe_float(row.get("Release Year", 0), 0.0) or 0)
         age_pen = 0.0
         if 1995 <= rel_year <= current_year:
             years_old = max(0, current_year - rel_year)
-            age_pen = min(20.0, years_old * 2.0)
+            age_pen = min(10.0, years_old * 0.75)
 
-        psa9_value = float(safe_float(row.get("PSA 9", 0.0), 0.0))
-        down_pen = downside_penalty_psa9(cost, psa9_value)
-        if cost > 0 and profit9 < 0:
-            down_pen += min(20.0, (abs(profit9) / cost) * 60.0)
+        # --- Downside penalty if PSA9 is negative (extra beyond the component) ---
+        down_pen = downside_penalty_psa9(cost, float(safe_float(row.get("_psa9_est", 0.0), 0.0)))
 
-        raw_score = roi_weighted + gem_component + sales_component + cap_component - age_pen - down_pen
+        raw_score = (base * (0.55 + 0.45 * conf)) - vol_pen - age_pen - (0.25 * down_pen)
         return float(max(0.0, raw_score))
 
     out["Grading Score"] = out.apply(_score, axis=1).round(2)
     out["Gem Rate"] = out["Gem Rate"].astype(float).round(4)
 
+    # cleanup internal cols
+    out.drop(columns=["_psa9_est", "_psa10_est"], inplace=True, errors="ignore")
+
+    # preferred display order (your "efficient evaluation table")
     front = [
         "Image",
         "Generation", "Set", "Card Name", "Card No", "Parallel",
         "Target Buy Price", "Max Buy Price",
         "Buy Basis (Raw)", "All-in Cost (Buy+Fee)",
         "Ungraded", "PSA 9", "PSA 10",
+        "ungraded_min_30d", "ungraded_max_30d", "ungraded_avg_30d", "ungraded_sales_30d",
+        "psa9_min_30d", "psa9_max_30d", "psa9_avg_30d", "psa9_sales_30d",
+        "psa10_min_30d", "psa10_max_30d", "psa10_avg_30d", "psa10_sales_30d",
         "Profit PSA 9", "Profit PSA 10",
         "ROI PSA 9", "ROI PSA 10",
         "Total Graded", "# PSA 10", "Gem Rate",
-        "psa10_sales_30d", "psa9_sales_30d", "ungraded_sales_30d",
-        "psa10_min_30d", "psa10_max_30d", "psa10_avg_30d",
         "Grading Score",
         "Release Year",
         "Link", "Pic", "Notes",
@@ -1185,7 +1424,6 @@ def write_enriched_watchlist(view_df: pd.DataFrame):
 
     df2 = view_df.copy().loc[:, ~view_df.columns.duplicated()].copy()
 
-    # guarantee enrich cols exist
     needed = set(WATCHLIST_BASE_HEADERS + WATCHLIST_ENRICH_HEADERS)
     for c in needed:
         if c not in df2.columns:
@@ -1224,7 +1462,7 @@ tab_analysis, tab_submit, tab_update, tab_summary = st.tabs(
 )
 
 with tab_analysis:
-    st.subheader("Grading Watch List (GemRates + PriceCharting + Last 10 Sales)")
+    st.subheader("Grading Watch List (GemRates + PriceCharting + Sold Comps: last 10 per condition)")
 
     fee_assumption = st.number_input(
         "Assumed grading fee (per card)",
@@ -1238,16 +1476,14 @@ with tab_analysis:
 
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
-        if st.button("📈 Refresh sales history (keep last 10 per link)", width="stretch", disabled=(wdf is None or wdf.empty)):
+        if st.button("📈 Refresh sales history (keep last 10 per link per condition)", width="stretch", disabled=(wdf is None or wdf.empty)):
             n = update_sales_history_incremental(wdf, keep_n=10)
             st.success(f"Updated sales history for {n} link(s).")
             st.rerun()
 
     with c2:
-        if st.button("🔄 Refresh & write Watchlist (prices + gemrates + sales + image + score)", width="stretch", disabled=(wdf is None or wdf.empty)):
-            # refresh sales first (this populates your database sheet)
+        if st.button("🔄 Refresh & write Watchlist (prices + gemrates + comps + image + score)", width="stretch", disabled=(wdf is None or wdf.empty)):
             _ = update_sales_history_incremental(wdf, keep_n=10)
-            # reload sales df, then compute all stats
             wdf2, gdf2, sdf2 = load_watchlist_gemrates_sales()
             view = build_watchlist_view(wdf2, gdf2, sdf2, fee_assumption)
             write_enriched_watchlist(view)
@@ -1255,7 +1491,7 @@ with tab_analysis:
             st.rerun()
 
     with c3:
-        st.caption("If Image is blank, add a direct image URL in Pic, or click refresh again after throttling.")
+        st.caption("Tip: Scores prefer strong PSA10 upside, decent PSA9 downside coverage, lower all-in cost, and higher confidence (more graded pop + more comps + tighter price ranges).")
 
     if wdf is None or wdf.empty:
         st.info(f"No rows found in '{WATCHLIST_WS_NAME}'. Expected headers: {', '.join(WATCHLIST_BASE_HEADERS)}")
@@ -1288,7 +1524,6 @@ with tab_analysis:
         )
 
         if st.button("💾 Save Watch List (manual edits only)", type="primary", width="stretch"):
-            # write back edited base+enrich columns; this does NOT re-scrape, it saves what you see
             write_enriched_watchlist(edited)
             st.success("Saved.")
             st.rerun()
