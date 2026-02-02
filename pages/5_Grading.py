@@ -333,10 +333,15 @@ def _read_sheet_df(ws) -> pd.DataFrame:
     values = ws.get_all_values()
     if not values:
         return pd.DataFrame()
-    header = [str(h).strip() for h in values[0]]
-    rows = values[1:]
-    if not header or all(h == "" for h in header):
+
+    raw_header = values[0] if values else []
+    if not raw_header or all(str(h).strip() == "" for h in raw_header):
         return pd.DataFrame()
+
+    # ✅ Make headers stable/unique (prevents duplicate-key crashes)
+    header = _build_stable_unique_headers(raw_header)
+
+    rows = values[1:]
     out_rows = []
     for r in rows:
         if len(r) < len(header):
@@ -344,7 +349,13 @@ def _read_sheet_df(ws) -> pd.DataFrame:
         elif len(r) > len(header):
             r = r[:len(header)]
         out_rows.append(r)
-    return pd.DataFrame(out_rows, columns=header)
+
+    df = pd.DataFrame(out_rows, columns=header)
+
+    # ✅ Optional safety: remove duplicated columns if any still slip through
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+    return df
+
 
 def _batch_write_sheet(ws, df: pd.DataFrame, header: list[str]):
     df2 = df.copy()
@@ -759,6 +770,11 @@ def load_watchlist_gemrates_sales():
     wdf = _read_sheet_df(watch_ws)
     gdf = _read_sheet_df(gem_ws)
     sdf = _read_sheet_df(sales_ws)
+
+    wdf = wdf.loc[:, ~wdf.columns.duplicated()].copy() if not wdf.empty else wdf
+    gdf = gdf.loc[:, ~gdf.columns.duplicated()].copy() if not gdf.empty else gdf
+    sdf = sdf.loc[:, ~sdf.columns.duplicated()].copy() if not sdf.empty else sdf
+
 
     return wdf, gdf, sdf
 
@@ -1528,10 +1544,14 @@ with tab_analysis:
         st.warning("Sales history sheet is empty. Click '📈 Refresh sales history' to populate.")
     else:
         st.caption(f"Sales history rows loaded: {len(sdf):,}")
+        # ✅ dedupe columns defensively
+        sdf = sdf.loc[:, ~sdf.columns.duplicated()].copy()
+
         if "updated_utc" in sdf.columns:
-            latest_ts = pd.to_datetime(sdf["updated_utc"], errors="coerce").max()
+            latest_ts = pd.to_datetime(sdf["updated_utc"].astype(str), errors="coerce").max()
             if pd.notna(latest_ts):
                 st.caption(f"Latest sales refresh (UTC): {latest_ts}")
+
 
 
 
