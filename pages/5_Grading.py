@@ -944,17 +944,80 @@ if not eligible_inv.empty:
 
 
 # =========================================================
-# WATCH LIST + GEMRATES (Analysis tab overhaul)
+# WATCH LIST + GEMRATES + SALES HISTORY (Analysis tab overhaul)
+#   - Watchlist tab: grading_watch_list
+#   - GemRates tab:  gemrates
+#   - Sales history tab: grading_sales_history (snapshot of last-30d stats)
 # =========================================================
+
+import math
 
 WATCHLIST_WS_NAME = st.secrets.get("grading_watchlist_worksheet", "grading_watch_list")
 GEMRATES_WS_NAME = st.secrets.get("gemrates_worksheet", "gemrates")
+GRADING_SALES_HISTORY_WS_NAME = st.secrets.get("grading_sales_history_worksheet", "grading_sales_history")
+
+# --- Headers (create tabs if missing) ---
+WATCHLIST_HEADERS = [
+    "Generation",
+    "Set",
+    "Card Name",
+    "Card No",
+    "Link",
+    "Parallel",
+    "Pic",               # optional (if blank, we'll try to pull from PriceCharting og:image)
+    "Release Year",      # optional (used for "older set" penalty)
+    "Target Buy Price",
+    "Max Buy Price",
+    "Notes",
+]
+
+GEMRATES_HEADERS = [
+    "Key",
+    "Generation",
+    "Set Name",
+    "Parallel",
+    "Card #",
+    "Card Description",
+    "Gems",
+    "Total",
+    "Gem Rate - All Time",
+]
+
+SALES_HISTORY_HEADERS = [
+    "run_utc",
+    "generation",
+    "set",
+    "card_name",
+    "card_no",
+    "reference_link",
+
+    "ungraded_sales_30d",
+    "ungraded_min_30d",
+    "ungraded_max_30d",
+    "ungraded_avg_30d",
+
+    "psa9_sales_30d",
+    "psa9_min_30d",
+    "psa9_max_30d",
+    "psa9_avg_30d",
+
+    "psa10_sales_30d",
+    "psa10_min_30d",
+    "psa10_max_30d",
+    "psa10_avg_30d",
+]
 
 def _norm(s) -> str:
     return "" if s is None else str(s).strip()
 
+def _norm_set(s: str) -> str:
+    # normalize set strings so "Scarlet & Violet 151" / "151" have a better shot
+    t = _norm(s).lower()
+    t = re.sub(r"\s+", " ", t)
+    t = t.replace("’", "'")
+    return t
+
 def _norm_key(*parts) -> str:
-    # simple stable join key
     out = []
     for p in parts:
         out.append(_norm(p).lower())
@@ -969,7 +1032,6 @@ def _safe_num(x, default=0.0) -> float:
         s = str(x).strip().replace("$", "").replace(",", "")
         if s == "":
             return default
-        # handle "39%" style
         if s.endswith("%"):
             return float(s[:-1]) / 100.0
         return float(s)
@@ -979,10 +1041,14 @@ def _safe_num(x, default=0.0) -> float:
 def _get_ws_or_create(sheet, name: str, headers: list[str], cols_hint: int = 26, rows_hint: int = 2000):
     """
     Creates worksheet if missing; writes header row once.
-    This is ONE-TIME setup; no repeated header "repair" to avoid quota issues.
+    Avoids repeated "repair" to keep writes low.
     """
     try:
         ws = sheet.worksheet(name)
+        # if empty sheet, write headers
+        vals = ws.get_all_values()
+        if not vals or not vals[0] or all(str(x).strip() == "" for x in vals[0]):
+            ws.update(range_name="1:1", values=[headers], value_input_option="RAW")
         return ws
     except Exception:
         ws = sheet.add_worksheet(title=name, rows=str(rows_hint), cols=str(max(cols_hint, len(headers) + 5)))
@@ -997,7 +1063,6 @@ def _read_sheet_df(ws) -> pd.DataFrame:
     rows = values[1:]
     if not header or all(h == "" for h in header):
         return pd.DataFrame()
-    # pad / trim rows
     out_rows = []
     for r in rows:
         if len(r) < len(header):
@@ -1014,7 +1079,6 @@ def _batch_write_sheet(ws, df: pd.DataFrame, header: list[str]):
     if df is None:
         return
     df2 = df.copy()
-    # ensure all header cols exist
     for c in header:
         if c not in df2.columns:
             df2[c] = ""
@@ -1037,6 +1101,7 @@ def _col(df: pd.DataFrame, *names, default=""):
         key = str(n).strip().lower()
         if key in norm_map:
             return df[norm_map[key]]
+
     # fuzzy contains match (useful for "Gem Rate - All Time")
     for n in names:
         key = str(n).strip().lower()
@@ -1045,120 +1110,341 @@ def _col(df: pd.DataFrame, *names, default=""):
                 return df[real]
     return pd.Series([default] * len(df))
 
+# -------------------------
+# PriceCharting sold-sales scrape (last 30d snapshot)
+# -------------------------
+
+def _to_float_price(s: str) -> float:
+    try:
+        if s is None:
+            return 0.0
+        t = str(s).replace("$", "").replace(",", "").strip()
+        return float(t) if t else 0.0
+    except Exception:
+        return 0.0
+
+def _classify_grade_from_title(title: str) -> str:
+    t = (title or "").upper()
+    if re.search(r"\bPSA\s*10\b", t) or re.search(r"\bGEM\s*MINT\s*10\b", t) or re.search(r"\bGEM\s*MT\s*10\b", t):
+        return "psa10"
+    if re.search(r"\bPSA\s*9\b", t) or re.search(r"\bMINT\s*9\b", t):
+        return "psa9"
+    return "ungraded"
+
+@st.cache_data(ttl=60 * 60 * 6)
+def fetch_pricecharting_sold_sales_last_60d(reference_link: str) -> list[dict]:
+    """
+    Returns list of dicts: {date, price, grade_bucket, title}
+    Scrapes visible sold listing lines on the PriceCharting page.
+    """
+    link = (reference_link or "").strip()
+    if not link or "pricecharting.com" not in link.lower():
+        return []
+
+    headers = {"User-Agent": "Mozilla/5.0 (CardTracker; +Streamlit)"}
+    r = requests.get(link, headers=headers, timeout=15)
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "lxml")
+    text = soup.get_text("\n", strip=True)
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+
+    sales = []
+    date_re = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
+    price_re = re.compile(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
+
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if ("$" in ln) and ("[EBAY]" in ln.upper() or "[GOLDIN]" in ln.upper() or "[PWCC]" in ln.upper() or "[TCGPLAYER]" in ln.upper()):
+            title = ln.split("[", 1)[0].strip()
+            pm = price_re.search(ln)
+            price = _to_float_price(pm.group(1)) if pm else 0.0
+
+            sale_date = None
+            for j in range(i, min(i + 4, len(lines))):
+                dm = date_re.search(lines[j])
+                if dm:
+                    sale_date = pd.to_datetime(dm.group(1), errors="coerce").date()
+                    break
+
+            if sale_date and price > 0:
+                bucket = _classify_grade_from_title(title)
+                sales.append({"date": sale_date, "price": price, "grade_bucket": bucket, "title": title})
+        i += 1
+
+    return sales
+
+def _sales_stats_for_bucket(sales: list[dict], bucket: str, days: int = 30) -> dict:
+    today = date.today()
+    cutoff = today - timedelta(days=days)
+
+    prices = [
+        float(x["price"])
+        for x in sales
+        if x.get("grade_bucket") == bucket and x.get("date") and x["date"] >= cutoff
+    ]
+    if not prices:
+        return {"count": 0, "min": 0.0, "max": 0.0, "avg": 0.0}
+    return {
+        "count": int(len(prices)),
+        "min": float(min(prices)),
+        "max": float(max(prices)),
+        "avg": float(sum(prices) / len(prices)),
+    }
+
+# -------------------------
+# Card image: prefer watchlist Pic, else pull og:image from PriceCharting
+# -------------------------
+
+@st.cache_data(ttl=60 * 60 * 24)
+def fetch_pricecharting_image_url(reference_link: str) -> str:
+    link = (reference_link or "").strip()
+    if not link or "pricecharting.com" not in link.lower():
+        return ""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (CardTracker; +Streamlit)"}
+        r = requests.get(link, headers=headers, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+        meta = soup.find("meta", attrs={"property": "og:image"})
+        if meta and meta.get("content"):
+            return str(meta.get("content")).strip()
+        return ""
+    except Exception:
+        return ""
+
+# -------------------------
+# Downside protection (PSA9 break-even)
+# -------------------------
+
+def downside_penalty_psa9(buy_total: float, psa9_value: float) -> float:
+    """
+    Penalty if PSA9 outcome loses money.
+    Break-even/profit => 0. Loss => grows quickly, capped.
+    """
+    buy_total = float(buy_total or 0.0)
+    psa9_value = float(psa9_value or 0.0)
+    if buy_total <= 0:
+        return 0.0
+    profit9 = psa9_value - buy_total
+    roi9 = profit9 / buy_total
+    if roi9 >= 0:
+        return 0.0
+    return float(min(65.0, abs(roi9) * 200.0))
+
 @st.cache_data(ttl=60)
-def load_watchlist_and_gemrates():
+def load_watchlist_gemrates_sales():
     client = get_gspread_client()
     sh = client.open_by_key(st.secrets["spreadsheet_id"])
 
-    # minimal starter headers to create sheets if missing
-    watch_headers = ["Generation", "Set", "Card Name", "Card No", "Link", "Parallel", "Target Buy Price", "Max Buy Price", "Notes"]
-    gem_headers = ["Key", "Generation", "Set Name", "Parallel", "Card #", "Card Description", "Gems", "Total", "Gem Rate - All Time"]
-
-    watch_ws = _get_ws_or_create(sh, WATCHLIST_WS_NAME, watch_headers, cols_hint=30)
-    gem_ws = _get_ws_or_create(sh, GEMRATES_WS_NAME, gem_headers, cols_hint=30)
+    watch_ws = _get_ws_or_create(sh, WATCHLIST_WS_NAME, WATCHLIST_HEADERS, cols_hint=40)
+    gem_ws = _get_ws_or_create(sh, GEMRATES_WS_NAME, GEMRATES_HEADERS, cols_hint=40)
+    sales_ws = _get_ws_or_create(sh, GRADING_SALES_HISTORY_WS_NAME, SALES_HISTORY_HEADERS, cols_hint=60, rows_hint=4000)
 
     wdf = _read_sheet_df(watch_ws)
     gdf = _read_sheet_df(gem_ws)
+    sdf = _read_sheet_df(sales_ws)
 
-    return wdf, gdf
+    return wdf, gdf, sdf
 
-def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, grading_fee_assumption: float):
+def update_sales_history_from_watchlist(wdf: pd.DataFrame):
     """
-    Returns a dataframe to display:
-    - base watch list columns
-    - merged gemrate stats
-    - pricecharting prices (raw/psa9/psa10)
+    Writes a snapshot (overwrite) to grading_sales_history with last-30d sales stats for each watchlist row.
+    ONE sheet write for the whole table.
+    """
+    if wdf is None or wdf.empty:
+        return 0
+
+    client = get_gspread_client()
+    sh = client.open_by_key(st.secrets["spreadsheet_id"])
+    sales_ws = _get_ws_or_create(sh, GRADING_SALES_HISTORY_WS_NAME, SALES_HISTORY_HEADERS, cols_hint=60, rows_hint=4000)
+
+    out_rows = []
+    run_utc = datetime.utcnow().isoformat()
+
+    # Ensure required cols exist
+    for c in ["Generation", "Set", "Card Name", "Card No", "Link"]:
+        if c not in wdf.columns:
+            wdf[c] = ""
+
+    for _, r in wdf.iterrows():
+        link = _norm(r.get("Link", ""))
+        if not link or "pricecharting.com" not in link.lower():
+            continue
+
+        sales = fetch_pricecharting_sold_sales_last_60d(link)
+        u = _sales_stats_for_bucket(sales, "ungraded", days=30)
+        p9 = _sales_stats_for_bucket(sales, "psa9", days=30)
+        p10 = _sales_stats_for_bucket(sales, "psa10", days=30)
+
+        out_rows.append({
+            "run_utc": run_utc,
+            "generation": _norm(r.get("Generation", "")),
+            "set": _norm(r.get("Set", "")),
+            "card_name": _norm(r.get("Card Name", "")),
+            "card_no": _norm(r.get("Card No", "")),
+            "reference_link": link,
+
+            "ungraded_sales_30d": u["count"],
+            "ungraded_min_30d": round(u["min"], 2),
+            "ungraded_max_30d": round(u["max"], 2),
+            "ungraded_avg_30d": round(u["avg"], 2),
+
+            "psa9_sales_30d": p9["count"],
+            "psa9_min_30d": round(p9["min"], 2),
+            "psa9_max_30d": round(p9["max"], 2),
+            "psa9_avg_30d": round(p9["avg"], 2),
+
+            "psa10_sales_30d": p10["count"],
+            "psa10_min_30d": round(p10["min"], 2),
+            "psa10_max_30d": round(p10["max"], 2),
+            "psa10_avg_30d": round(p10["avg"], 2),
+        })
+
+    if not out_rows:
+        return 0
+
+    df = pd.DataFrame(out_rows)
+    _batch_write_sheet(sales_ws, df, SALES_HISTORY_HEADERS)
+    load_watchlist_gemrates_sales.clear()
+    fetch_pricecharting_sold_sales_last_60d.clear()
+    return len(df)
+
+def build_watchlist_view(
+    wdf: pd.DataFrame,
+    gdf: pd.DataFrame,
+    sdf: pd.DataFrame,
+    grading_fee_assumption: float,
+):
+    """
+    Display DF includes:
+      - watchlist source fields
+      - Image
+      - gemrates: Total Graded, # PSA 10, Gem Rate
+      - pricecharting current: Ungraded, PSA 9, PSA 10
+      - sales last 30d snapshot: min/max/avg/count for ungraded/psa9/psa10
+      - grading score w/ downside protection
     """
     if wdf is None or wdf.empty:
         return pd.DataFrame()
 
     out = wdf.copy()
 
-    # normalize / ensure required columns exist
-    for c in ["Generation", "Set", "Card Name", "Card No", "Link", "Parallel", "Target Buy Price", "Max Buy Price", "Notes"]:
+    # ensure required columns exist
+    for c in WATCHLIST_HEADERS:
         if c not in out.columns:
             out[c] = ""
 
     # -------------------------
-    # Build GemRates aggregation
+    # Build GemRates aggregation (robust matching)
     # -------------------------
-    gem_agg = pd.DataFrame()
+    # Strategy:
+    #   Try match by (generation + set + card# + parallel) where possible.
+    #   If Parallel blank, match by (generation + set + card#) across all gemrate rows.
+    #   Also allow Parallel matching against Card Description.
+    gem_lookup = {}
+    base_lookup = {}
+
     if gdf is not None and not gdf.empty:
-        gen = _col(gdf, "Generation")
-        setn = _col(gdf, "Set Name", "Set")
-        cardno = _col(gdf, "Card #", "Card No")
-        par = _col(gdf, "Parallel", "Variant")
+        g_gen = _col(gdf, "Generation").astype(str)
+        g_set = _col(gdf, "Set Name", "Set").astype(str)
+        g_cardno = _col(gdf, "Card #", "Card No").astype(str)
+        g_par = _col(gdf, "Parallel", "Variant").astype(str)
+        g_desc = _col(gdf, "Card Description", "Description").astype(str)
 
         gems = _col(gdf, "Gems")
         total = _col(gdf, "Total")
-        # if the sheet already has a % string column we can still recompute from Gems/Total
-        gems_f = gems.apply(lambda x: _safe_num(x, 0.0))
-        total_f = total.apply(lambda x: _safe_num(x, 0.0))
+
+        g_gems = gems.apply(lambda x: _safe_num(x, 0.0))
+        g_total = total.apply(lambda x: _safe_num(x, 0.0))
 
         tmp = pd.DataFrame({
-            "__gen": gen.astype(str),
-            "__set": setn.astype(str),
-            "__cardno": cardno.astype(str),
-            "__par": par.astype(str),
-            "__gems": gems_f,
-            "__total": total_f,
+            "__gen": g_gen,
+            "__set": g_set,
+            "__cardno": g_cardno,
+            "__par": g_par,
+            "__desc": g_desc,
+            "__gems": g_gems,
+            "__total": g_total,
         })
 
-        # aggregate by gen/set/cardno (and parallel when present)
-        tmp["__k_full"] = tmp.apply(lambda r: _norm_key(r["__gen"], r["__set"], r["__cardno"], r["__par"]), axis=1)
-        tmp["__k_base"] = tmp.apply(lambda r: _norm_key(r["__gen"], r["__set"], r["__cardno"]), axis=1)
-
-        # full key aggregation (parallel-specific)
-        full = tmp.groupby("__k_full", as_index=False).agg(
-            total_graded=("__total", "sum"),
-            psa10_count=("__gems", "sum"),
-        )
-        full["gem_rate"] = full.apply(lambda r: (r["psa10_count"] / r["total_graded"]) if r["total_graded"] else 0.0, axis=1)
-
-        # base key aggregation (all parallels combined) — fallback if watchlist has no Parallel
+        # base aggregation (all rows per gen/set/cardno)
+        tmp["__k_base"] = tmp.apply(lambda r: _norm_key(_norm_set(r["__gen"]), _norm_set(r["__set"]), _norm(r["__cardno"])), axis=1)
         base = tmp.groupby("__k_base", as_index=False).agg(
             total_graded=("__total", "sum"),
             psa10_count=("__gems", "sum"),
         )
         base["gem_rate"] = base.apply(lambda r: (r["psa10_count"] / r["total_graded"]) if r["total_graded"] else 0.0, axis=1)
+        base_lookup = base.set_index("__k_base").to_dict("index")
 
-        gem_agg = {"full": full, "base": base}
+        # "full" lookup cannot be a simple group because watchlist parallel might match description.
+        # We'll keep tmp for row-wise filtering in _pick_gem_stats().
+        tmp["_tmp_idx"] = range(len(tmp))
+        gem_lookup["_tmp"] = tmp
 
-    # build watch keys
-    out["__k_full"] = out.apply(lambda r: _norm_key(r["Generation"], r["Set"], r["Card No"], r.get("Parallel", "")), axis=1)
-    out["__k_base"] = out.apply(lambda r: _norm_key(r["Generation"], r["Set"], r["Card No"]), axis=1)
+    def _pick_gem_stats(wrow) -> tuple[float, float, float]:
+        """
+        Returns: (total_graded, psa10_count, gem_rate)
+        """
+        gen = _norm_set(wrow.get("Generation", ""))
+        setn = _norm_set(wrow.get("Set", ""))
+        cardno = _norm(wrow.get("Card No", ""))
+        par = _norm(wrow.get("Parallel", ""))
 
-    # merge in gemrates (prefer full, else base)
+        kb = _norm_key(gen, setn, cardno)
+        base_stats = base_lookup.get(kb, None)
+
+        if not gem_lookup or "_tmp" not in gem_lookup:
+            if base_stats:
+                return float(base_stats["total_graded"]), float(base_stats["psa10_count"]), float(base_stats["gem_rate"])
+            return 0.0, 0.0, 0.0
+
+        tmp = gem_lookup["_tmp"]
+
+        # filter by base first
+        m = tmp[
+            (tmp["__gen"].astype(str).str.strip().str.lower().apply(_norm_set) == gen)
+            & (tmp["__set"].astype(str).str.strip().str.lower().apply(_norm_set) == setn)
+            & (tmp["__cardno"].astype(str).str.strip() == cardno)
+        ].copy()
+
+        if m.empty:
+            if base_stats:
+                return float(base_stats["total_graded"]), float(base_stats["psa10_count"]), float(base_stats["gem_rate"])
+            return 0.0, 0.0, 0.0
+
+        # if parallel provided, try match on Parallel OR Card Description contains it
+        if par:
+            par_l = par.lower()
+            m2 = m[
+                m["__par"].astype(str).str.lower().str.contains(par_l, na=False)
+                | m["__desc"].astype(str).str.lower().str.contains(par_l, na=False)
+            ].copy()
+            if not m2.empty:
+                m = m2
+
+        total_graded = float(m["__total"].sum())
+        psa10_count = float(m["__gems"].sum())
+        gem_rate = float((psa10_count / total_graded) if total_graded else 0.0)
+        return total_graded, psa10_count, gem_rate
+
     out["Total Graded"] = 0.0
     out["# PSA 10"] = 0.0
     out["Gem Rate"] = 0.0
 
-    if isinstance(gem_agg, dict):
-        full = gem_agg["full"].set_index("__k_full")
-        base = gem_agg["base"].set_index("__k_base")
-
-        def _pick(row, col):
-            kf = row["__k_full"]
-            kb = row["__k_base"]
-            if kf in full.index:
-                return float(full.loc[kf, col])
-            if kb in base.index:
-                return float(base.loc[kb, col])
-            return 0.0
-
-        out["Total Graded"] = out.apply(lambda r: _pick(r, "total_graded"), axis=1)
-        out["# PSA 10"] = out.apply(lambda r: _pick(r, "psa10_count"), axis=1)
-        out["Gem Rate"] = out.apply(lambda r: _pick(r, "gem_rate"), axis=1)
+    picked = out.apply(_pick_gem_stats, axis=1)
+    out["Total Graded"] = picked.apply(lambda t: float(t[0]))
+    out["# PSA 10"] = picked.apply(lambda t: float(t[1]))
+    out["Gem Rate"] = picked.apply(lambda t: float(t[2]))
 
     # -------------------------
-    # PriceCharting pull (raw/psa9/psa10)
+    # PriceCharting pull (current raw/psa9/psa10)
     # -------------------------
     out["Ungraded"] = 0.0
     out["PSA 9"] = 0.0
     out["PSA 10"] = 0.0
 
-    # IMPORTANT: do NOT fetch in a tight loop every rerun unless user asks;
-    # we’ll populate lazily using cache + only for valid links.
     def _get_prices(link):
         link = _norm(link)
         if not link or "pricecharting.com" not in link.lower():
@@ -1171,11 +1457,185 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, grading_fee_assum
     out["PSA 9"] = prices.apply(lambda t: float(t[1]))
     out["PSA 10"] = prices.apply(lambda t: float(t[2]))
 
-    # Basic derived column (you said ignore all the other calc columns for now)
-    out["Ungraded + Fee"] = out["Ungraded"].apply(float) + float(grading_fee_assumption)
+    # -------------------------
+    # Sales history merge (last-30d snapshot)
+    # -------------------------
+    for c in [
+        "ungraded_sales_30d", "ungraded_min_30d", "ungraded_max_30d", "ungraded_avg_30d",
+        "psa9_sales_30d", "psa9_min_30d", "psa9_max_30d", "psa9_avg_30d",
+        "psa10_sales_30d", "psa10_min_30d", "psa10_max_30d", "psa10_avg_30d",
+    ]:
+        out[c] = 0.0
 
-    # keep display clean
-    out = out.drop(columns=["__k_full", "__k_base"], errors="ignore")
+    if sdf is not None and not sdf.empty and "reference_link" in sdf.columns:
+        # most recent run per reference_link
+        sdf2 = sdf.copy()
+        sdf2["run_utc"] = sdf2.get("run_utc", "").astype(str)
+        sdf2["reference_link"] = sdf2["reference_link"].astype(str).str.strip()
+        # sort so newest run first
+        sdf2 = sdf2.sort_values("run_utc", ascending=False)
+
+        latest = sdf2.drop_duplicates(subset=["reference_link"], keep="first").copy()
+        latest = latest.set_index("reference_link")
+
+        def _merge_sales(row, col):
+            link = _norm(row.get("Link", ""))
+            if not link or link not in latest.index:
+                return 0.0
+            v = latest.loc[link].get(col, 0.0)
+            return _safe_num(v, 0.0)
+
+        for col in [
+            "ungraded_sales_30d", "ungraded_min_30d", "ungraded_max_30d", "ungraded_avg_30d",
+            "psa9_sales_30d", "psa9_min_30d", "psa9_max_30d", "psa9_avg_30d",
+            "psa10_sales_30d", "psa10_min_30d", "psa10_max_30d", "psa10_avg_30d",
+        ]:
+            out[col] = out.apply(lambda r: _merge_sales(r, col), axis=1)
+
+    # -------------------------
+    # Image column (prefer Pic, else PriceCharting og:image)
+    # -------------------------
+    def _img(row):
+        pic = _norm(row.get("Pic", ""))
+        if pic:
+            return pic
+        link = _norm(row.get("Link", ""))
+        if link and "pricecharting.com" in link.lower():
+            return fetch_pricecharting_image_url(link)
+        return ""
+
+    out["Image"] = out.apply(_img, axis=1)
+
+    # -------------------------
+    # Buy basis + risk/return
+    # -------------------------
+    fee = float(grading_fee_assumption or 0.0)
+    out["Target Buy Price"] = out["Target Buy Price"].apply(lambda v: _safe_num(v, 0.0))
+    out["Max Buy Price"] = out["Max Buy Price"].apply(lambda v: _safe_num(v, 0.0))
+
+    # choose buy basis:
+    # 1) Target Buy Price if provided
+    # 2) else last-30d ungraded avg if available
+    # 3) else current ungraded price
+    def _buy_basis(row):
+        tb = float(_safe_num(row.get("Target Buy Price", 0.0), 0.0))
+        if tb > 0:
+            return tb
+        uavg = float(_safe_num(row.get("ungraded_avg_30d", 0.0), 0.0))
+        if uavg > 0:
+            return uavg
+        return float(_safe_num(row.get("Ungraded", 0.0), 0.0))
+
+    out["Buy Basis (Raw)"] = out.apply(_buy_basis, axis=1)
+    out["All-in Cost (Buy+Fee)"] = (out["Buy Basis (Raw)"].astype(float) + fee).round(2)
+
+    out["Profit PSA 10"] = (out["PSA 10"].astype(float) - out["All-in Cost (Buy+Fee)"].astype(float)).round(2)
+    out["Profit PSA 9"] = (out["PSA 9"].astype(float) - out["All-in Cost (Buy+Fee)"].astype(float)).round(2)
+
+    def _roi(profit, cost):
+        cost = float(cost or 0.0)
+        if cost <= 0:
+            return 0.0
+        return float(profit) / cost
+
+    out["ROI PSA 10"] = out.apply(lambda r: _roi(r["Profit PSA 10"], r["All-in Cost (Buy+Fee)"]), axis=1)
+    out["ROI PSA 9"] = out.apply(lambda r: _roi(r["Profit PSA 9"], r["All-in Cost (Buy+Fee)"]), axis=1)
+
+    # -------------------------
+    # Grading score (with downside protection)
+    # Weighted by:
+    #   - ROI10 (primary)
+    #   - PSA10 sales_30d (confidence in PSA10 price)
+    #   - capital required (lower = better)
+    #   - gem rate (weighted by total graded = confidence)
+    #   - set age penalty (older = harder to find clean)
+    #   - downside penalty (PSA9 loss)
+    # -------------------------
+    current_year = date.today().year
+
+    def _score(row) -> float:
+        cost = float(_safe_num(row.get("All-in Cost (Buy+Fee)"), 0.0))
+        profit10 = float(_safe_num(row.get("Profit PSA 10"), 0.0))
+        profit9 = float(_safe_num(row.get("Profit PSA 9"), 0.0))
+        roi10 = float(_safe_num(row.get("ROI PSA 10"), 0.0))
+
+        psa10_sales = float(_safe_num(row.get("psa10_sales_30d", 0.0), 0.0))
+        total_graded = float(_safe_num(row.get("Total Graded", 0.0), 0.0))
+        gem_rate = float(_safe_num(row.get("Gem Rate", 0.0), 0.0))
+
+        # Confidence scalers (0..1)
+        sales_conf = 0.0
+        if psa10_sales > 0:
+            sales_conf = min(1.0, math.log1p(psa10_sales) / math.log1p(40.0))  # ~40 sales => 1.0
+
+        gem_conf = 0.0
+        if total_graded > 0:
+            gem_conf = min(1.0, math.log1p(total_graded) / math.log1p(5000.0))  # ~5k graded => 1.0
+
+        # ROI component (clamped) -> up to ~120
+        roi10_clamped = max(-0.50, min(3.00, roi10))
+        roi_component = (roi10_clamped + 0.50) * 40.0  # maps [-0.5..3.0] -> [0..140]
+
+        # More confidence => more weight on ROI component
+        roi_weighted = roi_component * (0.60 + 0.40 * sales_conf)
+
+        # Gem component (0..~30)
+        gem_component = (gem_rate * 30.0) * (0.40 + 0.60 * gem_conf)
+
+        # Sales component (0..20)
+        sales_component = 20.0 * sales_conf
+
+        # Capital component (lower cost => higher score, 0..20)
+        cap_component = 0.0
+        if cost > 0:
+            cap_component = 20.0 * (1.0 / (1.0 + (cost / 120.0)))  # ~$120 => ~10 pts
+
+        # Set age penalty (0..20) only if Release Year given
+        rel_year = int(_safe_num(row.get("Release Year", 0), 0.0) or 0)
+        age_pen = 0.0
+        if rel_year >= 1995 and rel_year <= current_year:
+            years_old = max(0, current_year - rel_year)
+            age_pen = min(20.0, years_old * 2.0)
+
+        # Downside penalty based on PSA9 loss vs cost
+        psa9_value = float(_safe_num(row.get("PSA 9", 0.0), 0.0))
+        down_pen = downside_penalty_psa9(cost, psa9_value)
+
+        # Extra protection: if PSA9 is negative profit, add small additional penalty tied to loss magnitude
+        if cost > 0 and profit9 < 0:
+            down_pen += min(20.0, (abs(profit9) / cost) * 60.0)
+
+        raw_score = roi_weighted + gem_component + sales_component + cap_component - age_pen - down_pen
+        return float(max(0.0, raw_score))
+
+    out["Grading Score"] = out.apply(_score, axis=1).round(2)
+
+    # nice % display helpers (keep numeric for sorting; UI will show as % with formatting if desired)
+    out["Gem Rate"] = out["Gem Rate"].astype(float).round(4)
+
+    # Clean up: put useful columns up front
+    front = [
+        "Image",
+        "Generation", "Set", "Card Name", "Card No", "Parallel",
+        "Target Buy Price", "Max Buy Price",
+        "Buy Basis (Raw)", "All-in Cost (Buy+Fee)",
+        "Ungraded", "PSA 9", "PSA 10",
+        "Profit PSA 9", "Profit PSA 10",
+        "ROI PSA 9", "ROI PSA 10",
+        "Total Graded", "# PSA 10", "Gem Rate",
+        "psa10_sales_30d",
+        "psa9_sales_30d",
+        "ungraded_sales_30d",
+        "Grading Score",
+        "Release Year",
+        "Link",
+        "Pic",
+        "Notes",
+    ]
+    # include any missing columns to avoid KeyError
+    cols = [c for c in front if c in out.columns] + [c for c in out.columns if c not in front]
+    out = out[cols]
+
     return out
 
 def save_watchlist_from_editor(edited_df: pd.DataFrame):
@@ -1183,22 +1643,18 @@ def save_watchlist_from_editor(edited_df: pd.DataFrame):
         return
     client = get_gspread_client()
     sh = client.open_by_key(st.secrets["spreadsheet_id"])
-    ws = sh.worksheet(WATCHLIST_WS_NAME)
+    ws = _get_ws_or_create(sh, WATCHLIST_WS_NAME, WATCHLIST_HEADERS, cols_hint=40)
 
-    # Only write back the "source" columns (not computed columns)
-    source_cols = ["Generation", "Set", "Card Name", "Card No", "Link", "Parallel", "Target Buy Price", "Max Buy Price", "Notes"]
+    # Only write back "source" columns (not computed columns)
+    source_cols = WATCHLIST_HEADERS[:]  # exact headers we created
     for c in source_cols:
         if c not in edited_df.columns:
             edited_df[c] = ""
 
-    # keep only source columns
     out = edited_df[source_cols].copy()
-
-    # Write in ONE call
     _batch_write_sheet(ws, out, source_cols)
 
-    # clear cache so Analysis updates immediately
-    load_watchlist_and_gemrates.clear()
+    load_watchlist_gemrates_sales.clear()
 
 
 # =========================================================
@@ -1213,7 +1669,7 @@ tab_analysis, tab_submit, tab_update, tab_summary = st.tabs(
 # Analysis
 # -------------------------
 with tab_analysis:
-    st.subheader("Grading Watch List (GemRates + PriceCharting)")
+    st.subheader("Grading Watch List (GemRates + PriceCharting + Sales History)")
 
     fee_assumption = st.number_input(
         "Assumed grading fee (per card)",
@@ -1223,38 +1679,88 @@ with tab_analysis:
         format="%.2f",
     )
 
-    wdf, gdf = load_watchlist_and_gemrates()
+    wdf, gdf, sdf = load_watchlist_gemrates_sales()
+
+    # Controls
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        if st.button("📈 Update last-30-day sales (PriceCharting → grading_sales_history)", use_container_width=True, disabled=(wdf is None or wdf.empty)):
+            n = update_sales_history_from_watchlist(wdf)
+            st.success(f"Updated sales history for {n} watchlist row(s).")
+            st.rerun()
+
+    with c2:
+        if st.button("🔄 Refresh (re-pull GemRates + PriceCharting)", use_container_width=True):
+            load_watchlist_gemrates_sales.clear()
+            fetch_pricecharting_prices.clear()
+            fetch_pricecharting_image_url.clear()
+            st.rerun()
+
+    with c3:
+        st.caption("Tip: Fill **Parallel** (e.g., Base / Reverse Holo / SIR) to improve GemRates matching.")
 
     if wdf is None or wdf.empty:
-        st.info(f"No rows found in '{WATCHLIST_WS_NAME}'. Paste your watch list data into that sheet (headers in row 1).")
+        st.info(
+            f"No rows found in '{WATCHLIST_WS_NAME}'.\n\n"
+            f"Paste your watch list data into that sheet (headers in row 1). "
+            f"Recommended columns: {', '.join(WATCHLIST_HEADERS)}"
+        )
     else:
-        view = build_watchlist_view(wdf, gdf, fee_assumption)
+        view = build_watchlist_view(wdf, gdf, sdf, fee_assumption)
 
         st.caption(
-            "Edit the watch list fields (Generation/Set/Card No/Link/etc). "
-            "GemRates + PriceCharting columns are computed."
+            "Edit the watch list fields (Generation/Set/Card No/Link/Parallel/Target Buy/etc). "
+            "GemRates, PriceCharting, Sales History, and Score columns are computed."
         )
 
-        # Show an editor with both source + computed columns
+        # Image column config (big enough to see the card)
+        img_cfg = {}
+        try:
+            img_cfg = {
+                "Image": st.column_config.ImageColumn(
+                    "Image",
+                    help="Card image (Pic column or PriceCharting)",
+                    width="large",
+                ),
+                "Link": st.column_config.LinkColumn("Link", display_text="PriceCharting"),
+            }
+        except Exception:
+            # column_config can vary by Streamlit version; safe fallback
+            img_cfg = {}
+
         edited = st.data_editor(
             view,
             use_container_width=True,
             hide_index=True,
             num_rows="dynamic",
+            column_config=img_cfg,
+            disabled=[
+                # lock computed columns so you only edit source fields
+                "Image",
+                "Buy Basis (Raw)", "All-in Cost (Buy+Fee)",
+                "Ungraded", "PSA 9", "PSA 10",
+                "Profit PSA 9", "Profit PSA 10",
+                "ROI PSA 9", "ROI PSA 10",
+                "Total Graded", "# PSA 10", "Gem Rate",
+                "ungraded_sales_30d", "ungraded_min_30d", "ungraded_max_30d", "ungraded_avg_30d",
+                "psa9_sales_30d", "psa9_min_30d", "psa9_max_30d", "psa9_avg_30d",
+                "psa10_sales_30d", "psa10_min_30d", "psa10_max_30d", "psa10_avg_30d",
+                "Grading Score",
+            ],
         )
 
-        c1, c2 = st.columns([1, 1])
-        with c1:
+        s1, s2 = st.columns([1, 1])
+        with s1:
             if st.button("💾 Save Watch List", type="primary", use_container_width=True):
                 save_watchlist_from_editor(edited)
                 st.success("Saved to Google Sheets.")
                 st.rerun()
 
-        with c2:
-            if st.button("🔄 Refresh (re-pull GemRates + PriceCharting)", use_container_width=True):
-                load_watchlist_and_gemrates.clear()
-                st.rerun()
-
+        with s2:
+            st.caption(
+                "Score includes: ROI in PSA10 (weighted by PSA10 sales_30d), gem rate (weighted by total graded), "
+                "capital required, set age penalty (Release Year), and PSA9 downside penalty."
+            )
 
 
 # -------------------------
@@ -1357,6 +1863,7 @@ with tab_submit:
             append_grading_rows(rows)
             st.success(f"Created submission {sub_id} with {len(rows)} card(s).")
             refresh_all()
+
 
 
 # -------------------------
