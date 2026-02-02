@@ -17,6 +17,15 @@
 # - Robust header normalization (prevents duplicates)
 # - card_type normalized to ONLY Pokemon/Sports (never "Other")
 # - Writes fees_total so Dashboard net (sold_price - fees_total) matches Transactions net
+#
+# NEW (2026-02): Listing Market + Profit/Loss Estimate (Create tab)
+# - Pull market_price from inventory
+# - Estimate profit/loss after fees beside list price
+# - If platform is eBay -> require shipping_type (Ebay Envelope / Ground Advantage)
+#   * eBay fee: 13.25% of (item + shipping + sales tax)
+#   * sales tax assumed: 9%
+#   * shipping costs: envelope $1.32, ground advantage $5
+# - Non-eBay platforms assume $0 fees/tax/shipping for estimate
 # ---------------------------------------------------------
 
 import json
@@ -55,6 +64,86 @@ TX_STATUS_SOLD = "SOLD"
 TX_STATUS_CANCELLED = "CANCELLED"
 
 TX_TYPES = ["Auction", "Buy It Now", "Trade In"]
+
+# =========================================================
+# LISTING PROFIT ESTIMATE (assumptions)
+# =========================================================
+ASSUMED_TAX_RATE = 0.09          # 9%
+EBAY_FEE_RATE = 0.1325           # 13.25% of (item + ship + tax)
+EBAY_ENV_COST = 1.32
+GROUND_ADV_COST = 5.00
+
+EBAY_SHIPPING_TYPES = ["Ebay Envelope", "Ground Advantage"]
+
+
+def _is_ebay_platform(platform: str) -> bool:
+    return "ebay" in str(platform or "").strip().lower()
+
+
+def _shipping_cost_from_type(shipping_type: str) -> float:
+    s = str(shipping_type or "").strip().lower()
+    if "envelope" in s:
+        return EBAY_ENV_COST
+    if "ground" in s:
+        return GROUND_ADV_COST
+    return 0.0
+
+
+def _estimate_profit_loss(platform: str, list_price: float, all_in_cost: float, shipping_type: str = "") -> dict:
+    """
+    Estimate profit/loss at LISTING time using requested assumptions.
+
+    If platform is eBay:
+      - shipping charged to buyer assumed = shipping label cost (by shipping_type)
+      - tax = 9% of (item + shipping)
+      - ebay fee = 13.25% of (item + shipping + tax)
+      - net = (item + shipping + tax) - ebay_fee - shipping_cost
+      - profit = net - all_in_cost
+
+    Else (non-eBay):
+      - fees = 0, tax = 0, shipping_cost = 0
+      - net = list_price
+      - profit = net - all_in_cost
+    """
+    lp = float(list_price or 0.0)
+    cost = float(all_in_cost or 0.0)
+
+    if lp <= 0:
+        return {
+            "shipping_cost": 0.0, "shipping_charged": 0.0, "tax": 0.0, "fee": 0.0,
+            "total_paid": 0.0, "net": 0.0, "profit": round(-cost, 2) if cost else 0.0
+        }
+
+    if _is_ebay_platform(platform):
+        ship_cost = _shipping_cost_from_type(shipping_type)
+        ship_charged = ship_cost  # assumption: pass-through
+        tax = round(ASSUMED_TAX_RATE * (lp + ship_charged), 2)
+        total_paid = round(lp + ship_charged + tax, 2)
+        fee = round(EBAY_FEE_RATE * total_paid, 2)
+        net = round(total_paid - fee - ship_cost, 2)
+        profit = round(net - cost, 2)
+        return {
+            "shipping_cost": ship_cost,
+            "shipping_charged": ship_charged,
+            "tax": tax,
+            "fee": fee,
+            "total_paid": total_paid,
+            "net": net,
+            "profit": profit,
+        }
+
+    net = round(lp, 2)
+    profit = round(net - cost, 2)
+    return {
+        "shipping_cost": 0.0,
+        "shipping_charged": 0.0,
+        "tax": 0.0,
+        "fee": 0.0,
+        "total_paid": round(lp, 2),
+        "net": net,
+        "profit": profit,
+    }
+
 
 # --- Inventory columns (internal canonical names) ---
 INV_COLUMNS = [
@@ -609,7 +698,6 @@ def _append_rows(ws, sheet_headers: list[str], rows_internal: list[dict]):
         batch.append(ordered)
 
     def _do():
-        # gspread supports append_rows on Worksheet
         return ws.append_rows(batch, value_input_option="USER_ENTERED")
 
     _with_backoff(_do)
@@ -737,10 +825,8 @@ def _to_float_money(x) -> float:
     if s == "":
         return 0.0
 
-    # Remove currency symbols/commas/whitespace
     s = s.replace("$", "").replace(",", "").strip()
 
-    # Handle parentheses as negatives: (123.45) -> -123.45
     if s.startswith("(") and s.endswith(")"):
         s = "-" + s[1:-1].strip()
 
@@ -748,6 +834,7 @@ def _to_float_money(x) -> float:
         return float(s)
     except Exception:
         return 0.0
+
 
 def _money(x) -> str:
     try:
@@ -828,7 +915,6 @@ with tab_create:
         if mode.startswith("Bulk"):
             st.markdown("### Bulk listing creator")
 
-            # select multiple items
             selected_labels = st.multiselect(
                 "Select ACTIVE items to list",
                 options=inv_available["__label"].tolist(),
@@ -841,27 +927,78 @@ with tab_create:
                 chosen_df = inv_available[inv_available["__label"].isin(selected_labels)].copy()
                 chosen_df = chosen_df.sort_values(by=["year", "set_name", "card_name", "inventory_id"], na_position="last")
 
-                # Build a table for editing listing fields
-                editor = pd.DataFrame({
+                # Build base editor df
+                base_editor = pd.DataFrame({
                     "inventory_id": chosen_df["inventory_id"].astype(str).str.strip(),
                     "year": chosen_df.get("year", ""),
                     "set_name": chosen_df.get("set_name", ""),
                     "card_name": chosen_df.get("card_name", ""),
                     "variant": chosen_df.get("variant", ""),
-                    "total_cost": chosen_df.get("total_price", 0.0),
+
+                    # read-only cost + market (all_in_cost overwritten below with grading)
+                    "all_in_cost": chosen_df.get("total_price", 0.0),
+                    "market_price": chosen_df.get("market_price", 0.0),
 
                     # editable fields
-                    "transaction_type": ["Buy It Now"] * len(chosen_df),  # default
+                    "transaction_type": ["Buy It Now"] * len(chosen_df),
                     "platform": ["eBay"] * len(chosen_df),
+                    "shipping_type": ["Ebay Envelope"] * len(chosen_df),
                     "list_date": [date.today()] * len(chosen_df),
                     "list_price": [0.0] * len(chosen_df),
                     "notes": [""] * len(chosen_df),
+
+                    # computed preview (read-only)
+                    "est_profit_loss": [0.0] * len(chosen_df),
                 })
 
-                st.caption("Edit the fields below, then click **Create Listings**. (This will mark inventory items as LISTED.)")
+                # Overwrite all_in_cost with purchase_total + best grading fee (if any)
+                inv_map_tmp = inv_df.set_index("inventory_id", drop=False).to_dict("index")
+                all_in_list = []
+                for _inv_id in base_editor["inventory_id"].astype(str).str.strip().tolist():
+                    inv_rec = inv_map_tmp.get(_inv_id, {})
+                    gr_info_tmp = _lookup_grading_for_inventory(gr_df, _inv_id)
+                    purchase_total = float(inv_rec.get("total_price", 0.0) or 0.0)
+                    grading_fee_total = float(gr_info_tmp.get("grading_fee_total", 0.0) or 0.0)
+                    all_in_list.append(float(round(purchase_total + grading_fee_total, 2)))
+                base_editor["all_in_cost"] = all_in_list
+
+                # If user has already edited, seed from session_state and preserve their edits
+                prior = st.session_state.get("bulk_listing_editor", None)
+                if isinstance(prior, pd.DataFrame) and not prior.empty:
+                    # align by inventory_id (keep prior edits for editable columns)
+                    editable_cols = ["transaction_type", "platform", "shipping_type", "list_date", "list_price", "notes"]
+                    prior2 = prior.copy()
+                    prior2["inventory_id"] = prior2["inventory_id"].astype(str).str.strip()
+                    merged = base_editor.merge(
+                        prior2[["inventory_id"] + [c for c in editable_cols if c in prior2.columns]],
+                        on="inventory_id",
+                        how="left",
+                        suffixes=("", "_prior"),
+                    )
+                    for c in editable_cols:
+                        pc = f"{c}_prior"
+                        if pc in merged.columns:
+                            merged[c] = merged[pc].where(merged[pc].notna() & (merged[pc].astype(str) != ""), merged[c])
+                            merged = merged.drop(columns=[pc])
+                    base_editor = merged
+
+                # Compute preview estimates BEFORE editor renders (so they appear beside list price)
+                est_list = []
+                for _, r in base_editor.iterrows():
+                    est = _estimate_profit_loss(
+                        platform=str(r.get("platform", "")),
+                        list_price=float(r.get("list_price", 0.0) or 0.0),
+                        all_in_cost=float(r.get("all_in_cost", 0.0) or 0.0),
+                        shipping_type=str(r.get("shipping_type", "")),
+                    )
+                    est_list.append(float(est["profit"]))
+                base_editor["est_profit_loss"] = est_list
+
+                st.caption("Edit fields below, then click **Create Listings**. Inventory items will be marked LISTED.")
+                st.caption("Est Profit/Loss uses: eBay fee 13.25% of (item + ship + 9% tax). Non-eBay assumes $0 fees/tax/shipping.")
 
                 edited = st.data_editor(
-                    editor,
+                    base_editor,
                     use_container_width=True,
                     hide_index=True,
                     num_rows="fixed",
@@ -871,7 +1008,9 @@ with tab_create:
                         "set_name": st.column_config.TextColumn("Set", disabled=True),
                         "card_name": st.column_config.TextColumn("Card", disabled=True),
                         "variant": st.column_config.TextColumn("Variant", disabled=True),
-                        "total_cost": st.column_config.NumberColumn("Cost", format="$%.2f", disabled=True),
+
+                        "all_in_cost": st.column_config.NumberColumn("All-in Cost", format="$%.2f", disabled=True),
+                        "market_price": st.column_config.NumberColumn("Market Price", format="$%.2f", disabled=True),
 
                         "transaction_type": st.column_config.SelectboxColumn(
                             "Transaction Type",
@@ -879,22 +1018,58 @@ with tab_create:
                             required=True,
                         ),
                         "platform": st.column_config.TextColumn("Platform", required=True),
+
+                        "shipping_type": st.column_config.SelectboxColumn(
+                            "Shipping Type (eBay only)",
+                            options=["", "Ebay Envelope", "Ground Advantage"],
+                            required=False,
+                        ),
+
                         "list_date": st.column_config.DateColumn("List Date", required=True),
                         "list_price": st.column_config.NumberColumn("List Price", min_value=0.0, step=1.0, format="$%.2f", required=True),
+
+                        "est_profit_loss": st.column_config.NumberColumn("Est Profit/Loss", format="$%.2f", disabled=True),
+
                         "notes": st.column_config.TextColumn("Notes"),
                     },
                     key="bulk_listing_editor",
                 )
 
-                # Validate + create
+                # Recompute estimates from user edits and show a quick summary underneath
+                # (The editor will reflect computed column on next interaction/rerun.)
+                if isinstance(edited, pd.DataFrame) and not edited.empty:
+                    recomputed = edited.copy()
+                    est_list2 = []
+                    for _, r in recomputed.iterrows():
+                        est = _estimate_profit_loss(
+                            platform=str(r.get("platform", "")),
+                            list_price=float(r.get("list_price", 0.0) or 0.0),
+                            all_in_cost=float(r.get("all_in_cost", 0.0) or 0.0),
+                            shipping_type=str(r.get("shipping_type", "")),
+                        )
+                        est_list2.append(float(est["profit"]))
+                    recomputed["est_profit_loss"] = est_list2
+
+                    # Show preview table (keeps "next to list price" in the main editor, plus accurate numbers here)
+                    st.dataframe(
+                        recomputed[["inventory_id", "platform", "shipping_type", "list_price", "market_price", "all_in_cost", "est_profit_loss"]].copy(),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "list_price": st.column_config.NumberColumn("List Price", format="$%.2f"),
+                            "market_price": st.column_config.NumberColumn("Market Price", format="$%.2f"),
+                            "all_in_cost": st.column_config.NumberColumn("All-in Cost", format="$%.2f"),
+                            "est_profit_loss": st.column_config.NumberColumn("Est Profit/Loss", format="$%.2f"),
+                        },
+                    )
+
                 colA, colB = st.columns([1, 2])
                 with colA:
                     create_bulk = st.button("✅ Create Listings", type="primary", use_container_width=True)
                 with colB:
-                    st.caption("Tip: set list_price on each row. Any row with missing platform or list_price <= 0 will be rejected.")
+                    st.caption("Tip: Any row with missing platform or list_price <= 0 will be rejected. If platform is eBay, Shipping Type is required.")
 
                 if create_bulk:
-                    # basic validation
                     problems = []
                     rows_to_create = []
 
@@ -902,6 +1077,7 @@ with tab_create:
                         inv_id = str(r.get("inventory_id", "")).strip()
                         ttype = str(r.get("transaction_type", "")).strip()
                         platform = str(r.get("platform", "")).strip()
+                        shipping_type = str(r.get("shipping_type", "")).strip()
                         list_date = r.get("list_date", None)
                         list_price = float(r.get("list_price", 0.0) or 0.0)
                         notes = str(r.get("notes", "")).strip()
@@ -915,6 +1091,9 @@ with tab_create:
                         if not platform:
                             problems.append(f"Row {i+1} (Inv {inv_id}): platform is required.")
                             continue
+                        if _is_ebay_platform(platform) and shipping_type not in EBAY_SHIPPING_TYPES:
+                            problems.append(f"Row {i+1} (Inv {inv_id}): choose Shipping Type (Ebay Envelope or Ground Advantage).")
+                            continue
                         if list_date in [None, ""]:
                             problems.append(f"Row {i+1} (Inv {inv_id}): list_date is required.")
                             continue
@@ -926,6 +1105,7 @@ with tab_create:
                             "inventory_id": inv_id,
                             "transaction_type": ttype,
                             "platform": platform,
+                            "shipping_type": shipping_type,
                             "list_date": list_date,
                             "list_price": list_price,
                             "notes": notes,
@@ -945,7 +1125,6 @@ with tab_create:
                         )
                         st.stop()
 
-                    # Build TX rows + Inventory updates
                     spreadsheet_id = st.secrets["spreadsheet_id"]
                     inv_ws_name = st.secrets.get("inventory_worksheet", INVENTORY_WS_DEFAULT)
                     tx_ws_name = st.secrets.get("transactions_worksheet", TRANSACTIONS_WS_DEFAULT)
@@ -963,11 +1142,9 @@ with tab_create:
                         st.error("Could not find 'inventory_id' column in the inventory sheet header.")
                         st.stop()
 
-                    # rownum map (one pass)
                     inv_ids = [x["inventory_id"] for x in rows_to_create]
                     inv_rownums = _find_rownum_by_id(inv_values, inv_id_col_idx, inv_ids)
 
-                    # Build lookup from inv_df for snapshots (fast)
                     inv_map = inv_df.set_index("inventory_id", drop=False).to_dict("index")
 
                     now_iso = pd.Timestamp.utcnow().isoformat()
@@ -980,10 +1157,8 @@ with tab_create:
 
                         tx_id = str(uuid.uuid4())
 
-                        # grading info (fee/company/grade) from grading sheet
                         gr_info = _lookup_grading_for_inventory(gr_df, inv_id)
 
-                        # Prefer existing image_url; avoid scraping N items in bulk
                         img_url_final = str(inv_rec.get("image_url", "")).strip()
 
                         purchase_total = float(inv_rec.get("total_price", 0.0) or 0.0)
@@ -1055,7 +1230,6 @@ with tab_create:
                         row_internal["inventory_status"] = STATUS_LISTED
                         row_internal["listed_transaction_id"] = tx_id
 
-                        # If image_url missing AND we already have one in inv_rec, write it back
                         if "image_url" in row_internal and (not str(row_internal.get("image_url", "")).strip()) and img_url_final:
                             row_internal["image_url"] = img_url_final
 
@@ -1065,11 +1239,9 @@ with tab_create:
                         st.error("No valid rows to create (unexpected).")
                         st.stop()
 
-                    # Write: append all tx rows, then update inventory in batch
                     _append_rows(tx_ws, tx_sheet_headers, tx_rows)
                     _batch_update_rows(inv_ws, inv_sheet_headers, inv_updates)
 
-                    # clear caches
                     st.session_state.pop("inv_df_cache_tx", None)
                     st.session_state.pop("tx_df_cache", None)
                     st.session_state.pop("gr_df_cache_tx", None)
@@ -1079,7 +1251,7 @@ with tab_create:
                     st.rerun()
 
         # -----------------------------------------
-        # SINGLE MODE (your existing UI/flow)
+        # SINGLE MODE
         # -----------------------------------------
         else:
             inv_available["__label"] = inv_available.apply(_inv_label, axis=1)
@@ -1108,10 +1280,11 @@ with tab_create:
                     st.caption("No image found.")
 
             st.markdown("#### Purchase details")
-            p1, p2, p3 = st.columns(3)
+            p1, p2, p3, p4 = st.columns(4)
             p1.write(f"**Purchase date:** {selected_row.get('purchase_date', '')}")
             p2.write(f"**Purchased from:** {selected_row.get('purchased_from', '')}")
             p3.write(f"**Total cost:** {_money(selected_row.get('total_price', 0.0))}")
+            p4.write(f"**Market price:** {_money(selected_row.get('market_price', 0.0))}")
 
             st.markdown("---")
 
@@ -1135,10 +1308,42 @@ with tab_create:
                     l1, l2, l3 = st.columns(3)
                     with l1:
                         list_date = st.date_input("List date*", value=date.today())
+
                     with l2:
                         list_price = st.number_input("List price*", min_value=0.0, step=1.0, format="%.2f")
+
                     with l3:
-                        st.caption("Sale fields get filled in later under 'Mark Sold / Update Listing'.")
+                        # Show shipping type input; required only if platform is eBay
+                        if _is_ebay_platform(platform):
+                            shipping_type = st.selectbox("Shipping type (eBay only)*", EBAY_SHIPPING_TYPES, index=0)
+                        else:
+                            shipping_type = st.selectbox("Shipping type (eBay only)", [""] + EBAY_SHIPPING_TYPES, index=0)
+                            st.caption("Only used for eBay estimates.")
+
+                    # Live estimate preview
+                    purchase_total_tmp = float(selected_row.get("total_price", 0.0) or 0.0)
+                    grading_fee_total_tmp = float(gr_info.get("grading_fee_total", 0.0) or 0.0)
+                    all_in_cost_tmp = float(round(purchase_total_tmp + grading_fee_total_tmp, 2))
+
+                    est = _estimate_profit_loss(
+                        platform=platform,
+                        list_price=list_price,
+                        all_in_cost=all_in_cost_tmp,
+                        shipping_type=shipping_type,
+                    )
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Est Profit/Loss", _money(est["profit"]))
+                    if _is_ebay_platform(platform):
+                        m2.metric("Est eBay fee", _money(est["fee"]))
+                        m3.metric("Est tax (9%)", _money(est["tax"]))
+                        m4.metric("Total buyer pays", _money(est["total_paid"]))
+                    else:
+                        m2.metric("Fees", _money(0))
+                        m3.metric("Tax", _money(0))
+                        m4.metric("Buyer pays", _money(est["total_paid"]))
+
+                    st.caption("Estimate uses assumptions; actual fees/tax/shipping can differ. Enter actuals when sold in Tab 2.")
 
                     sold_date = ""
                     sold_price = 0.0
@@ -1161,7 +1366,8 @@ with tab_create:
                             format="%.2f"
                         )
 
-
+                    # define for consistency
+                    shipping_type = ""
                     list_date = ""
                     list_price = 0.0
 
@@ -1170,6 +1376,8 @@ with tab_create:
             if submit:
                 if not platform.strip():
                     st.error("Platform is required.")
+                elif tx_type in ["Auction", "Buy It Now"] and _is_ebay_platform(platform) and shipping_type not in EBAY_SHIPPING_TYPES:
+                    st.error("For eBay listings, Shipping type is required (Ebay Envelope or Ground Advantage).")
                 else:
                     spreadsheet_id = st.secrets["spreadsheet_id"]
                     inv_ws_name = st.secrets.get("inventory_worksheet", INVENTORY_WS_DEFAULT)
@@ -1210,7 +1418,6 @@ with tab_create:
                             shipping_charge=shipping_charged,
                         )
                         fees_total = _compute_fees_total_for_dashboard(fees, shipping_charged)
-
                         tx_status = TX_STATUS_SOLD
                     else:
                         net, profit = 0.0, 0.0
@@ -1300,7 +1507,6 @@ with tab_create:
 
 
 # =========================================================
-# =========================================================
 # TAB 2: MARK SOLD / UPDATE LISTING
 # =========================================================
 with tab_update:
@@ -1352,7 +1558,6 @@ with tab_update:
                         format="%.2f"
                     )
 
-
                 notes = st.text_input("Notes (optional)", value=str(tx_row.get("notes", "") or ""))
 
                 b1, b2 = st.columns(2)
@@ -1400,7 +1605,7 @@ with tab_update:
                 tx_internal = {sheet_header_to_internal(k): v for k, v in tx_sheet_dict.items()}
                 tx_internal = _coalesce_duplicate_columns(pd.DataFrame([tx_internal])).iloc[0].to_dict()
 
-                # --- NEW: sanitize numeric fields from Sheets (e.g., "$0.00") ---
+                # sanitize numeric fields from Sheets (e.g., "$0.00")
                 for c in NUMERIC_TX:
                     if c in tx_internal:
                         tx_internal[c] = _to_float_money(tx_internal.get(c))
@@ -1441,7 +1646,6 @@ with tab_update:
                     st.rerun()
 
                 if mark_btn:
-                    # --- UPDATED: safe float parsing (handles "$0.00") ---
                     all_in_cost = _to_float_money(tx_internal.get("all_in_cost", 0.0))
                     if all_in_cost <= 0:
                         all_in_cost = _to_float_money(tx_internal.get("purchase_total", 0.0))
@@ -1453,7 +1657,6 @@ with tab_update:
                         shipping_charge=shipping_charged,
                     )
                     fees_total = _compute_fees_total_for_dashboard(fees, shipping_charged)
-
 
                     tx_internal["sold_date"] = str(sold_date)
                     tx_internal["sold_price"] = float(sold_price)
