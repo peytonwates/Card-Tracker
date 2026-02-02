@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup
 import gspread
 from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
 st.set_page_config(page_title="Grading", layout="wide")
 st.title("Grading")
@@ -1563,45 +1564,124 @@ with tab_analysis:
 
             filtered = filtered[filtered.apply(_row_match, axis=1)]
 
-        # sort
+        # sort (stable + safe numeric coercion)
         if sort_col in filtered.columns:
-            filtered = filtered.sort_values(
-                by=sort_col,
-                ascending=not sort_desc,
-                key=lambda s: s.apply(lambda v: safe_float(v, 0.0) if str(v).replace(".","",1).replace("-","",1).isdigit() else safe_str(v))
-            )
+            if sort_col in {
+                "Grading Score",
+                "Profit PSA 10",
+                "Profit PSA 9",
+                "All-in Cost (Buy+Fee)",
+                "Buy Basis (Raw)",
+                "ROI PSA 10",
+                "ROI PSA 9",
+                "Gem Rate",
+                "Total Graded",
+                "psa10_avg_30d",
+                "psa9_avg_30d",
+                "ungraded_avg_30d",
+            }:
+                filtered["_sort_num"] = filtered[sort_col].apply(lambda v: safe_float(v, 0.0))
+                filtered = filtered.sort_values(by="_sort_num", ascending=not sort_desc, kind="mergesort").drop(columns=["_sort_num"])
+            else:
+                filtered["_sort_txt"] = filtered[sort_col].astype(str)
+                filtered = filtered.sort_values(by="_sort_txt", ascending=not sort_desc, kind="mergesort").drop(columns=["_sort_txt"])
 
         filtered = filtered.reset_index(drop=True)
-        
 
-        img_cfg = {
-            "Image": st.column_config.ImageColumn("Image", width="large"),
-            "Link": st.column_config.LinkColumn("Link", display_text="PriceCharting"),
+        # --- BIGGER images + freeze Image column + better sort/filter UX ---
+        # NOTE: Streamlit's st.data_editor cannot freeze/pin columns while scrolling horizontally.
+        # To get "Image" frozen left, we switch this table to AgGrid which supports pinned columns.
+        from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
+
+        img_renderer = JsCode("""
+        function(params) {
+            if (!params.value) return '';
+            return `<img src="${params.value}"
+                        style="height:180px; width:auto; border-radius:10px;" />`;
         }
+        """)
 
-        edited = st.data_editor(filtered.loc[:, ~filtered.columns.duplicated()].copy(),
-            width="stretch",
-            hide_index=True,
-            num_rows="dynamic",
-            column_config=img_cfg,
-            disabled=[
+        link_renderer = JsCode("""
+        function(params) {
+            if (!params.value) return '';
+            return `<a href="${params.value}" target="_blank" rel="noopener noreferrer">PriceCharting</a>`;
+        }
+        """)
+
+        df_show = filtered.loc[:, ~filtered.columns.duplicated()].copy()
+
+        gb = GridOptionsBuilder.from_dataframe(df_show)
+        gb.configure_default_column(sortable=True, filter=True, resizable=True, wrapText=True, autoHeight=True)
+
+        if "Image" in df_show.columns:
+            gb.configure_column(
                 "Image",
-                "Buy Basis (Raw)", "All-in Cost (Buy+Fee)",
-                "Ungraded", "PSA 9", "PSA 10",
-                "Profit PSA 9", "Profit PSA 10",
-                "ROI PSA 9", "ROI PSA 10",
-                "Total Graded", "# PSA 10", "Gem Rate",
-                "ungraded_sales_30d", "ungraded_min_30d", "ungraded_max_30d", "ungraded_avg_30d",
-                "psa9_sales_30d", "psa9_min_30d", "psa9_max_30d", "psa9_avg_30d",
-                "psa10_sales_30d", "psa10_min_30d", "psa10_max_30d", "psa10_avg_30d",
-                "Grading Score",
-            ],
+                header_name="Image",
+                pinned="left",      # freeze Image column while scrolling
+                width=300,          # wider col so image isn't cramped
+                cellRenderer=img_renderer,
+                sortable=False,
+                filter=False,
+            )
+
+        if "Link" in df_show.columns:
+            gb.configure_column(
+                "Link",
+                header_name="Link",
+                cellRenderer=link_renderer,
+                width=150,
+            )
+
+        # row height ~ 3x-ish vs default so images look big
+        gb.configure_grid_options(rowHeight=220)
+
+        grid_options = gb.build()
+
+        AgGrid(
+            df_show,
+            gridOptions=grid_options,
+            height=750,
+            theme="streamlit",
+            allow_unsafe_jscode=True,
+            update_mode=GridUpdateMode.NO_UPDATE,
+            fit_columns_on_grid_load=False,
         )
 
-        if st.button("💾 Save Watch List (manual edits only)", type="primary", width="stretch"):
-            write_enriched_watchlist(edited)
-            st.success("Saved.")
-            st.rerun()
+        st.caption("Image column is pinned (frozen) on the left. Use column menus to filter/sort, or the controls above.")
+
+        # If you still want manual edits + save-back, keep your existing st.data_editor below
+        # (but note: it won't have pinned columns). Commented out for now.
+        #
+        # img_cfg = {
+        #     "Image": st.column_config.ImageColumn("Image", width="large"),
+        #     "Link": st.column_config.LinkColumn("Link", display_text="PriceCharting"),
+        # }
+        #
+        # edited = st.data_editor(
+        #     df_show,
+        #     width="stretch",
+        #     hide_index=True,
+        #     num_rows="dynamic",
+        #     column_config=img_cfg,
+        #     disabled=[
+        #         "Image",
+        #         "Buy Basis (Raw)", "All-in Cost (Buy+Fee)",
+        #         "Ungraded", "PSA 9", "PSA 10",
+        #         "Profit PSA 9", "Profit PSA 10",
+        #         "ROI PSA 9", "ROI PSA 10",
+        #         "Total Graded", "# PSA 10", "Gem Rate",
+        #         "ungraded_sales_30d", "ungraded_min_30d", "ungraded_max_30d", "ungraded_avg_30d",
+        #         "psa9_sales_30d", "psa9_min_30d", "psa9_max_30d", "psa9_avg_30d",
+        #         "psa10_sales_30d", "psa10_min_30d", "psa10_max_30d", "psa10_avg_30d",
+        #         "Grading Score",
+        #     ],
+        # )
+        #
+        # if st.button("💾 Save Watch List (manual edits only)", type="primary", width="stretch"):
+        #     write_enriched_watchlist(edited)
+        #     st.success("Saved.")
+        #     st.rerun()
+
 
 
 with tab_submit:
