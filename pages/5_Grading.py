@@ -262,8 +262,7 @@ def update_watchlist_image_column(ws, wdf: pd.DataFrame, image_urls_by_row_idx: 
     updates = []
 
     for df_row_idx, url in image_urls_by_row_idx.items():
-        # sheet row number = header row (1) + data row index + 1
-        sheet_row = 2 + int(df_row_idx)
+        sheet_row = 2 + int(df_row_idx)  # header row=1
         a1 = f"{a1_col_letter(img_col_idx)}{sheet_row}"
         updates.append({"range": a1, "values": [[safe_str(url)]]})
 
@@ -319,13 +318,86 @@ def http_get_with_backoff(url: str, *, timeout=25, max_tries=6):
 
 
 # =========================
-# Image scraper (from PriceCharting reference link)
+# Image scraper (PriceCharting) - UPDATED using your proven logic
 # =========================
+def _find_best_image(soup: BeautifulSoup) -> str:
+    """
+    Prefer PriceCharting's real card/product photos (storage.googleapis.com)
+    over set icons like /images/pokemon-sets/*.png.
+    """
+    if soup is None:
+        return ""
+
+    # 1) If og/twitter image is already a real hosted photo, use it.
+    for meta in [
+        soup.find("meta", property="og:image"),
+        soup.find("meta", attrs={"name": "twitter:image"}),
+    ]:
+        if meta and meta.get("content"):
+            url = meta["content"].strip()
+            if "storage.googleapis.com/images.pricecharting.com" in url:
+                return url
+            # If it's the set icon, ignore it
+            if "/images/pokemon-sets/" not in url:
+                return url
+
+    # 2) Prefer any storage.googleapis.com PriceCharting image anywhere on the page
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if "storage.googleapis.com/images.pricecharting.com" in href:
+            return href
+
+    for img in soup.find_all("img", src=True):
+        src = (img.get("src") or "").strip()
+        if "storage.googleapis.com/images.pricecharting.com" in src:
+            return src
+
+    # 3) Otherwise, choose the first non-set-icon <img>
+    for img in soup.find_all("img", src=True):
+        src = (img.get("src") or "").strip()
+        if not src:
+            continue
+        if "/images/pokemon-sets/" in src:
+            continue
+        return src
+
+    return ""
+
+def _find_pricecharting_main_image(soup: BeautifulSoup) -> str:
+    """
+    PriceCharting often shows the real product/card image under:
+    'More Photos' -> 'Main Image' as a storage.googleapis.com link.
+    We prefer that over set icons like /images/pokemon-sets/....
+    """
+    if soup is None:
+        return ""
+
+    candidates = []
+
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+
+        if href.startswith("//"):
+            href = "https:" + href
+
+        if "storage.googleapis.com" in href and "images.pricecharting.com" in href:
+            label = ""
+            if a.parent:
+                label = " ".join(a.parent.stripped_strings)
+            if "main image" in (label or "").lower():
+                return href
+            candidates.append(href)
+
+    return candidates[0] if candidates else ""
+
 @st.cache_data(ttl=60 * 60 * 24)
 def fetch_pricecharting_image_url(reference_link: str) -> str:
     """
-    Tries to extract a representative card image from the PriceCharting game page.
-    Prefers og:image (usually best).
+    Uses proven logic:
+      - _find_best_image(soup) first
+      - then _find_pricecharting_main_image(soup)
     """
     link = (reference_link or "").strip()
     if not link or "pricecharting.com" not in link.lower():
@@ -334,32 +406,17 @@ def fetch_pricecharting_image_url(reference_link: str) -> str:
     r = http_get_with_backoff(link, timeout=25, max_tries=6)
     soup = BeautifulSoup(r.text, _bs_parser())
 
-    # Best: OpenGraph image
-    og = soup.find("meta", attrs={"property": "og:image"})
-    if og and og.get("content"):
-        return og["content"].strip()
+    url = _find_best_image(soup) or ""
+    if not url:
+        url = _find_pricecharting_main_image(soup) or ""
 
-    # Twitter image fallback
-    tw = soup.find("meta", attrs={"name": "twitter:image"})
-    if tw and tw.get("content"):
-        return tw["content"].strip()
+    if not url:
+        return ""
 
-    # Try common image elements
-    for sel in [
-        "img.product-image",
-        "img#product-image",
-        "img.game-image",
-        "img",
-    ]:
-        img = soup.select_one(sel)
-        if img and img.get("src"):
-            src = img["src"].strip()
-            if src.startswith("http"):
-                return src
-            if src.startswith("//"):
-                return "https:" + src
-
-    return ""
+    url = url.strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    return url
 
 
 # =========================
@@ -635,7 +692,6 @@ def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame) -> pd.DataFrame:
     if wdf is None or wdf.empty:
         return pd.DataFrame(columns=SALES_HISTORY_HEADERS)
 
-    # do NOT require Image for sales scraping; only the normal expected cols
     for h in ["Generation", "Set", "Card Name", "Card No", "Link"]:
         if h not in wdf.columns:
             wdf[h] = ""
@@ -763,7 +819,6 @@ def build_gemrates_lookup(gdf: pd.DataFrame) -> dict[tuple[str, str], dict]:
     if gdf is None or gdf.empty:
         return {}
 
-    # tolerate column name variance
     col_set = "Set Name" if "Set Name" in gdf.columns else ("Set" if "Set" in gdf.columns else None)
     col_card = "Card #" if "Card #" in gdf.columns else ("Card No" if "Card No" in gdf.columns else None)
     col_total = "Total" if "Total" in gdf.columns else None
@@ -781,7 +836,6 @@ def build_gemrates_lookup(gdf: pd.DataFrame) -> dict[tuple[str, str], dict]:
     else:
         tmp["_total_num"] = 0.0
 
-    # pick best row per key (max Total)
     tmp = tmp.sort_values("_total_num", ascending=False)
 
     out = {}
@@ -830,7 +884,6 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
     out = None
     for bucket in ["ungraded", "psa9", "psa10"]:
         sub = stats[stats["grade_bucket"] == bucket].copy()
-
         sub = sub[keys + ["mean", "min", "max"]].copy() if not sub.empty else pd.DataFrame(columns=keys + ["mean", "min", "max"])
         rename = _bucket_cols(bucket)
         sub = sub.rename(columns={"mean": rename["mean"], "min": rename["min"], "max": rename["max"]})
@@ -842,7 +895,6 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
 
     out = out.fillna(0.0)
 
-    # round numeric stats
     for c in out.columns:
         if c.endswith(" Avg") or c.endswith(" Min") or c.endswith(" Max"):
             out[c] = out[c].apply(lambda v: round(safe_float(v, 0.0), 2))
@@ -895,7 +947,6 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
 
     out = out.drop(columns=["_set_norm", "_card_norm"], errors="ignore")
 
-    # column order (Image next to Link)
     ordered = [
         "Generation",
         "Set",
@@ -909,7 +960,6 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
         "PSA9 Avg", "PSA9 Min", "PSA9 Max",
         "PSA10 Avg", "PSA10 Min", "PSA10 Max",
     ]
-    # tolerate missing columns
     final_cols = [c for c in ordered if c in out.columns] + [c for c in out.columns if c not in ordered]
     out = out[final_cols].copy()
 
@@ -924,12 +974,10 @@ sheet = get_sheet()
 watch_ws = get_ws(sheet, WATCHLIST_WS_NAME)
 sales_ws = get_ws(sheet, SALES_HISTORY_WS_NAME)
 
-# ensure sales history headers (unchanged)
 ensure_headers(sales_ws, SALES_HISTORY_HEADERS)
 
 wdf = read_ws_df(watch_ws)
 
-# Load gemrates once for the page render
 gdf = load_gemrates_df(sheet)
 gem_lookup = build_gemrates_lookup(gdf)
 
@@ -956,7 +1004,6 @@ with top:
                                 continue
                             if "pricecharting.com" not in link.lower():
                                 continue
-                            # polite delay (light)
                             if to_write:
                                 time.sleep(0.35)
                             url = fetch_pricecharting_image_url(link)
@@ -985,22 +1032,17 @@ with top:
 
 st.divider()
 
-# Read sales history and show summary
 sdf = read_ws_df(sales_ws)
-
 summary_df = build_summary_from_sales_history(sdf, wdf, gem_lookup)
 
 if summary_df is None or summary_df.empty:
     st.info("No sales history yet. Click **Refresh** to populate `grading_sales_history` and see the summary.")
 else:
-    # Render image column nicely
     col_config = {}
     if "Image" in summary_df.columns:
         col_config["Image"] = st.column_config.ImageColumn("Image", help="Scraped from PriceCharting ref link", width="small")
-
     if "Link" in summary_df.columns:
         col_config["Link"] = st.column_config.LinkColumn("Link")
-
     st.dataframe(
         summary_df,
         use_container_width=True,
