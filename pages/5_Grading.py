@@ -18,7 +18,7 @@ from google.oauth2.service_account import Credentials
 # Page
 # =========================
 st.set_page_config(page_title="Grading", layout="wide")
-st.title("Grading — Watchlist → Sales History (Ungraded + PSA 9 + PSA 10)")
+st.title("Grading — Watchlist → Sales History")
 
 # =========================
 # Config
@@ -50,7 +50,7 @@ ISO_DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 # =========================
 def _bs_parser():
     try:
-        import lxml  # noqa: F401
+        import lxml  # noqa
         return "lxml"
     except Exception:
         return "html.parser"
@@ -73,6 +73,34 @@ def safe_float(x, default=0.0):
 
 def is_blank(x) -> bool:
     return safe_str(x).strip() == ""
+
+def _parse_sale_date(text: str):
+    if not text:
+        return None
+    t = text.strip()
+    m = ISO_DATE_RE.search(t)
+    if m:
+        try:
+            d = pd.to_datetime(m.group(1), errors="coerce")
+            if pd.notna(d):
+                return d.date()
+        except Exception:
+            return None
+    try:
+        d = pd.to_datetime(t, errors="coerce")
+        if pd.notna(d) and d.year >= 2000:
+            return d.date()
+    except Exception:
+        pass
+    return None
+
+def _classify_bucket_from_title(title: str) -> str:
+    t = (title or "").upper()
+    if re.search(r"\bPSA\s*10\b", t) or re.search(r"\bGEM\s*MINT\s*10\b", t) or re.search(r"\bGEM\s*MT\s*10\b", t):
+        return "psa10"
+    if re.search(r"\bPSA\s*9\b", t) or re.search(r"\bMINT\s*9\b", t):
+        return "psa9"
+    return "ungraded"
 
 def _gs_write_retry(fn, *args, **kwargs):
     max_tries = 6
@@ -132,7 +160,6 @@ def ensure_headers(ws, headers: list[str]):
     if not values or not values[0]:
         _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
         return
-
     current = [str(x).strip() for x in values[0]]
     if current != headers:
         _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
@@ -180,72 +207,72 @@ def http_get_with_backoff(url: str, timeout=25, max_tries=6):
     raise requests.HTTPError(f"HTTPError: Too Many Requests (retries exhausted) for {url}")
 
 # =========================
-# Sold sales scraping (FIXED)
+# Sold scraping (robust)
 # =========================
-def _classify_bucket_from_title(title: str) -> str:
-    t = (title or "").upper()
-    if re.search(r"\bPSA\s*10\b", t) or re.search(r"\bGEM\s*MINT\s*10\b", t) or re.search(r"\bGEM\s*MT\s*10\b", t):
-        return "psa10"
-    if re.search(r"\bPSA\s*9\b", t) or re.search(r"\bMINT\s*9\b", t):
-        return "psa9"
-    return "ungraded"
-
-def _parse_sale_date(text: str):
-    if not text:
-        return None
-    m = ISO_DATE_RE.search(text.strip())
-    if m:
-        try:
-            d = pd.to_datetime(m.group(1), errors="coerce")
-            if pd.notna(d):
-                return d.date()
-        except Exception:
-            return None
-    try:
-        d = pd.to_datetime(text.strip(), errors="coerce")
-        if pd.notna(d) and d.year >= 2000:
-            return d.date()
-    except Exception:
-        pass
-    return None
-
-def _table_has_completed_headers(table_tag: BeautifulSoup) -> bool:
-    # We only want the “Sale Date / Title / Price” tables
-    header_text = " ".join([th.get_text(" ", strip=True) for th in table_tag.select("th")]).lower()
-    return ("sale date" in header_text) and ("title" in header_text) and ("price" in header_text)
-
 @st.cache_data(ttl=60 * 60 * 3)
-def fetch_sold_sales_per_bucket(reference_link: str, per_bucket: int = 5) -> list[dict]:
+def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 120) -> tuple[list[dict], dict]:
     """
-    Parse ONLY the completed-auctions tables and read price from the Price column.
-    Prevents wrong $ capture (like $6.00) from unrelated page text.
+    Robust scrape:
+    - Iterate tables/rows
+    - Prefer price from LAST cell (Price column) when present
+    - Date from first cell when present
+    - Title from a middle cell (usually 3rd) when present
+    Returns: (sales_rows, debug_info)
     """
+    debug = {
+        "tables_found": 0,
+        "rows_scanned": 0,
+        "rows_emitted": 0,
+        "notes": [],
+    }
+
     link = (reference_link or "").strip()
     if not link or "pricecharting.com" not in link.lower():
-        return []
+        debug["notes"].append("Invalid link")
+        return [], debug
 
     try:
         r = http_get_with_backoff(link, timeout=25, max_tries=6)
-    except Exception:
-        return []
+    except Exception as e:
+        debug["notes"].append(f"HTTP error: {e}")
+        return [], debug
 
     soup = BeautifulSoup(r.text, _bs_parser())
 
-    # Find the relevant tables
-    tables = [t for t in soup.select("table") if _table_has_completed_headers(t)]
-    if not tables:
-        return []
+    sales = []
+    now = datetime.utcnow().isoformat()
 
-    candidates = []
+    def emit(sale_date: date, price: float, title: str):
+        if not sale_date or not price or price <= 0 or not title:
+            return
+        bucket = _classify_bucket_from_title(title)
+        sale_key = f"{sale_date.isoformat()}|{price:.2f}|{bucket}|{title[:120].strip().lower()}"
+        sales.append(
+            {
+                "sale_date": sale_date,
+                "price": float(price),
+                "title": title.strip(),
+                "grade_bucket": bucket,
+                "sale_key": sale_key,
+                "updated_utc": now,
+            }
+        )
+        debug["rows_emitted"] += 1
 
+    tables = soup.select("table")
+    debug["tables_found"] = len(tables)
+
+    # Scan all tables (this is what made ungraded work for you)
     for table in tables:
-        # Rows with tds (skip header)
         for tr in table.select("tr"):
             tds = tr.select("td")
             if len(tds) < 3:
                 continue
 
-            # PriceCharting tables: usually [Sale Date] [TW] [Title] [Price]
+            debug["rows_scanned"] += 1
+
+            # Heuristic: PC sold tables usually:
+            # td[0] = sale date, td[2] = title, td[-1] = price
             sale_date_txt = tds[0].get_text(" ", strip=True)
             title_txt = tds[2].get_text(" ", strip=True)
             price_txt = tds[-1].get_text(" ", strip=True)
@@ -254,57 +281,62 @@ def fetch_sold_sales_per_bucket(reference_link: str, per_bucket: int = 5) -> lis
             if not sale_date:
                 continue
 
-            # Price cell sometimes has two values (e.g., "$100.00 $119.00" with one struck-through).
-            # Your screenshot shows the FIRST one is the real sold price.
+            # Price cell can contain multiple prices (e.g., "$100.00 $119.00")
             pm_all = PRICE_RE.findall(price_txt)
             if not pm_all:
+                # fallback: sometimes the $ appears in the row text but not last cell
+                row_text = tr.get_text(" ", strip=True)
+                pm_all = PRICE_RE.findall(row_text)
+            if not pm_all:
                 continue
+
             price = safe_float(pm_all[0], 0.0)
             if price <= 0:
                 continue
 
             title = title_txt.strip()
-            bucket = _classify_bucket_from_title(title)
+            if not title:
+                # fallback: pick the longest non-price, non-date cell
+                cell_texts = [td.get_text(" ", strip=True) for td in tds]
+                candidates = []
+                for c in cell_texts:
+                    if not c:
+                        continue
+                    if _parse_sale_date(c):
+                        continue
+                    if PRICE_RE.search(c):
+                        continue
+                    candidates.append(c)
+                title = max(candidates, key=len).strip() if candidates else ""
 
-            sale_key = f"{sale_date.isoformat()}|{price:.2f}|{bucket}|{title[:120].strip().lower()}"
-            candidates.append(
-                {
-                    "sale_date": sale_date,
-                    "price": float(price),
-                    "title": title,
-                    "grade_bucket": bucket,
-                    "sale_key": sale_key,
-                }
-            )
-
-    if not candidates:
-        return []
+            if title:
+                emit(sale_date, price, title)
 
     # Dedup + newest first
-    by_key = {c["sale_key"]: c for c in candidates if c.get("sale_key")}
-    deduped = list(by_key.values())
-    deduped.sort(key=lambda x: (x["sale_date"], x["price"]), reverse=True)
+    by_key = {s["sale_key"]: s for s in sales if s.get("sale_key")}
+    sales2 = list(by_key.values())
+    sales2.sort(key=lambda x: (x["sale_date"], x["price"]), reverse=True)
 
-    # Take per-bucket
+    return sales2[: max(1, int(limit))], debug
+
+def pick_last_n_per_bucket(sales: list[dict], per_bucket: int = 5) -> list[dict]:
     out = []
     for bucket in ["ungraded", "psa9", "psa10"]:
-        bucket_rows = [r for r in deduped if r.get("grade_bucket") == bucket]
-        out.extend(bucket_rows[:per_bucket])
-
+        rows = [s for s in sales if s.get("grade_bucket") == bucket]
+        out.extend(rows[:per_bucket])
     return out
 
 # =========================
-# Main pipeline: watchlist -> sales history
+# Pipeline
 # =========================
-def update_sales_history_from_watchlist(per_bucket: int = 5) -> int:
+def update_sales_history_from_watchlist(per_bucket: int = 5, show_debug: bool = False) -> tuple[int, list[dict]]:
     watch_ws = get_ws(WATCHLIST_WS_NAME)
     sales_ws = get_ws(SALES_HISTORY_WS_NAME)
-
     ensure_headers(sales_ws, SALES_HEADERS)
 
     wdf = read_df(watch_ws)
     if wdf.empty:
-        return 0
+        return 0, [{"error": f"No rows found in {WATCHLIST_WS_NAME}"}]
 
     for c in WATCHLIST_REQUIRED_COLS:
         if c not in wdf.columns:
@@ -316,8 +348,8 @@ def update_sales_history_from_watchlist(per_bucket: int = 5) -> int:
         existing_keys = set(sdf["sale_key"].astype(str).str.strip().tolist())
 
     appended = 0
-    now_utc = datetime.utcnow().isoformat()
     rows_to_append = []
+    debug_rows = []
 
     for _, w in wdf.iterrows():
         link = safe_str(w.get("Link", "")).strip()
@@ -329,11 +361,24 @@ def update_sales_history_from_watchlist(per_bucket: int = 5) -> int:
         card_name = safe_str(w.get("Card Name", "")).strip()
         card_no = safe_str(w.get("Card No", "")).strip()
 
-        sales = fetch_sold_sales_per_bucket(link, per_bucket=per_bucket)
-        if not sales:
-            continue
+        sales_all, dbg = fetch_pricecharting_sold_sales_latest(link, limit=200)
+        picked = pick_last_n_per_bucket(sales_all, per_bucket=per_bucket)
 
-        for s in sales:
+        debug_rows.append(
+            {
+                "link": link,
+                "tables_found": dbg.get("tables_found"),
+                "rows_scanned": dbg.get("rows_scanned"),
+                "rows_emitted": dbg.get("rows_emitted"),
+                "picked_total": len(picked),
+                "picked_ungraded": sum(1 for x in picked if x.get("grade_bucket") == "ungraded"),
+                "picked_psa9": sum(1 for x in picked if x.get("grade_bucket") == "psa9"),
+                "picked_psa10": sum(1 for x in picked if x.get("grade_bucket") == "psa10"),
+                "notes": " | ".join(dbg.get("notes", [])),
+            }
+        )
+
+        for s in picked:
             sk = safe_str(s.get("sale_key", "")).strip()
             if not sk or sk in existing_keys:
                 continue
@@ -350,7 +395,7 @@ def update_sales_history_from_watchlist(per_bucket: int = 5) -> int:
                     f"{float(safe_float(s.get('price', 0.0), 0.0)):.2f}",
                     safe_str(s.get("title", "")).strip(),
                     sk,
-                    now_utc,
+                    safe_str(s.get("updated_utc", "")),
                 ]
             )
             existing_keys.add(sk)
@@ -365,7 +410,7 @@ def update_sales_history_from_watchlist(per_bucket: int = 5) -> int:
             for r in rows_to_append:
                 _gs_write_retry(sales_ws.append_row, r, value_input_option="RAW")
 
-    return appended
+    return appended, debug_rows
 
 # =========================
 # UI
@@ -373,37 +418,36 @@ def update_sales_history_from_watchlist(per_bucket: int = 5) -> int:
 st.markdown(
     f"""
 **Reads:** `{WATCHLIST_WS_NAME}`  
-**Writes:** `{SALES_HISTORY_WS_NAME}`  
+**Writes:** `{SALES_HISTORY_WS_NAME}`
 
-This appends **last N sold comps** for **Ungraded + PSA 9 + PSA 10** per watchlist row.
+Pulls **last N** sales for each watchlist row for:
+- `ungraded`
+- `psa9`
+- `psa10`
 """
 )
 
-per_bucket = st.number_input(
-    "How many sales per bucket (ungraded / psa9 / psa10)?",
-    min_value=1,
-    max_value=25,
-    value=5,
-    step=1,
-)
+per_bucket = st.number_input("Sales per bucket (ungraded/psa9/psa10)", min_value=1, max_value=25, value=5, step=1)
+show_debug = st.checkbox("Show debug details after run", value=True)
 
-c1, c2 = st.columns([1, 1])
+if st.button("📥 Pull sales data", use_container_width=True):
+    with st.spinner("Scraping PriceCharting and writing to Google Sheet..."):
+        n, dbg = update_sales_history_from_watchlist(per_bucket=int(per_bucket), show_debug=show_debug)
 
-with c1:
-    if st.button("📥 Pull sales from PriceCharting → Write to Sales History", use_container_width=True):
-        with st.spinner("Scraping and writing..."):
-            n = update_sales_history_from_watchlist(per_bucket=int(per_bucket))
-        st.success(f"Appended {n} new sale row(s).")
+    st.success(f"Done. Appended {n} new row(s).")
 
-with c2:
-    if st.button("🔄 Show current Sales History preview", use_container_width=True):
-        sales_ws = get_ws(SALES_HISTORY_WS_NAME)
-        ensure_headers(sales_ws, SALES_HEADERS)
-        sdf = read_df(sales_ws)
-        if sdf.empty:
-            st.info("Sales history is empty.")
-        else:
-            if "sale_date" in sdf.columns:
-                sdf["_sale_date_dt"] = pd.to_datetime(sdf["sale_date"], errors="coerce")
-                sdf = sdf.sort_values("_sale_date_dt", ascending=False).drop(columns=["_sale_date_dt"])
-            st.dataframe(sdf, use_container_width=True, hide_index=True)
+    if show_debug and dbg:
+        with st.expander("Debug output (per link)", expanded=True):
+            st.dataframe(pd.DataFrame(dbg), use_container_width=True, hide_index=True)
+
+if st.button("🔄 Preview Sales History", use_container_width=True):
+    ws = get_ws(SALES_HISTORY_WS_NAME)
+    ensure_headers(ws, SALES_HEADERS)
+    sdf = read_df(ws)
+    if sdf.empty:
+        st.info("Sales history is empty.")
+    else:
+        if "sale_date" in sdf.columns:
+            sdf["_dt"] = pd.to_datetime(sdf["sale_date"], errors="coerce")
+            sdf = sdf.sort_values("_dt", ascending=False).drop(columns=["_dt"])
+        st.dataframe(sdf, use_container_width=True, hide_index=True)
