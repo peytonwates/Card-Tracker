@@ -4,7 +4,10 @@
 # Goal:
 # - Read rows from Google Sheet tab: grading_watch_list
 # - For each row, use the "Link" (PriceCharting) to pull the most recent SOLD sales
-# - Keep ONLY the latest N "ungraded" sales per watchlist item
+# - Keep ONLY the latest N sales per bucket:
+#       - ungraded
+#       - psa9   (Grade 9)
+#       - psa10  (PSA 10)
 # - (Optionally) filter to eBay-only rows
 # - Write those rows to Google Sheet tab: grading_sales_history (overwrite)
 # ---------------------------------------------------------
@@ -40,12 +43,14 @@ SALES_HISTORY_WS_NAME = st.secrets.get("grading_sales_history_worksheet", "gradi
 
 WATCHLIST_HEADERS_EXPECTED = ["Generation", "Set", "Card Name", "Card No", "Link"]
 
+# NOTE: Added grade_bucket so we can store ungraded vs psa9 vs psa10
 SALES_HISTORY_HEADERS = [
     "Generation",
     "Set",
     "Card Name",
     "Card No",
     "Link",
+    "grade_bucket",  # ungraded / psa9 / psa10
     "sale_date",     # YYYY-MM-DD
     "price",         # numeric
     "title",
@@ -89,9 +94,10 @@ def _bs_parser():
 
 def _classify_grade_from_title(title: str) -> str:
     """
-    Simple classifier:
-    - PSA 9/10 => graded
-    - else => ungraded
+    bucket mapping:
+      - PSA 10 / Gem Mint 10 -> psa10
+      - PSA 9 / Mint 9       -> psa9   (this is your "Grade 9" bucket)
+      - else                 -> ungraded
     """
     t = (title or "").upper()
     if re.search(r"\bPSA\s*10\b", t) or re.search(r"\bGEM\s*(MINT|MT)\s*10\b", t):
@@ -101,10 +107,6 @@ def _classify_grade_from_title(title: str) -> str:
     return "ungraded"
 
 def _parse_any_date(text: str):
-    """
-    PriceCharting sold listings typically show YYYY-MM-DD.
-    We'll be flexible anyway.
-    """
     if not text:
         return None
     d = pd.to_datetime(text, errors="coerce")
@@ -115,9 +117,6 @@ def _parse_any_date(text: str):
     return d.date()
 
 def _price_from_cell_text(text: str) -> float:
-    """
-    Pull a single $X.XX from a *cell*, not from a whole row blob.
-    """
     if not text:
         return 0.0
     m = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", text)
@@ -190,7 +189,6 @@ def ensure_headers(ws, headers: list[str]):
         _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
         return
     current = [safe_str(x).strip() for x in (values[0] or [])]
-    # For this simple page, overwrite header if different.
     if current != headers:
         _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
 
@@ -268,16 +266,10 @@ def http_get_with_backoff(url: str, *, timeout=25, max_tries=6):
 
 
 # =========================
-# PriceCharting sold sales scraper (FIXED)
+# PriceCharting sold sales scraper (table-cell based)
 # =========================
 @st.cache_data(ttl=60 * 60 * 6)
-def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list[dict]:
-    """
-    Parse sold listings by reading the actual table cells, not row text.
-
-    Output:
-      { sale_date: date, price: float, title: str, grade_bucket: str, sale_key: str }
-    """
+def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 150) -> list[dict]:
     link = (reference_link or "").strip()
     if not link or "pricecharting.com" not in link.lower():
         return []
@@ -285,19 +277,17 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
     r = http_get_with_backoff(link, timeout=25, max_tries=6)
     soup = BeautifulSoup(r.text, _bs_parser())
 
-    # Find a table whose header contains "Sale Date" and "Price"
     target_table = None
     for tbl in soup.find_all("table"):
         ths = [th.get_text(" ", strip=True) for th in tbl.find_all("th")]
         ths_norm = [t.lower() for t in ths if t]
-        if any("sale date" in t for t in ths_norm) and any(t.strip() == "price" or "price" in t for t in ths_norm):
+        if any("sale date" in t for t in ths_norm) and any("price" in t for t in ths_norm):
             target_table = tbl
             break
 
     if target_table is None:
         return []
 
-    # Map header names -> column index
     header_cells = [th.get_text(" ", strip=True) for th in target_table.find_all("th")]
     header_norm = [h.strip().lower() for h in header_cells]
 
@@ -311,8 +301,7 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
     title_idx = _find_col_idx("title")
     price_idx = _find_col_idx("price")
 
-    # If we can't find a clean mapping, fallback to common layout:
-    # [Sale Date, TW, Title, Price]
+    # fallback common layout
     if sale_date_idx is None:
         sale_date_idx = 0
     if title_idx is None:
@@ -326,7 +315,6 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
         if not tds:
             continue
 
-        # Safe get
         def cell(i: int) -> str:
             if i < 0 or i >= len(tds):
                 return ""
@@ -358,7 +346,6 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
             }
         )
 
-    # Dedup + sort newest first
     by_key = {s["sale_key"]: s for s in sales if s.get("sale_key")}
     out = list(by_key.values())
     out.sort(key=lambda x: (x["sale_date"], x["price"]), reverse=True)
@@ -366,11 +353,11 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
 
 
 # =========================
-# Core: build sales-history rows (last N ungraded per item)
+# Core: build rows (last N per bucket per item)
 # =========================
 def build_sales_history_rows_from_watchlist(
     wdf: pd.DataFrame,
-    per_item_n: int = 5,
+    per_bucket_n: int = 5,
     ebay_only: bool = True,
 ) -> pd.DataFrame:
     if wdf is None or wdf.empty:
@@ -392,46 +379,51 @@ def build_sales_history_rows_from_watchlist(
         if "pricecharting.com" not in link.lower():
             continue
 
-        # Polite delay between items
         if rows_out:
             time.sleep(0.75)
 
-        sales = fetch_pricecharting_sold_sales(link, limit=120)
+        sales = fetch_pricecharting_sold_sales(link, limit=200)
         if not sales:
             continue
 
-        # Filter to ungraded
-        ungraded = [s for s in sales if (s.get("grade_bucket") or "").lower() == "ungraded"]
-
-        # Filter to eBay only (matches PriceCharting label style)
+        # optionally filter to eBay only
         if ebay_only:
-            ungraded = [s for s in ungraded if "[ebay]" in (s.get("title", "").lower())]
+            sales = [s for s in sales if "[ebay]" in (s.get("title", "").lower())]
 
-        ungraded = ungraded[: int(per_item_n)]
-
-        for s in ungraded:
-            rows_out.append(
-                {
-                    "Generation": safe_str(r.get("Generation", "")).strip(),
-                    "Set": safe_str(r.get("Set", "")).strip(),
-                    "Card Name": safe_str(r.get("Card Name", "")).strip(),
-                    "Card No": safe_str(r.get("Card No", "")).strip(),
-                    "Link": link,
-                    "sale_date": s["sale_date"].isoformat() if isinstance(s.get("sale_date"), date) else safe_str(s.get("sale_date", "")).strip(),
-                    "price": float(safe_float(s.get("price", 0.0), 0.0)),
-                    "title": safe_str(s.get("title", "")).strip(),
-                    "sale_key": safe_str(s.get("sale_key", "")).strip(),
-                    "updated_utc": now_utc,
-                }
-            )
+        # pick last N per bucket
+        buckets = ["ungraded", "psa9", "psa10"]
+        for b in buckets:
+            picks = [s for s in sales if (s.get("grade_bucket") or "").lower() == b][: int(per_bucket_n)]
+            for s in picks:
+                rows_out.append(
+                    {
+                        "Generation": safe_str(r.get("Generation", "")).strip(),
+                        "Set": safe_str(r.get("Set", "")).strip(),
+                        "Card Name": safe_str(r.get("Card Name", "")).strip(),
+                        "Card No": safe_str(r.get("Card No", "")).strip(),
+                        "Link": link,
+                        "grade_bucket": b,
+                        "sale_date": s["sale_date"].isoformat() if isinstance(s.get("sale_date"), date) else safe_str(s.get("sale_date", "")).strip(),
+                        "price": float(safe_float(s.get("price", 0.0), 0.0)),
+                        "title": safe_str(s.get("title", "")).strip(),
+                        "sale_key": safe_str(s.get("sale_key", "")).strip(),
+                        "updated_utc": now_utc,
+                    }
+                )
 
     df_out = pd.DataFrame(rows_out)
     if df_out.empty:
         return pd.DataFrame(columns=SALES_HISTORY_HEADERS)
 
     df_out["price"] = df_out["price"].apply(lambda v: safe_float(v, 0.0))
-    df_out["sale_date_dt"] = pd.to_datetime(df_out["sale_date"], errors="coerce")
-    df_out = df_out.sort_values(["Card Name", "Card No", "sale_date_dt"], ascending=[True, True, False]).drop(columns=["sale_date_dt"])
+    df_out["_sale_date"] = pd.to_datetime(df_out["sale_date"], errors="coerce")
+
+    # sort newest first within each item & bucket
+    df_out = df_out.sort_values(
+        ["Card Name", "Card No", "grade_bucket", "_sale_date"],
+        ascending=[True, True, True, False],
+    ).drop(columns=["_sale_date"])
+
     return df_out[SALES_HISTORY_HEADERS].copy()
 
 
@@ -439,8 +431,8 @@ def build_sales_history_rows_from_watchlist(
 # UI
 # =========================
 st.caption(
-    "This page ONLY does one thing: reads `grading_watch_list`, scrapes SOLD comps from PriceCharting, "
-    "keeps the latest **ungraded** sales per item, and overwrites `grading_sales_history`."
+    "This page reads `grading_watch_list`, scrapes SOLD comps from PriceCharting, "
+    "keeps the latest **N per bucket** (ungraded / psa9 / psa10), and overwrites `grading_sales_history`."
 )
 
 sheet = get_sheet()
@@ -454,7 +446,7 @@ wdf = read_ws_df(watch_ws)
 c1, c2, c3 = st.columns([1, 1, 2])
 
 with c1:
-    per_item_n = st.number_input("Ungraded sales per item", min_value=1, max_value=20, value=5, step=1)
+    per_bucket_n = st.number_input("Sales per bucket (ungraded / grade 9 / psa 10)", min_value=1, max_value=20, value=5, step=1)
 
 with c2:
     ebay_only = st.checkbox("eBay only", value=True)
@@ -466,7 +458,7 @@ with c3:
         else:
             out_df = build_sales_history_rows_from_watchlist(
                 wdf,
-                per_item_n=int(per_item_n),
+                per_bucket_n=int(per_bucket_n),
                 ebay_only=bool(ebay_only),
             )
             write_ws_df(sales_ws, out_df, SALES_HISTORY_HEADERS)
@@ -493,5 +485,5 @@ else:
         sdf["price"] = sdf["price"].apply(lambda v: safe_float(v, 0.0))
     if "sale_date" in sdf.columns:
         sdf["_sale_date"] = pd.to_datetime(sdf["sale_date"], errors="coerce")
-        sdf = sdf.sort_values("_sale_date", ascending=False).drop(columns=["_sale_date"])
+        sdf = sdf.sort_values(["grade_bucket", "_sale_date"], ascending=[True, False]).drop(columns=["_sale_date"])
     st.dataframe(sdf, use_container_width=True, hide_index=True)
