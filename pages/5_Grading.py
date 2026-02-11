@@ -15,7 +15,14 @@ from bs4 import BeautifulSoup
 import gspread
 from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
+
+# AgGrid (guarded so the page doesn't go blank if the package/env has issues)
+try:
+    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
+    AGGRID_OK = True
+except Exception:
+    AGGRID_OK = False
+
 
 st.set_page_config(page_title="Grading", layout="wide")
 st.title("Grading")
@@ -236,6 +243,16 @@ def _parse_iso_date(s: str):
     except Exception:
         return None
 
+def _bs_parser():
+    """
+    Use lxml if available; otherwise fall back to html.parser to avoid hard dependency.
+    """
+    try:
+        import lxml  # noqa: F401
+        return "lxml"
+    except Exception:
+        return "html.parser"
+
 
 # =========================================================
 # GOOGLE SHEETS AUTH
@@ -338,7 +355,7 @@ def _read_sheet_df(ws) -> pd.DataFrame:
     if not raw_header or all(str(h).strip() == "" for h in raw_header):
         return pd.DataFrame()
 
-    # ✅ Make headers stable/unique (prevents duplicate-key crashes)
+    # ✅ stable/unique headers
     header = _build_stable_unique_headers(raw_header)
 
     rows = values[1:]
@@ -352,10 +369,9 @@ def _read_sheet_df(ws) -> pd.DataFrame:
 
     df = pd.DataFrame(out_rows, columns=header)
 
-    # ✅ Optional safety: remove duplicated columns if any still slip through
+    # ✅ remove any duplicated columns defensively
     df = df.loc[:, ~df.columns.duplicated()].copy()
     return df
-
 
 def _batch_write_sheet(ws, df: pd.DataFrame, header: list[str]):
     df2 = df.copy()
@@ -424,7 +440,7 @@ def fetch_pricecharting_prices(reference_link: str) -> dict:
 
     try:
         r = http_get_with_backoff(link, timeout=25, max_tries=6)
-        soup = BeautifulSoup(r.text, "lxml")
+        soup = BeautifulSoup(r.text, _bs_parser())
         nodes = soup.select(".price.js-price")
         prices = []
         for n in nodes:
@@ -448,7 +464,7 @@ def fetch_pricecharting_image_url(reference_link: str) -> str:
 
     try:
         r = http_get_with_backoff(link, timeout=25, max_tries=6)
-        soup = BeautifulSoup(r.text, "lxml")
+        soup = BeautifulSoup(r.text, _bs_parser())
 
         meta = soup.find("meta", attrs={"property": "og:image"})
         if meta and meta.get("content"):
@@ -499,15 +515,11 @@ def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 60) 
     except Exception:
         return []
 
-    soup = BeautifulSoup(r.text, "lxml")
+    soup = BeautifulSoup(r.text, _bs_parser())
 
     sales = []
     price_re = re.compile(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
 
-    # date formats seen on PriceCharting:
-    # - 2026-01-31
-    # - 01/31/2026 or 1/3/26
-    # - Jan 31, 2026
     iso_date_re = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
     slash_date_re = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b")
     month_date_re = re.compile(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+20\d{2}\b", re.IGNORECASE)
@@ -540,11 +552,9 @@ def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 60) 
             except Exception:
                 pass
 
-        # last resort: try pandas on the whole line (but keep it conservative)
         try:
             d = pd.to_datetime(text, errors="coerce")
             if pd.notna(d):
-                # guard against “today” guesses by pandas on random text
                 if d.year >= 2000:
                     return d.date()
         except Exception:
@@ -586,7 +596,6 @@ def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 60) 
 
         title = ""
         if cells:
-            # remove pieces that look like date/price
             filtered = []
             for c in cells:
                 if "$" in c and price_re.search(c):
@@ -617,7 +626,6 @@ def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 60) 
             if price <= 0:
                 continue
 
-            # try find a date in a small neighborhood
             sale_date = None
             for j in range(max(0, i - 2), min(i + 6, len(lines))):
                 sale_date = _parse_any_date(lines[j])
@@ -630,14 +638,12 @@ def fetch_pricecharting_sold_sales_latest(reference_link: str, limit: int = 60) 
             title = ln.split("[", 1)[0].strip() if "[" in ln else ln.strip()
             _emit(title, sale_date, price)
 
-    # de-dupe by sale_key
     by_key = {}
     for s in sales:
         if s.get("sale_key"):
             by_key[s["sale_key"]] = s
     sales2 = list(by_key.values())
 
-    # newest first
     sales2.sort(key=lambda x: (x["sale_date"], x["price"]), reverse=True)
     return sales2[: max(1, int(limit))]
 
@@ -735,7 +741,6 @@ def load_grading_df():
             s = s.where(s.str.strip() != "", t)
         df[base] = s
 
-    # unify legacy -> canon
     _coalesce_into("grading_fee_initial", ["grading_fee_per_card"])
     _coalesce_into("additional_costs", ["extra_costs"])
     _coalesce_into("received_grade", ["returned_grade"])
@@ -774,7 +779,6 @@ def load_watchlist_gemrates_sales():
     wdf = wdf.loc[:, ~wdf.columns.duplicated()].copy() if not wdf.empty else wdf
     gdf = gdf.loc[:, ~gdf.columns.duplicated()].copy() if not gdf.empty else gdf
     sdf = sdf.loc[:, ~sdf.columns.duplicated()].copy() if not sdf.empty else sdf
-
 
     return wdf, gdf, sdf
 
@@ -899,13 +903,13 @@ def update_inventory_status(inventory_id: str, new_status: str):
         return
 
     headers = values[0]
-    idx = { _strip_dups(h): j for j, h in enumerate(headers) }
+    idx = {_strip_dups(h): j for j, h in enumerate(headers)}
 
     if "inventory_id" not in idx or "inventory_status" not in idx:
         ensure_headers(inv_ws, ["inventory_id", "inventory_status"], write=True)
         values = inv_ws.get_all_values()
         headers = values[0] if values else []
-        idx = { _strip_dups(h): j for j, h in enumerate(headers) }
+        idx = {_strip_dups(h): j for j, h in enumerate(headers)}
 
     if "inventory_id" not in idx or "inventory_status" not in idx:
         return
@@ -923,7 +927,12 @@ def update_inventory_status(inventory_id: str, new_status: str):
         return
 
     col_letter = a1_col_letter(status_col_idx + 1)
-    _gs_write_retry(inv_ws.update, values=[[new_status]], range_name=f"{col_letter}{target_row}", value_input_option="USER_ENTERED")
+    _gs_write_retry(
+        inv_ws.update,
+        values=[[new_status]],
+        range_name=f"{col_letter}{target_row}",
+        value_input_option="USER_ENTERED",
+    )
 
 
 # =========================================================
@@ -931,15 +940,6 @@ def update_inventory_status(inventory_id: str, new_status: str):
 # =========================================================
 
 def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> int:
-    """
-    For each PriceCharting Link in watchlist:
-      - fetch latest sales (up to ~60)
-      - add new sale rows to sales history sheet
-      - then keep ONLY last `keep_n` per (reference_link, grade_bucket)
-        so you end up with up to 30 rows per link (10 ungraded + 10 psa9 + 10 psa10)
-
-    Returns count of links updated.
-    """
     if wdf is None or wdf.empty or "Link" not in wdf.columns:
         return 0
 
@@ -978,7 +978,6 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
     sdf_out = sdf.copy()
 
     for idx, lk in enumerate(uniq, start=1):
-        # gentle throttle to reduce 429
         if idx > 1:
             time.sleep(1.1)
 
@@ -989,11 +988,9 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
         ex_keys = existing.get(lk, set())
         new_sales = [s for s in latest if s.get("sale_key") and s["sale_key"] not in ex_keys]
 
-        # If we already have link and nothing new, skip
         if not new_sales and lk in existing:
             continue
 
-        # pull old rows for link
         old = sdf_out[sdf_out["reference_link"].astype(str).str.strip() == lk].copy()
 
         merged = []
@@ -1021,7 +1018,6 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
                 "updated_utc": now_utc,
             })
 
-        # de-dupe by sale_key
         by_key = {}
         for m in merged:
             if m.get("sale_key"):
@@ -1032,7 +1028,6 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
             dd = _parse_iso_date(d)
             return dd or date(1900, 1, 1)
 
-        # keep last N per bucket
         dfm = pd.DataFrame(merged2)
         if dfm.empty:
             continue
@@ -1045,7 +1040,6 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
         dfm["sale_date_dt"] = dfm["sale_date"].apply(_parse_date_safe)
         dfm["price_f"] = dfm["price"].apply(lambda v: safe_float(v, 0.0))
 
-        # sort newest first
         dfm = dfm.sort_values(["grade_bucket", "sale_date_dt", "price_f"], ascending=[True, False, False])
 
         kept_parts = []
@@ -1053,16 +1047,13 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
             part = dfm[dfm["grade_bucket"] == bucket].copy()
             if not part.empty:
                 kept_parts.append(part.head(int(keep_n)))
-        # also keep any unknown bucket just in case (limited)
         other = dfm[~dfm["grade_bucket"].isin(["ungraded", "psa9", "psa10"])].copy()
         if not other.empty:
             kept_parts.append(other.head(5))
 
         kept = pd.concat(kept_parts, ignore_index=True) if kept_parts else dfm.head(int(keep_n))
-
         kept = kept.drop(columns=["sale_date_dt", "price_f"], errors="ignore")
 
-        # replace link section in sdf_out
         sdf_out = sdf_out[sdf_out["reference_link"].astype(str).str.strip() != lk].copy()
         sdf_out = pd.concat([sdf_out, kept[SALES_HISTORY_HEADERS_V2]], ignore_index=True)
 
@@ -1085,10 +1076,6 @@ def update_sales_history_incremental(wdf: pd.DataFrame, *, keep_n: int = 10) -> 
 # =========================================================
 
 def _sales_stats_from_last10(sdf: pd.DataFrame, link: str, bucket: str) -> dict:
-    """
-    Stats from the stored sales history sheet.
-    Because we keep last 10 per bucket per link, this is effectively "last 10".
-    """
     if sdf is None or sdf.empty or not link:
         return {"count": 0, "min": 0.0, "max": 0.0, "avg": 0.0}
 
@@ -1133,9 +1120,6 @@ def downside_penalty_psa9(buy_total: float, psa9_value: float) -> float:
     return float(min(65.0, abs(roi9) * 200.0))
 
 def _range_ratio(min_v: float, max_v: float, avg_v: float) -> float:
-    """
-    Volatility proxy: (max-min)/avg.
-    """
     avg_v = float(avg_v or 0.0)
     min_v = float(min_v or 0.0)
     max_v = float(max_v or 0.0)
@@ -1144,9 +1128,6 @@ def _range_ratio(min_v: float, max_v: float, avg_v: float) -> float:
     return max(0.0, (max_v - min_v) / avg_v)
 
 def _conf_log_scale(x: float, target: float) -> float:
-    """
-    0..1 confidence from count using log scaling.
-    """
     x = float(x or 0.0)
     target = float(target or 1.0)
     if x <= 0:
@@ -1154,13 +1135,6 @@ def _conf_log_scale(x: float, target: float) -> float:
     return float(min(1.0, math.log1p(x) / math.log1p(target)))
 
 def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame, grading_fee_assumption: float):
-    """
-    Produces the Analysis tab table:
-      - current prices (PriceCharting)
-      - last-10 sales stats (min/max/avg/count) for ungraded/psa9/psa10
-      - gemrates (total graded, psa10 count, gem rate)
-      - computed score + profit estimates based on Buy Basis + grading fee
-    """
     if wdf is None or wdf.empty:
         return pd.DataFrame()
 
@@ -1209,7 +1183,6 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
             if base_stats is None:
                 return 0.0, 0.0, 0.0
 
-            # optional filter by parallel within tmp (contains match)
             m = tmp[(tmp["__set"].apply(_norm_set) == setn) & (tmp["__cardno"].astype(str).str.strip() == cardno)].copy()
             if not m.empty and par:
                 par_l = par.lower()
@@ -1293,10 +1266,6 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
     out["Max Buy Price"] = out["Max Buy Price"].apply(lambda v: safe_float(v, 0.0))
 
     def _choose_market_value(row, bucket: str) -> float:
-        """
-        Use last-10 avg first (because it's *actual* sold comps),
-        fallback to PriceCharting current price.
-        """
         if bucket == "ungraded":
             v = safe_float(row.get("ungraded_avg_30d", 0.0), 0.0)
             if v > 0:
@@ -1318,17 +1287,14 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
         tb = float(safe_float(row.get("Target Buy Price", 0.0), 0.0))
         if tb > 0:
             return tb
-        # fallback to last-10 ungraded avg
         uavg = float(safe_float(row.get("ungraded_avg_30d", 0.0), 0.0))
         if uavg > 0:
             return uavg
-        # fallback to current raw
         return float(safe_float(row.get("Ungraded", 0.0), 0.0))
 
     out["Buy Basis (Raw)"] = out.apply(_buy_basis, axis=1)
     out["All-in Cost (Buy+Fee)"] = (out["Buy Basis (Raw)"].astype(float) + fee).round(2)
 
-    # compute "expected" PSA9/PSA10 values from last-10 avg (fallback current)
     out["_psa9_est"] = out.apply(lambda r: _choose_market_value(r, "psa9"), axis=1)
     out["_psa10_est"] = out.apply(lambda r: _choose_market_value(r, "psa10"), axis=1)
 
@@ -1347,19 +1313,6 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
     current_year = date.today().year
 
     def _score(row) -> float:
-        """
-        Scoring philosophy aligned to your guidelines:
-
-        Positive drivers:
-          - upside: profit/ROI in PSA10
-          - downside coverage: PSA9 profit close to breakeven (or better)
-          - low capital requirement
-
-        Confidence multipliers / penalties:
-          - penalize low graded population (Total Graded)
-          - penalize low sales counts per bucket (especially psa10)
-          - penalize wide price ranges (volatility) in comps
-        """
         cost = float(safe_float(row.get("All-in Cost (Buy+Fee)"), 0.0))
         if cost <= 0:
             return 0.0
@@ -1368,7 +1321,6 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
         profit9 = float(safe_float(row.get("Profit PSA 9"), 0.0))
         roi10 = float(safe_float(row.get("ROI PSA 10"), 0.0))
 
-        # counts
         psa10_sales = float(safe_float(row.get("psa10_sales_30d", 0.0), 0.0))
         psa9_sales = float(safe_float(row.get("psa9_sales_30d", 0.0), 0.0))
         raw_sales = float(safe_float(row.get("ungraded_sales_30d", 0.0), 0.0))
@@ -1376,7 +1328,6 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
         total_graded = float(safe_float(row.get("Total Graded", 0.0), 0.0))
         gem_rate = float(safe_float(row.get("Gem Rate", 0.0), 0.0))
 
-        # volatility proxies
         u_rr = _range_ratio(
             safe_float(row.get("ungraded_min_30d", 0.0), 0.0),
             safe_float(row.get("ungraded_max_30d", 0.0), 0.0),
@@ -1393,55 +1344,40 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
             safe_float(row.get("psa10_avg_30d", 0.0), 0.0),
         )
 
-        # --- Base components (0..100-ish) ---
-        # Upside: focus on ROI and absolute profit (both matter)
         roi10_clamped = max(-0.50, min(3.00, roi10))
-        roi_component = (roi10_clamped + 0.50) * 30.0  # 0..105
-        profit_component = max(-40.0, min(60.0, profit10))  # -40..60
+        roi_component = (roi10_clamped + 0.50) * 30.0
+        profit_component = max(-40.0, min(60.0, profit10))
 
-        # Downside coverage: reward PSA9 being near breakeven
-        # Map profit9 from [-0.5*cost .. +0.25*cost] to [0..25]
         p9_floor = -0.50 * cost
         p9_ceil = 0.25 * cost
         p9_norm = (profit9 - p9_floor) / (p9_ceil - p9_floor) if (p9_ceil - p9_floor) else 0.0
         p9_component = max(0.0, min(1.0, p9_norm)) * 25.0
 
-        # Capital efficiency: cheaper all-in cost is better (softly)
-        cap_component = 20.0 * (1.0 / (1.0 + (cost / 120.0)))  # ~20 at small cost, decays
+        cap_component = 20.0 * (1.0 / (1.0 + (cost / 120.0)))
 
-        # Small gem-rate boost (only if you have pop)
         gem_component = 0.0
         if total_graded > 0:
-            gem_component = min(10.0, max(0.0, gem_rate) * 20.0)  # up to +10
+            gem_component = min(10.0, max(0.0, gem_rate) * 20.0)
 
         base = roi_component + profit_component + p9_component + cap_component + gem_component
 
-        # --- Confidence multipliers ---
-        # graded population confidence (target: 2000 graded to be "high confidence")
         pop_conf = _conf_log_scale(total_graded, 2000.0)
-        # sales confidence (target: 10 sales in each bucket)
         s10_conf = _conf_log_scale(psa10_sales, 10.0)
         s9_conf = _conf_log_scale(psa9_sales, 10.0)
         sr_conf = _conf_log_scale(raw_sales, 10.0)
 
-        # prioritize psa10 sales confidence, then pop, then others
         conf = 0.55 * s10_conf + 0.25 * pop_conf + 0.10 * s9_conf + 0.10 * sr_conf
         conf = max(0.0, min(1.0, conf))
 
-        # --- Volatility penalty (wide range hurts confidence/score) ---
-        # Weight PSA10 comps most heavily.
         vol = 0.55 * p10_rr + 0.25 * p9_rr + 0.20 * u_rr
-        # penalty grows quickly after ~0.6 range ratio
         vol_pen = min(30.0, max(0.0, (vol - 0.30) * 35.0))
 
-        # --- Age penalty (optional; mild) ---
         rel_year = int(safe_float(row.get("Release Year", 0), 0.0) or 0)
         age_pen = 0.0
         if 1995 <= rel_year <= current_year:
             years_old = max(0, current_year - rel_year)
             age_pen = min(10.0, years_old * 0.75)
 
-        # --- Downside penalty if PSA9 is negative (extra beyond the component) ---
         down_pen = downside_penalty_psa9(cost, float(safe_float(row.get("_psa9_est", 0.0), 0.0)))
 
         raw_score = (base * (0.55 + 0.45 * conf)) - vol_pen - age_pen - (0.25 * down_pen)
@@ -1450,10 +1386,8 @@ def build_watchlist_view(wdf: pd.DataFrame, gdf: pd.DataFrame, sdf: pd.DataFrame
     out["Grading Score"] = out.apply(_score, axis=1).round(2)
     out["Gem Rate"] = out["Gem Rate"].astype(float).round(4)
 
-    # cleanup internal cols
     out.drop(columns=["_psa9_est", "_psa10_est"], inplace=True, errors="ignore")
 
-    # preferred display order (your "efficient evaluation table")
     front = [
         "Image",
         "Generation", "Set", "Card Name", "Card No", "Parallel",
@@ -1495,7 +1429,6 @@ def write_enriched_watchlist(view_df: pd.DataFrame):
         if c not in df2.columns:
             df2[c] = ""
 
-    # preserve sheet order (don’t drop cols)
     for c in sheet_header:
         if c not in df2.columns:
             df2[c] = ""
@@ -1544,16 +1477,12 @@ with tab_analysis:
         st.warning("Sales history sheet is empty. Click '📈 Refresh sales history' to populate.")
     else:
         st.caption(f"Sales history rows loaded: {len(sdf):,}")
-        # ✅ dedupe columns defensively
         sdf = sdf.loc[:, ~sdf.columns.duplicated()].copy()
 
         if "updated_utc" in sdf.columns:
             latest_ts = pd.to_datetime(sdf["updated_utc"].astype(str), errors="coerce").max()
             if pd.notna(latest_ts):
                 st.caption(f"Latest sales refresh (UTC): {latest_ts}")
-
-
-
 
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
@@ -1579,7 +1508,6 @@ with tab_analysis:
     else:
         view = build_watchlist_view(wdf, gdf, sdf, fee_assumption)
 
-        # --- Quick filter/sort controls ---
         st.markdown("### Filter / Sort")
 
         cfa, cfb, cfc, cfd = st.columns([1.1, 1.1, 1.1, 1.0])
@@ -1620,17 +1548,14 @@ with tab_analysis:
             )
             sort_desc = st.checkbox("Descending", value=True)
 
-        # apply filters
         filtered = view.copy()
 
-        # numeric filters
         if "Grading Score" in filtered.columns:
             filtered = filtered[filtered["Grading Score"].apply(lambda x: safe_float(x, 0.0)) >= float(min_score)]
 
         if "All-in Cost (Buy+Fee)" in filtered.columns:
             filtered = filtered[filtered["All-in Cost (Buy+Fee)"].apply(lambda x: safe_float(x, 0.0)) <= float(max_all_in)]
 
-        # text search
         if search:
             def _row_match(r):
                 blob = " ".join([
@@ -1644,7 +1569,6 @@ with tab_analysis:
 
             filtered = filtered[filtered.apply(_row_match, axis=1)]
 
-        # sort (stable + safe numeric coercion)
         if sort_col in filtered.columns:
             if sort_col in {
                 "Grading Score",
@@ -1667,122 +1591,88 @@ with tab_analysis:
                 filtered = filtered.sort_values(by="_sort_txt", ascending=not sort_desc, kind="mergesort").drop(columns=["_sort_txt"])
 
         filtered = filtered.reset_index(drop=True)
-
-        # --- BIGGER images + freeze Image column + better sort/filter UX ---
-        # NOTE: Streamlit's st.data_editor cannot freeze/pin columns while scrolling horizontally.
-        # To get "Image" frozen left, we switch this table to AgGrid which supports pinned columns.
-        # --- BIGGER images + freeze Image column + correct rendering ---
-        img_renderer = JsCode("""
-        function(params) {
-            if (!params.value) return '';
-            const url = String(params.value);
-
-            // build a real DOM node so AgGrid doesn't treat HTML as plain text
-            const eDiv = document.createElement('div');
-            eDiv.style.display = 'flex';
-            eDiv.style.alignItems = 'center';
-            eDiv.style.justifyContent = 'center';
-
-            const img = document.createElement('img');
-            img.src = url;
-            img.style.height = '260px';   // ~3x bigger than typical default
-            img.style.width = 'auto';
-            img.style.borderRadius = '10px';
-            img.style.objectFit = 'contain';
-
-            eDiv.appendChild(img);
-            return eDiv;
-        }
-        """)
-
-        link_renderer = JsCode("""
-        function(params) {
-            if (!params.value) return '';
-            const url = String(params.value);
-
-            const a = document.createElement('a');
-            a.href = url;
-            a.target = '_blank';
-            a.rel = 'noopener noreferrer';
-            a.innerText = 'PriceCharting';
-            return a;
-        }
-        """)
-
         df_show = filtered.loc[:, ~filtered.columns.duplicated()].copy()
 
-        gb = GridOptionsBuilder.from_dataframe(df_show)
-        gb.configure_default_column(sortable=True, filter=True, resizable=True, wrapText=True)
+        # Prefer AgGrid for pinned Image column; fallback to st.dataframe if AgGrid isn't available.
+        if AGGRID_OK:
+            try:
+                img_renderer = JsCode("""
+                function(params) {
+                    if (!params.value) return '';
+                    const url = String(params.value);
 
-        if "Image" in df_show.columns:
-            gb.configure_column(
-                "Image",
-                header_name="Image",
-                pinned="left",     # freeze/pin Image column
-                width=340,
-                cellRenderer=img_renderer,
-                sortable=False,
-                filter=False,
-                suppressSizeToFit=True,
-            )
+                    const eDiv = document.createElement('div');
+                    eDiv.style.display = 'flex';
+                    eDiv.style.alignItems = 'center';
+                    eDiv.style.justifyContent = 'center';
 
-        if "Link" in df_show.columns:
-            gb.configure_column(
-                "Link",
-                header_name="Link",
-                cellRenderer=link_renderer,
-                width=150,
-            )
+                    const img = document.createElement('img');
+                    img.src = url;
+                    img.style.height = '260px';
+                    img.style.width = 'auto';
+                    img.style.borderRadius = '10px';
+                    img.style.objectFit = 'contain';
 
-        # match taller images
-        gb.configure_grid_options(rowHeight=300)
+                    eDiv.appendChild(img);
+                    return eDiv;
+                }
+                """)
 
-        grid_options = gb.build()
+                link_renderer = JsCode("""
+                function(params) {
+                    if (!params.value) return '';
+                    const url = String(params.value);
 
-        AgGrid(
-            df_show,
-            gridOptions=grid_options,
-            height=780,
-            theme="streamlit",
-            allow_unsafe_jscode=True,
-            update_mode=GridUpdateMode.NO_UPDATE,
-            fit_columns_on_grid_load=False,
-        )
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.target = '_blank';
+                    a.rel = 'noopener noreferrer';
+                    a.innerText = 'PriceCharting';
+                    return a;
+                }
+                """)
 
+                gb = GridOptionsBuilder.from_dataframe(df_show)
+                gb.configure_default_column(sortable=True, filter=True, resizable=True, wrapText=True)
 
-        # If you still want manual edits + save-back, keep your existing st.data_editor below
-        # (but note: it won't have pinned columns). Commented out for now.
-        #
-        # img_cfg = {
-        #     "Image": st.column_config.ImageColumn("Image", width="large"),
-        #     "Link": st.column_config.LinkColumn("Link", display_text="PriceCharting"),
-        # }
-        #
-        # edited = st.data_editor(
-        #     df_show,
-        #     width="stretch",
-        #     hide_index=True,
-        #     num_rows="dynamic",
-        #     column_config=img_cfg,
-        #     disabled=[
-        #         "Image",
-        #         "Buy Basis (Raw)", "All-in Cost (Buy+Fee)",
-        #         "Ungraded", "PSA 9", "PSA 10",
-        #         "Profit PSA 9", "Profit PSA 10",
-        #         "ROI PSA 9", "ROI PSA 10",
-        #         "Total Graded", "# PSA 10", "Gem Rate",
-        #         "ungraded_sales_30d", "ungraded_min_30d", "ungraded_max_30d", "ungraded_avg_30d",
-        #         "psa9_sales_30d", "psa9_min_30d", "psa9_max_30d", "psa9_avg_30d",
-        #         "psa10_sales_30d", "psa10_min_30d", "psa10_max_30d", "psa10_avg_30d",
-        #         "Grading Score",
-        #     ],
-        # )
-        #
-        # if st.button("💾 Save Watch List (manual edits only)", type="primary", width="stretch"):
-        #     write_enriched_watchlist(edited)
-        #     st.success("Saved.")
-        #     st.rerun()
+                if "Image" in df_show.columns:
+                    gb.configure_column(
+                        "Image",
+                        header_name="Image",
+                        pinned="left",
+                        width=340,
+                        cellRenderer=img_renderer,
+                        sortable=False,
+                        filter=False,
+                        suppressSizeToFit=True,
+                    )
 
+                if "Link" in df_show.columns:
+                    gb.configure_column(
+                        "Link",
+                        header_name="Link",
+                        cellRenderer=link_renderer,
+                        width=150,
+                    )
+
+                gb.configure_grid_options(rowHeight=300)
+                grid_options = gb.build()
+
+                AgGrid(
+                    df_show,
+                    gridOptions=grid_options,
+                    height=780,
+                    theme="streamlit",
+                    allow_unsafe_jscode=True,
+                    update_mode=GridUpdateMode.NO_UPDATE,
+                    fit_columns_on_grid_load=False,
+                )
+            except Exception as e:
+                st.warning(f"AgGrid failed to render; falling back to Streamlit table. ({e})")
+                st.dataframe(df_show, use_container_width=True, hide_index=True)
+        else:
+            st.info("AgGrid not available in this environment; showing standard table.")
+            st.dataframe(df_show, use_container_width=True, hide_index=True)
 
 
 with tab_submit:
