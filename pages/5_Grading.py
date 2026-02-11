@@ -1,21 +1,24 @@
 # pages/5_Grading.py
 # ---------------------------------------------------------
-# Grading > Analysis (CLEAN VERSION)
+# Grading > Analysis (CLEAN + IMAGE + GEMRATES + SCORING + FILTERS)
+#
 # Goal:
-# - Read rows from Google Sheet tab: grading_watch_list (now includes Image column)
+# - Read rows from Google Sheet tab: grading_watch_list
 # - For each row, use the "Link" (PriceCharting) to pull the most recent SOLD sales:
-#     - Ungraded (existing table scrape)  (DO NOT CHANGE)
-#     - PSA10 (completed-auctions-manual-only) (DO NOT CHANGE)
-#     - PSA9  (completed-auctions-graded) (DO NOT CHANGE)
+#     - Ungraded (existing table scrape)                [DO NOT CHANGE]
+#     - PSA10 (completed-auctions-manual-only)          [DO NOT CHANGE]
+#     - PSA9  (completed-auctions-graded)               [DO NOT CHANGE]
 # - Keep ONLY the latest 5 sales per grade bucket per watchlist item
 # - Overwrite Google Sheet tab: grading_sales_history
 #
-# NEW:
-# - Scrape card image URL from the reference link and write it into watchlist "Image" column
-# - Summary table:
-#     - 1 row per card with Avg/Min/Max price for Ungraded, PSA9, PSA10
-#     - show Image next to Link
-#     - join GemRates tab (by Set + Card #) to pull Gem rate - All time and Total
+# Additions:
+# - Scrape best card image from PriceCharting and write to grading_watch_list.Image
+# - Build a summary table (1 row per card) that includes:
+#     - image + link
+#     - avg/min/max for Ungraded, PSA9, PSA10 (from sales history)
+#     - gemrate (all time) + total graded (from gemrates tab; key = Set + Card #)
+#     - prospect score (0-100) based on grading economics + gemrate confidence
+# - Filterable summary UI (set, score, PSA9/PSA10 prices, etc.)
 # ---------------------------------------------------------
 
 import json
@@ -23,6 +26,7 @@ import re
 import time
 from datetime import datetime, date
 from pathlib import Path
+from math import exp
 
 import pandas as pd
 import requests
@@ -46,9 +50,8 @@ st.title("Grading — Analysis")
 # =========================
 WATCHLIST_WS_NAME = st.secrets.get("grading_watchlist_worksheet", "grading_watch_list")
 SALES_HISTORY_WS_NAME = st.secrets.get("grading_sales_history_worksheet", "grading_sales_history")
-GEMRATES_WS_NAME = st.secrets.get("gemrates_worksheet", "gemrates")
+GEMRATES_WS_NAME = st.secrets.get("gemrates_worksheet", "gemrates")  # tab name "gemrates"
 
-# Watchlist now includes Image
 WATCHLIST_HEADERS_EXPECTED = ["Generation", "Set", "Card Name", "Card No", "Link", "Image"]
 
 SALES_HISTORY_HEADERS = [
@@ -69,7 +72,11 @@ SALES_HISTORY_HEADERS = [
 PER_ITEM_N = 5
 PSA10_PER_ITEM = 5
 PSA9_PER_ITEM = 5
-EBAY_ONLY = True  # fixed (no checkbox)
+EBAY_ONLY = True  # fixed
+
+# Scoring config
+GRADING_ALL_IN_COST = float(st.secrets.get("grading_all_in_cost", 25.0))  # you can set in secrets
+CONF_K = float(st.secrets.get("gemrate_conf_k", 250.0))                   # confidence saturation
 
 
 # =========================
@@ -91,12 +98,28 @@ def safe_float(x, default=0.0) -> float:
     except Exception:
         return default
 
+def safe_int(x, default=0) -> int:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, int):
+            return int(x)
+        s = safe_str(x).strip().replace(",", "")
+        if s == "":
+            return default
+        return int(float(s))
+    except Exception:
+        return default
+
 def a1_col_letter(n: int) -> str:
     letters = ""
     while n:
         n, r = divmod(n - 1, 26)
         letters = chr(65 + r) + letters
     return letters
+
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
 
 def _bs_parser():
     try:
@@ -131,19 +154,15 @@ def _price_from_cell_text(text: str) -> float:
         return 0.0
     return safe_float(m.group(1), 0.0)
 
-def _norm_set(x: str) -> str:
-    return re.sub(r"\s+", " ", safe_str(x).strip().lower())
+def _normalize_set(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
 
-def _norm_cardno(x: str) -> str:
-    """
-    Normalize card numbers so '063', '63', ' 63 ' all match.
-    If there are no digits, fallback to trimmed lower string.
-    """
-    s = safe_str(x).strip()
-    m = re.search(r"(\d+)", s)
-    if not m:
-        return s.strip().lower()
-    return str(int(m.group(1)))  # removes leading zeros
+def _normalize_cardno(v: str) -> str:
+    # compare as integer-ish string ("026" -> "26")
+    digits = re.sub(r"[^\d]", "", safe_str(v))
+    if digits == "":
+        return ""
+    return str(int(digits))
 
 
 # =========================
@@ -242,32 +261,32 @@ def write_ws_df(ws, df: pd.DataFrame, headers: list[str]):
     rng = f"A1:{last_col}{len(values)}"
     _gs_write_retry(ws.update, range_name=rng, values=values, value_input_option="RAW")
 
-def update_watchlist_image_column(ws, wdf: pd.DataFrame, image_urls_by_row_idx: dict[int, str]):
+def update_ws_column_by_header(ws, header_name: str, values_by_row_index_1based: dict[int, str]):
     """
-    Writes image URLs back into the watchlist "Image" column for specific row indices.
-    Row indices are 0-based within dataframe (excluding header row).
+    Update a single column (by header name) for specific row numbers (1-based, including header row).
+    Only writes rows provided in values_by_row_index_1based.
     """
-    if not image_urls_by_row_idx:
+    all_vals = ws.get_all_values()
+    if not all_vals or not all_vals[0]:
         return
 
-    values = ws.get_all_values()
-    if not values or not values[0]:
-        return
+    headers = [safe_str(x).strip() for x in all_vals[0]]
+    if header_name not in headers:
+        # append header if missing
+        headers.append(header_name)
+        _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
+        col_idx = len(headers)
+    else:
+        col_idx = headers.index(header_name) + 1
 
-    header = [safe_str(x).strip() for x in values[0]]
-    if "Image" not in header:
-        return
+    col_letter = a1_col_letter(col_idx)
 
-    img_col_idx = header.index("Image") + 1  # 1-based for A1
-    updates = []
-
-    for df_row_idx, url in image_urls_by_row_idx.items():
-        sheet_row = 2 + int(df_row_idx)  # header row=1
-        a1 = f"{a1_col_letter(img_col_idx)}{sheet_row}"
-        updates.append({"range": a1, "values": [[safe_str(url)]]})
-
-    if updates:
-        _gs_write_retry(ws.batch_update, updates)
+    # write individual cells (small volume, stable)
+    for row_1based, val in values_by_row_index_1based.items():
+        if row_1based <= 1:
+            continue
+        cell = f"{col_letter}{row_1based}"
+        _gs_write_retry(ws.update, range_name=cell, values=[[safe_str(val)]], value_input_option="RAW")
 
 
 # =========================
@@ -318,7 +337,7 @@ def http_get_with_backoff(url: str, *, timeout=25, max_tries=6):
 
 
 # =========================
-# Image scraper (PriceCharting) - UPDATED using your proven logic
+# Image scraping (from your working snippet)
 # =========================
 def _find_best_image(soup: BeautifulSoup) -> str:
     """
@@ -394,11 +413,6 @@ def _find_pricecharting_main_image(soup: BeautifulSoup) -> str:
 
 @st.cache_data(ttl=60 * 60 * 24)
 def fetch_pricecharting_image_url(reference_link: str) -> str:
-    """
-    Uses proven logic:
-      - _find_best_image(soup) first
-      - then _find_pricecharting_main_image(soup)
-    """
     link = (reference_link or "").strip()
     if not link or "pricecharting.com" not in link.lower():
         return ""
@@ -406,17 +420,12 @@ def fetch_pricecharting_image_url(reference_link: str) -> str:
     r = http_get_with_backoff(link, timeout=25, max_tries=6)
     soup = BeautifulSoup(r.text, _bs_parser())
 
-    url = _find_best_image(soup) or ""
-    if not url:
-        url = _find_pricecharting_main_image(soup) or ""
-
-    if not url:
-        return ""
-
-    url = url.strip()
-    if url.startswith("//"):
-        url = "https:" + url
-    return url
+    # Prefer your best finder, fallback to main image finder
+    img = _find_best_image(soup)
+    if img:
+        return img
+    img2 = _find_pricecharting_main_image(soup)
+    return img2 or ""
 
 
 # =========================
@@ -692,7 +701,8 @@ def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame) -> pd.DataFrame:
     if wdf is None or wdf.empty:
         return pd.DataFrame(columns=SALES_HISTORY_HEADERS)
 
-    for h in ["Generation", "Set", "Card Name", "Card No", "Link"]:
+    # ensure needed columns exist in df (do not overwrite sheet headers here)
+    for h in WATCHLIST_HEADERS_EXPECTED:
         if h not in wdf.columns:
             wdf[h] = ""
 
@@ -795,65 +805,78 @@ def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame) -> pd.DataFrame:
     df_out["sale_date_dt"] = pd.to_datetime(df_out["sale_date"], errors="coerce")
     df_out = df_out.sort_values(
         ["Card Name", "Card No", "grade_bucket", "sale_date_dt"],
-        ascending=[True, True, True, False],
+        ascending=[True, True, True, False]
     ).drop(columns=["sale_date_dt"])
     return df_out[SALES_HISTORY_HEADERS].copy()
 
 
 # =========================
-# GemRates loader + matcher
+# Gemrates loader (key = Set Name + Card #)
 # =========================
-def load_gemrates_df(sheet) -> pd.DataFrame:
-    try:
-        gr_ws = get_ws(sheet, GEMRATES_WS_NAME)
-        gdf = read_ws_df(gr_ws)
-        return gdf
-    except Exception:
-        return pd.DataFrame()
-
-def build_gemrates_lookup(gdf: pd.DataFrame) -> dict[tuple[str, str], dict]:
+def load_gemrates_lookup(gdf: pd.DataFrame) -> dict[tuple[str, str], dict]:
     """
-    Returns dict keyed by (set_norm, cardno_norm) => {total, gem_rate}
-    If multiple rows exist for same key, chooses the row with largest Total.
+    Returns dict keyed by (set_norm, cardno_norm) -> {gem_rate, total}
+    where gem_rate is decimal (0.39) and total is int.
     """
     if gdf is None or gdf.empty:
         return {}
 
-    col_set = "Set Name" if "Set Name" in gdf.columns else ("Set" if "Set" in gdf.columns else None)
-    col_card = "Card #" if "Card #" in gdf.columns else ("Card No" if "Card No" in gdf.columns else None)
-    col_total = "Total" if "Total" in gdf.columns else None
-    col_rate = "Gem rate - All time" if "Gem rate - All time" in gdf.columns else ("Gem rate" if "Gem rate" in gdf.columns else None)
+    # tolerate variations in column names
+    col_set = None
+    for c in ["Set Name", "Set", "SetName"]:
+        if c in gdf.columns:
+            col_set = c
+            break
+    col_card = None
+    for c in ["Card #", "Card#", "Card No", "CardNo"]:
+        if c in gdf.columns:
+            col_card = c
+            break
+    col_total = None
+    for c in ["Total", "TOTAL", "Total Graded"]:
+        if c in gdf.columns:
+            col_total = c
+            break
+    col_rate = None
+    for c in ["Gem rate - All time", "Gem Rate - All time", "Gem rate", "Gem Rate"]:
+        if c in gdf.columns:
+            col_rate = c
+            break
 
     if not col_set or not col_card:
         return {}
 
-    tmp = gdf.copy()
-    tmp["_set_norm"] = tmp[col_set].apply(_norm_set)
-    tmp["_card_norm"] = tmp[col_card].apply(_norm_cardno)
-
-    if col_total:
-        tmp["_total_num"] = tmp[col_total].apply(lambda v: safe_float(v, 0.0))
-    else:
-        tmp["_total_num"] = 0.0
-
-    tmp = tmp.sort_values("_total_num", ascending=False)
-
     out = {}
-    for _, r in tmp.iterrows():
-        k = (safe_str(r["_set_norm"]), safe_str(r["_card_norm"]))
-        if k in out:
+    for _, row in gdf.iterrows():
+        set_norm = _normalize_set(safe_str(row.get(col_set, "")))
+        card_norm = _normalize_cardno(safe_str(row.get(col_card, "")))
+        if not set_norm or not card_norm:
             continue
-        out[k] = {
-            "Total": safe_str(r.get(col_total, "")).strip() if col_total else "",
-            "Gem rate - All time": safe_str(r.get(col_rate, "")).strip() if col_rate else "",
-        }
+
+        total = safe_int(row.get(col_total, 0), 0) if col_total else 0
+        rate_raw = safe_str(row.get(col_rate, "")).strip() if col_rate else ""
+        rate = 0.0
+        if rate_raw.endswith("%"):
+            rate = safe_float(rate_raw.replace("%", ""), 0.0) / 100.0
+        else:
+            # allow decimals like 0.39
+            rate = safe_float(rate_raw, 0.0)
+            if rate > 1.0:
+                # if someone stored 39 instead of 0.39
+                rate = rate / 100.0
+
+        out[(set_norm, card_norm)] = {"gem_rate": float(rate), "total": int(total)}
     return out
 
 
 # =========================
-# Summary table builder (from grading_sales_history + watchlist image + gemrates)
+# Summary table builder (from grading_sales_history + watchlist + gemrates)
 # =========================
-def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_lookup: dict) -> pd.DataFrame:
+def build_summary_from_sales_history(
+    sdf: pd.DataFrame,
+    wdf: pd.DataFrame,
+    gem_lookup: dict[tuple[str, str], dict],
+) -> pd.DataFrame:
     if sdf is None or sdf.empty:
         return pd.DataFrame()
 
@@ -875,6 +898,7 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
     )
 
     def _bucket_cols(bucket: str):
+        b = bucket.lower()
         return {
             "mean": f"{bucket.upper()} Avg",
             "min": f"{bucket.upper()} Min",
@@ -887,137 +911,190 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
         sub = sub[keys + ["mean", "min", "max"]].copy() if not sub.empty else pd.DataFrame(columns=keys + ["mean", "min", "max"])
         rename = _bucket_cols(bucket)
         sub = sub.rename(columns={"mean": rename["mean"], "min": rename["min"], "max": rename["max"]})
+        out = sub if out is None else out.merge(sub, on=keys, how="outer")
 
-        if out is None:
-            out = sub
-        else:
-            out = out.merge(sub, on=keys, how="outer")
+    if out is None or out.empty:
+        return pd.DataFrame()
 
-    out = out.fillna(0.0)
+    # add image (from watchlist; by Link)
+    img_map = {}
+    if wdf is not None and not wdf.empty:
+        if "Link" in wdf.columns and "Image" in wdf.columns:
+            for _, r in wdf.iterrows():
+                lk = safe_str(r.get("Link", "")).strip()
+                if lk:
+                    img_map[lk] = safe_str(r.get("Image", "")).strip()
 
+    out["Image"] = out["Link"].map(lambda x: img_map.get(safe_str(x).strip(), ""))
+
+    # numeric formatting/round
     for c in out.columns:
         if c.endswith(" Avg") or c.endswith(" Min") or c.endswith(" Max"):
             out[c] = out[c].apply(lambda v: round(safe_float(v, 0.0), 2))
 
-    # bring in Image from watchlist (by the same keys)
-    img_map = {}
-    if wdf is not None and not wdf.empty:
-        for col in ["Generation", "Set", "Card Name", "Card No", "Link", "Image"]:
-            if col not in wdf.columns:
-                wdf[col] = ""
-        w2 = wdf.copy()
-        w2["Link"] = w2["Link"].astype(str).str.strip()
-        w2["Image"] = w2["Image"].astype(str).str.strip()
-        for _, r in w2.iterrows():
-            k = (
-                safe_str(r.get("Generation", "")).strip(),
-                safe_str(r.get("Set", "")).strip(),
-                safe_str(r.get("Card Name", "")).strip(),
-                safe_str(r.get("Card No", "")).strip(),
-                safe_str(r.get("Link", "")).strip(),
-            )
-            img_map[k] = safe_str(r.get("Image", "")).strip()
+    # gemrates (key = Set + Card No)
+    out["Gem rate (all time)"] = 0.0
+    out["Total graded"] = 0
 
-    out["Image"] = out.apply(
-        lambda rr: img_map.get(
-            (
-                safe_str(rr.get("Generation", "")).strip(),
-                safe_str(rr.get("Set", "")).strip(),
-                safe_str(rr.get("Card Name", "")).strip(),
-                safe_str(rr.get("Card No", "")).strip(),
-                safe_str(rr.get("Link", "")).strip(),
-            ),
-            "",
-        ),
-        axis=1,
-    )
+    for i, row in out.iterrows():
+        set_norm = _normalize_set(row.get("Set", ""))
+        card_norm = _normalize_cardno(row.get("Card No", ""))
+        rec = gem_lookup.get((set_norm, card_norm))
+        if rec:
+            out.at[i, "Gem rate (all time)"] = round(float(rec.get("gem_rate", 0.0)), 4)
+            out.at[i, "Total graded"] = int(rec.get("total", 0))
 
-    # gemrates join by Set + Card No
-    out["_set_norm"] = out["Set"].apply(_norm_set)
-    out["_card_norm"] = out["Card No"].apply(_norm_cardno)
+    # scoring fields
+    out = add_prospect_scoring(out)
 
-    out["Gem rate - All time"] = out.apply(
-        lambda rr: (gem_lookup.get((rr["_set_norm"], rr["_card_norm"]), {}) or {}).get("Gem rate - All time", ""),
-        axis=1,
-    )
-    out["Total graded"] = out.apply(
-        lambda rr: (gem_lookup.get((rr["_set_norm"], rr["_card_norm"]), {}) or {}).get("Total", ""),
-        axis=1,
-    )
-
-    out = out.drop(columns=["_set_norm", "_card_norm"], errors="ignore")
-
-    ordered = [
-        "Generation",
-        "Set",
-        "Card Name",
-        "Card No",
-        "Link",
-        "Image",
-        "Gem rate - All time",
-        "Total graded",
-        "UNGRADED Avg", "UNGRADED Min", "UNGRADED Max",
-        "PSA9 Avg", "PSA9 Min", "PSA9 Max",
-        "PSA10 Avg", "PSA10 Min", "PSA10 Max",
-    ]
-    final_cols = [c for c in ordered if c in out.columns] + [c for c in out.columns if c not in ordered]
-    out = out[final_cols].copy()
-
-    out = out.sort_values(["Card Name", "Card No"], ascending=[True, True]).reset_index(drop=True)
+    # sort
+    out = out.sort_values(["Set", "Card Name", "Card No"], ascending=[True, True, True]).reset_index(drop=True)
     return out
 
 
 # =========================
-# UI + workflow
+# Prospect scoring
+# =========================
+def add_prospect_scoring(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary is None or summary.empty:
+        return summary
+
+    df = summary.copy()
+
+    # ensure numeric columns exist
+    for col in ["UNGRADED Avg", "PSA9 Avg", "PSA10 Avg"]:
+        if col not in df.columns:
+            df[col] = 0.0
+
+    df["UNGRADED Avg"] = df["UNGRADED Avg"].apply(lambda v: safe_float(v, 0.0))
+    df["PSA9 Avg"] = df["PSA9 Avg"].apply(lambda v: safe_float(v, 0.0))
+    df["PSA10 Avg"] = df["PSA10 Avg"].apply(lambda v: safe_float(v, 0.0))
+
+    df["Gem rate (all time)"] = df.get("Gem rate (all time)", 0.0).apply(lambda v: safe_float(v, 0.0))
+    df["Total graded"] = df.get("Total graded", 0).apply(lambda v: safe_int(v, 0))
+
+    C = float(GRADING_ALL_IN_COST)
+
+    # confidence
+    # conf = 1 - exp(-N / k)
+    df["Gem conf"] = df["Total graded"].apply(lambda n: round(1.0 - exp(-max(0, safe_int(n, 0)) / max(1.0, CONF_K)), 4))
+
+    # adjusted p10 (discount by confidence)
+    df["P10 adj"] = (df["Gem rate (all time)"] * df["Gem conf"]).apply(lambda v: round(clamp(safe_float(v, 0.0), 0.0, 1.0), 4))
+
+    # net economics vs ungraded (simplified)
+    df["Net 9"] = (df["PSA9 Avg"] - (df["UNGRADED Avg"] + C)).apply(lambda v: round(safe_float(v, 0.0), 2))
+    df["Net 10"] = (df["PSA10 Avg"] - (df["UNGRADED Avg"] + C)).apply(lambda v: round(safe_float(v, 0.0), 2))
+
+    # component scores
+    # s9: -15 -> 0, +5 -> 1
+    def s9(net9: float) -> float:
+        return clamp((net9 + 15.0) / 20.0, 0.0, 1.0)
+
+    # s10: 0 -> 0, 50 -> 1
+    def s10(net10: float) -> float:
+        return clamp(net10 / 50.0, 0.0, 1.0)
+
+    # sg: p10_adj 0.10 -> 0, 0.50 -> 1
+    def sg(p10_adj: float) -> float:
+        return clamp((p10_adj - 0.10) / 0.40, 0.0, 1.0)
+
+    df["Score_s9"] = df["Net 9"].apply(lambda v: s9(safe_float(v, 0.0)))
+    df["Score_s10"] = df["Net 10"].apply(lambda v: s10(safe_float(v, 0.0)))
+    df["Score_sg"] = df["P10 adj"].apply(lambda v: sg(safe_float(v, 0.0)))
+
+    # Prospect score 0-100
+    df["Prospect Score"] = (
+        100.0 * (0.45 * df["Score_s10"] + 0.35 * df["Score_sg"] + 0.20 * df["Score_s9"])
+    ).apply(lambda v: round(clamp(safe_float(v, 0.0), 0.0, 100.0), 1))
+
+    # simple EV check (optional)
+    df["EV (vs ungraded)"] = (
+        df["P10 adj"] * df["PSA10 Avg"] + (1.0 - df["P10 adj"]) * df["PSA9 Avg"] - (df["UNGRADED Avg"] + C)
+    ).apply(lambda v: round(safe_float(v, 0.0), 2))
+
+    # cleanup helper columns (you can keep if you want)
+    df = df.drop(columns=["Score_s9", "Score_s10", "Score_sg"], errors="ignore")
+    return df
+
+
+# =========================
+# Refresh: also scrape/write Image column in watchlist
+# =========================
+def refresh_watchlist_images(watch_ws, wdf: pd.DataFrame):
+    """
+    Fetch image URL per watchlist row and write back to the watchlist sheet "Image" column.
+    Only updates rows where Image is blank OR invalid.
+    """
+    if wdf is None or wdf.empty:
+        return
+
+    if "Link" not in wdf.columns:
+        return
+
+    if "Image" not in wdf.columns:
+        # if user created it, it'll exist; but just in case, we still write column
+        wdf["Image"] = ""
+
+    updates = {}  # row_1based -> image_url
+    # rows in df correspond to sheet rows starting at row 2
+    for idx0, row in wdf.reset_index(drop=True).iterrows():
+        sheet_row = idx0 + 2
+        link = safe_str(row.get("Link", "")).strip()
+        if not link or "pricecharting.com" not in link.lower():
+            continue
+
+        cur_img = safe_str(row.get("Image", "")).strip()
+        if cur_img and (cur_img.startswith("http://") or cur_img.startswith("https://")):
+            continue
+
+        try:
+            img = fetch_pricecharting_image_url(link)
+        except Exception:
+            img = ""
+
+        if img:
+            updates[sheet_row] = img
+
+        # polite delay so we don't hammer
+        time.sleep(0.25)
+
+    if updates:
+        update_ws_column_by_header(watch_ws, "Image", updates)
+
+
+# =========================
+# UI (single refresh + filterable summary)
 # =========================
 sheet = get_sheet()
 watch_ws = get_ws(sheet, WATCHLIST_WS_NAME)
 sales_ws = get_ws(sheet, SALES_HISTORY_WS_NAME)
+gem_ws = get_ws(sheet, GEMRATES_WS_NAME)
 
 ensure_headers(sales_ws, SALES_HISTORY_HEADERS)
 
 wdf = read_ws_df(watch_ws)
-
-gdf = load_gemrates_df(sheet)
-gem_lookup = build_gemrates_lookup(gdf)
+gdf = read_ws_df(gem_ws)
+gem_lookup = load_gemrates_lookup(gdf)
 
 top = st.container()
 with top:
     c1, c2 = st.columns([1, 3])
+
     with c1:
         if st.button("Refresh", type="primary", use_container_width=True):
             if wdf is None or wdf.empty:
                 st.warning(f"No rows found in `{WATCHLIST_WS_NAME}`.")
             else:
                 try:
-                    with st.spinner("Refreshing images + sales history (Ungraded + PSA9 + PSA10)..."):
-                        # ---------- (1) Fill Image column in watchlist (blank cells only) ----------
-                        wdf2 = wdf.copy()
-                        if "Image" not in wdf2.columns:
-                            wdf2["Image"] = ""
+                    with st.spinner("Refreshing sales history + images..."):
+                        # 1) refresh watchlist images (writes back to watchlist)
+                        refresh_watchlist_images(watch_ws, wdf)
 
-                        to_write = {}
-                        for idx, row in wdf2.iterrows():
-                            link = safe_str(row.get("Link", "")).strip()
-                            img = safe_str(row.get("Image", "")).strip()
-                            if img:
-                                continue
-                            if "pricecharting.com" not in link.lower():
-                                continue
-                            if to_write:
-                                time.sleep(0.35)
-                            url = fetch_pricecharting_image_url(link)
-                            if url:
-                                to_write[idx] = url
-                                wdf2.at[idx, "Image"] = url
-
-                        if to_write:
-                            update_watchlist_image_column(watch_ws, wdf2, to_write)
-
-                        # refresh local watchlist df after updating
+                        # reload watchlist after writing images
                         wdf = read_ws_df(watch_ws)
 
-                        # ---------- (2) Pull sales + write sales history ----------
+                        # 2) refresh sales history
                         out_df = build_sales_history_rows_from_watchlist(wdf)
                         write_ws_df(sales_ws, out_df, SALES_HISTORY_HEADERS)
 
@@ -1028,24 +1105,128 @@ with top:
                     st.exception(e)
 
     with c2:
-        st.caption("Summary is calculated from `grading_sales_history` + watchlist Image + gemrates (Set + Card #).")
+        st.caption(
+            f"Summary is calculated from `grading_sales_history` (last 5 sales per grade bucket). "
+            f"Prospect Score uses all-in grading cost = ${GRADING_ALL_IN_COST:.2f} and gemrate confidence."
+        )
 
 st.divider()
 
+# Build summary from current sheets
 sdf = read_ws_df(sales_ws)
 summary_df = build_summary_from_sales_history(sdf, wdf, gem_lookup)
 
 if summary_df is None or summary_df.empty:
     st.info("No sales history yet. Click **Refresh** to populate `grading_sales_history` and see the summary.")
-else:
-    col_config = {}
-    if "Image" in summary_df.columns:
-        col_config["Image"] = st.column_config.ImageColumn("Image", help="Scraped from PriceCharting ref link", width="small")
-    if "Link" in summary_df.columns:
-        col_config["Link"] = st.column_config.LinkColumn("Link")
-    st.dataframe(
-        summary_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config=col_config,
-    )
+    st.stop()
+
+# -------------------------
+# Filters
+# -------------------------
+with st.expander("Filters", expanded=True):
+    f1, f2, f3, f4 = st.columns([1.2, 1.2, 1.2, 1.2])
+
+    # set + generation
+    sets = sorted([s for s in summary_df["Set"].dropna().astype(str).unique() if s.strip() != ""])
+    gens = sorted([g for g in summary_df["Generation"].dropna().astype(str).unique() if g.strip() != ""])
+
+    with f1:
+        sel_set = st.multiselect("Set", options=sets, default=sets)
+    with f2:
+        sel_gen = st.multiselect("Generation", options=gens, default=gens)
+
+    # score
+    score_min = float(summary_df["Prospect Score"].min()) if "Prospect Score" in summary_df.columns else 0.0
+    score_max = float(summary_df["Prospect Score"].max()) if "Prospect Score" in summary_df.columns else 100.0
+    with f3:
+        score_rng = st.slider("Prospect Score", 0.0, 100.0, (max(0.0, score_min), min(100.0, score_max)), 0.5)
+
+    # total graded min
+    with f4:
+        total_min = st.number_input("Min Total graded", min_value=0, value=0, step=10)
+
+    g1, g2, g3, g4 = st.columns([1.2, 1.2, 1.2, 1.2])
+
+    def _rng(col: str):
+        if col not in summary_df.columns:
+            return (0.0, 0.0)
+        vals = summary_df[col].apply(lambda v: safe_float(v, 0.0))
+        return (float(vals.min()), float(vals.max()))
+
+    p9_min, p9_max = _rng("PSA9 Avg")
+    p10_min, p10_max = _rng("PSA10 Avg")
+    u_min, u_max = _rng("UNGRADED Avg")
+    ev_min, ev_max = _rng("EV (vs ungraded)")
+
+    with g1:
+        psa9_rng = st.slider("PSA9 Avg ($)", 0.0, max(1.0, p9_max), (0.0, p9_max), 0.5)
+    with g2:
+        psa10_rng = st.slider("PSA10 Avg ($)", 0.0, max(1.0, p10_max), (0.0, p10_max), 0.5)
+    with g3:
+        ungraded_rng = st.slider("UNGRADED Avg ($)", 0.0, max(1.0, u_max), (0.0, u_max), 0.5)
+    with g4:
+        ev_rng = st.slider("EV (vs ungraded)", min(-200.0, ev_min), max(200.0, ev_max), (min(-200.0, ev_min), max(200.0, ev_max)), 0.5)
+
+# apply filters
+fdf = summary_df.copy()
+
+if sel_set:
+    fdf = fdf[fdf["Set"].astype(str).isin(sel_set)]
+if sel_gen:
+    fdf = fdf[fdf["Generation"].astype(str).isin(sel_gen)]
+
+if "Prospect Score" in fdf.columns:
+    fdf = fdf[(fdf["Prospect Score"].apply(lambda v: safe_float(v, 0.0)) >= score_rng[0]) &
+              (fdf["Prospect Score"].apply(lambda v: safe_float(v, 0.0)) <= score_rng[1])]
+
+if "Total graded" in fdf.columns:
+    fdf = fdf[fdf["Total graded"].apply(lambda v: safe_int(v, 0)) >= int(total_min)]
+
+fdf = fdf[(fdf["PSA9 Avg"].apply(lambda v: safe_float(v, 0.0)) >= psa9_rng[0]) &
+          (fdf["PSA9 Avg"].apply(lambda v: safe_float(v, 0.0)) <= psa9_rng[1])]
+
+fdf = fdf[(fdf["PSA10 Avg"].apply(lambda v: safe_float(v, 0.0)) >= psa10_rng[0]) &
+          (fdf["PSA10 Avg"].apply(lambda v: safe_float(v, 0.0)) <= psa10_rng[1])]
+
+fdf = fdf[(fdf["UNGRADED Avg"].apply(lambda v: safe_float(v, 0.0)) >= ungraded_rng[0]) &
+          (fdf["UNGRADED Avg"].apply(lambda v: safe_float(v, 0.0)) <= ungraded_rng[1])]
+
+if "EV (vs ungraded)" in fdf.columns:
+    fdf = fdf[(fdf["EV (vs ungraded)"].apply(lambda v: safe_float(v, 0.0)) >= ev_rng[0]) &
+              (fdf["EV (vs ungraded)"].apply(lambda v: safe_float(v, 0.0)) <= ev_rng[1])]
+
+# choose columns order (clean)
+preferred_cols = [
+    "Image",
+    "Link",
+    "Generation",
+    "Set",
+    "Card Name",
+    "Card No",
+    "Prospect Score",
+    "EV (vs ungraded)",
+    "Gem rate (all time)",
+    "Total graded",
+    "Gem conf",
+    "P10 adj",
+    "UNGRADED Avg", "UNGRADED Min", "UNGRADED Max",
+    "PSA9 Avg", "PSA9 Min", "PSA9 Max",
+    "PSA10 Avg", "PSA10 Min", "PSA10 Max",
+    "Net 9",
+    "Net 10",
+]
+
+final_cols = [c for c in preferred_cols if c in fdf.columns] + [c for c in fdf.columns if c not in preferred_cols]
+fdf = fdf[final_cols].copy()
+
+# show
+st.markdown("### Summary (filterable)")
+st.dataframe(
+    fdf,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Image": st.column_config.ImageColumn("Image", width="small"),
+        "Link": st.column_config.LinkColumn("Link", width="medium"),
+    },
+)
