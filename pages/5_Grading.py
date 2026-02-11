@@ -118,7 +118,7 @@ def _parse_any_date(text: str):
 def _price_from_cell_text(text: str) -> float:
     """
     Pull a single $X.XX from a *cell*, not from a whole row blob.
-    (This is the exact existing behavior — do not change.)
+    (UNCHANGED — this is the ungraded working logic.)
     """
     if not text:
         return 0.0
@@ -192,7 +192,6 @@ def ensure_headers(ws, headers: list[str]):
         _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
         return
     current = [safe_str(x).strip() for x in (values[0] or [])]
-    # For this simple page, overwrite header if different.
     if current != headers:
         _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
 
@@ -270,7 +269,7 @@ def http_get_with_backoff(url: str, *, timeout=25, max_tries=6):
 
 
 # =========================
-# PriceCharting sold sales scraper (FIXED) — UNCHANGED
+# PriceCharting sold sales scraper (UNTOUCHED)
 # =========================
 @st.cache_data(ttl=60 * 60 * 6)
 def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list[dict]:
@@ -328,7 +327,6 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
         if not tds:
             continue
 
-        # Safe get
         def cell(i: int) -> str:
             if i < 0 or i >= len(tds):
                 return ""
@@ -351,16 +349,9 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
 
         sale_key = f"{d.isoformat()}|{price:.2f}|{bucket}|{title[:90].strip().lower()}"
         sales.append(
-            {
-                "sale_date": d,
-                "price": float(price),
-                "title": title,
-                "grade_bucket": bucket,
-                "sale_key": sale_key,
-            }
+            {"sale_date": d, "price": float(price), "title": title, "grade_bucket": bucket, "sale_key": sale_key}
         )
 
-    # Dedup + sort newest first
     by_key = {s["sale_key"]: s for s in sales if s.get("sale_key")}
     out = list(by_key.values())
     out.sort(key=lambda x: (x["sale_date"], x["price"]), reverse=True)
@@ -368,14 +359,18 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
 
 
 # =========================
-# NEW: PSA 10 scraper from #completed-auctions-manual-only
-# (Does NOT change ungraded logic at all)
+# NEW: PSA 10 scraper from the manual-only section
+# FIX: section is usually a CLASS, not an ID
 # =========================
 @st.cache_data(ttl=60 * 60 * 6)
 def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 80) -> list[dict]:
     """
-    Pull sold listings ONLY from the '#completed-auctions-manual-only' section.
-    Then classify + return rows (we will filter to PSA10 in the caller).
+    Pull sold listings ONLY from the manual-only tab/section:
+      - URL fragment: #completed-auctions-manual-only (fragment isn't sent to server)
+      - HTML usually contains: div.completed-auctions-manual-only (CLASS), inside a tab-frame
+
+    Output matches fetch_pricecharting_sold_sales:
+      { sale_date: date, price: float, title: str, grade_bucket: str, sale_key: str }
     """
     link = (reference_link or "").strip()
     if not link or "pricecharting.com" not in link.lower():
@@ -384,11 +379,18 @@ def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 80) 
     r = http_get_with_backoff(link, timeout=25, max_tries=6)
     soup = BeautifulSoup(r.text, _bs_parser())
 
-    section = soup.find(id="completed-auctions-manual-only")
+    # IMPORTANT: in your devtools screenshot this is a CLASS, not necessarily an ID
+    section = soup.select_one("#completed-auctions-manual-only")
+    if section is None:
+        section = soup.select_one(".completed-auctions-manual-only")
+    if section is None:
+        # extra-safe fallback based on common structure
+        section = soup.select_one("div.tab-frame div.completed-auctions-manual-only")
+
     if section is None:
         return []
 
-    # Find the correct table within that section (same header logic as ungraded scraper)
+    # Find the sold listings table inside this section
     target_table = None
     for tbl in section.find_all("table"):
         ths = [th.get_text(" ", strip=True) for th in tbl.find_all("th")]
@@ -400,7 +402,6 @@ def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 80) 
     if target_table is None:
         return []
 
-    # Map header names -> column index
     header_cells = [th.get_text(" ", strip=True) for th in target_table.find_all("th")]
     header_norm = [h.strip().lower() for h in header_cells]
 
@@ -414,7 +415,6 @@ def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 80) 
     title_idx = _find_col_idx("title")
     price_idx = _find_col_idx("price")
 
-    # Fallback layout stays identical
     if sale_date_idx is None:
         sale_date_idx = 0
     if title_idx is None:
@@ -441,6 +441,7 @@ def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 80) 
         if not d:
             continue
 
+        # This pulls the FIRST $ in the price cell (your PSA10 sale price is the first $ amount)
         price = _price_from_cell_text(price_txt)
         if price <= 0:
             continue
@@ -450,13 +451,7 @@ def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 80) 
 
         sale_key = f"{d.isoformat()}|{price:.2f}|{bucket}|{title[:90].strip().lower()}"
         sales.append(
-            {
-                "sale_date": d,
-                "price": float(price),
-                "title": title,
-                "grade_bucket": bucket,
-                "sale_key": sale_key,
-            }
+            {"sale_date": d, "price": float(price), "title": title, "grade_bucket": bucket, "sale_key": sale_key}
         )
 
     by_key = {s["sale_key"]: s for s in sales if s.get("sale_key")}
@@ -467,8 +462,8 @@ def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 80) 
 
 # =========================
 # Core: build sales-history rows
-# - KEEP existing ungraded behavior
-# - ADD psa10 rows from manual-only section
+# - KEEP ungraded behavior
+# - ADD psa10 from manual-only section
 # =========================
 def build_sales_history_rows_from_watchlist(
     wdf: pd.DataFrame,
@@ -494,20 +489,17 @@ def build_sales_history_rows_from_watchlist(
         if "pricecharting.com" not in link.lower():
             continue
 
-        # Polite delay between items
         if rows_out:
             time.sleep(0.75)
 
         # -------------------------
-        # EXISTING: pull sold sales (ungraded logic unchanged)
+        # EXISTING: ungraded sales (UNCHANGED)
         # -------------------------
         sales = fetch_pricecharting_sold_sales(link, limit=120)
         if sales:
             ungraded = [s for s in sales if (s.get("grade_bucket") or "").lower() == "ungraded"]
-
             if ebay_only:
                 ungraded = [s for s in ungraded if "[ebay]" in (s.get("title", "").lower())]
-
             ungraded = ungraded[: int(per_item_n)]
 
             for s in ungraded:
@@ -527,16 +519,13 @@ def build_sales_history_rows_from_watchlist(
                 )
 
         # -------------------------
-        # NEW: pull PSA 10 from #completed-auctions-manual-only
-        # (same approach, just different section)
+        # NEW: PSA10 from manual-only section
         # -------------------------
         psa10_sales = fetch_pricecharting_psa10_manual_only(link, limit=120)
         if psa10_sales:
             psa10_only = [s for s in psa10_sales if (s.get("grade_bucket") or "").lower() == "psa10"]
-
             if ebay_only:
                 psa10_only = [s for s in psa10_only if "[ebay]" in (s.get("title", "").lower())]
-
             psa10_only = psa10_only[: int(per_item_n)]
 
             for s in psa10_only:
@@ -559,7 +548,6 @@ def build_sales_history_rows_from_watchlist(
     if df_out.empty:
         return pd.DataFrame(columns=SALES_HISTORY_HEADERS)
 
-    # De-dupe (important now that we have two pulls)
     if "sale_key" in df_out.columns:
         df_out = df_out.drop_duplicates(subset=["sale_key"], keep="first").copy()
 
@@ -573,9 +561,8 @@ def build_sales_history_rows_from_watchlist(
 # UI
 # =========================
 st.caption(
-    "This page reads `grading_watch_list`, scrapes SOLD comps from PriceCharting, keeps the latest "
-    "**ungraded** sales per item (UNCHANGED), and now ALSO pulls latest **PSA 10** sales from "
-    "`#completed-auctions-manual-only`. Then it overwrites `grading_sales_history`."
+    "Reads `grading_watch_list`, scrapes SOLD comps from PriceCharting, keeps latest **ungraded** sales (unchanged), "
+    "and ALSO pulls latest **PSA 10** sales from the manual-only section. Overwrites `grading_sales_history`."
 )
 
 sheet = get_sheet()
