@@ -2,17 +2,20 @@
 # ---------------------------------------------------------
 # Grading > Analysis (CLEAN VERSION)
 # Goal:
-# - Read rows from Google Sheet tab: grading_watch_list
+# - Read rows from Google Sheet tab: grading_watch_list (now includes Image column)
 # - For each row, use the "Link" (PriceCharting) to pull the most recent SOLD sales:
-#     - Ungraded (existing table scrape)
-#     - PSA10 (completed-auctions-manual-only)
-#     - PSA9  (completed-auctions-graded)
+#     - Ungraded (existing table scrape)  (DO NOT CHANGE)
+#     - PSA10 (completed-auctions-manual-only) (DO NOT CHANGE)
+#     - PSA9  (completed-auctions-graded) (DO NOT CHANGE)
 # - Keep ONLY the latest 5 sales per grade bucket per watchlist item
 # - Overwrite Google Sheet tab: grading_sales_history
 #
-# UI:
-# - Single "Refresh" button
-# - Summary table: 1 row per card with Avg/Min/Max price for Ungraded, PSA9, PSA10
+# NEW:
+# - Scrape card image URL from the reference link and write it into watchlist "Image" column
+# - Summary table:
+#     - 1 row per card with Avg/Min/Max price for Ungraded, PSA9, PSA10
+#     - show Image next to Link
+#     - join GemRates tab (by Set + Card #) to pull Gem rate - All time and Total
 # ---------------------------------------------------------
 
 import json
@@ -43,8 +46,10 @@ st.title("Grading — Analysis")
 # =========================
 WATCHLIST_WS_NAME = st.secrets.get("grading_watchlist_worksheet", "grading_watch_list")
 SALES_HISTORY_WS_NAME = st.secrets.get("grading_sales_history_worksheet", "grading_sales_history")
+GEMRATES_WS_NAME = st.secrets.get("gemrates_worksheet", "gemrates")
 
-WATCHLIST_HEADERS_EXPECTED = ["Generation", "Set", "Card Name", "Card No", "Link"]
+# Watchlist now includes Image
+WATCHLIST_HEADERS_EXPECTED = ["Generation", "Set", "Card Name", "Card No", "Link", "Image"]
 
 SALES_HISTORY_HEADERS = [
     "Generation",
@@ -64,7 +69,7 @@ SALES_HISTORY_HEADERS = [
 PER_ITEM_N = 5
 PSA10_PER_ITEM = 5
 PSA9_PER_ITEM = 5
-EBAY_ONLY = True  # fixed as requested (no checkbox)
+EBAY_ONLY = True  # fixed (no checkbox)
 
 
 # =========================
@@ -125,6 +130,20 @@ def _price_from_cell_text(text: str) -> float:
     if not m:
         return 0.0
     return safe_float(m.group(1), 0.0)
+
+def _norm_set(x: str) -> str:
+    return re.sub(r"\s+", " ", safe_str(x).strip().lower())
+
+def _norm_cardno(x: str) -> str:
+    """
+    Normalize card numbers so '063', '63', ' 63 ' all match.
+    If there are no digits, fallback to trimmed lower string.
+    """
+    s = safe_str(x).strip()
+    m = re.search(r"(\d+)", s)
+    if not m:
+        return s.strip().lower()
+    return str(int(m.group(1)))  # removes leading zeros
 
 
 # =========================
@@ -223,6 +242,34 @@ def write_ws_df(ws, df: pd.DataFrame, headers: list[str]):
     rng = f"A1:{last_col}{len(values)}"
     _gs_write_retry(ws.update, range_name=rng, values=values, value_input_option="RAW")
 
+def update_watchlist_image_column(ws, wdf: pd.DataFrame, image_urls_by_row_idx: dict[int, str]):
+    """
+    Writes image URLs back into the watchlist "Image" column for specific row indices.
+    Row indices are 0-based within dataframe (excluding header row).
+    """
+    if not image_urls_by_row_idx:
+        return
+
+    values = ws.get_all_values()
+    if not values or not values[0]:
+        return
+
+    header = [safe_str(x).strip() for x in values[0]]
+    if "Image" not in header:
+        return
+
+    img_col_idx = header.index("Image") + 1  # 1-based for A1
+    updates = []
+
+    for df_row_idx, url in image_urls_by_row_idx.items():
+        # sheet row number = header row (1) + data row index + 1
+        sheet_row = 2 + int(df_row_idx)
+        a1 = f"{a1_col_letter(img_col_idx)}{sheet_row}"
+        updates.append({"range": a1, "values": [[safe_str(url)]]})
+
+    if updates:
+        _gs_write_retry(ws.batch_update, updates)
+
 
 # =========================
 # HTTP (basic backoff)
@@ -269,6 +316,50 @@ def http_get_with_backoff(url: str, *, timeout=25, max_tries=6):
     if last_exc:
         raise last_exc
     raise requests.HTTPError(f"HTTPError: retries exhausted for {url}")
+
+
+# =========================
+# Image scraper (from PriceCharting reference link)
+# =========================
+@st.cache_data(ttl=60 * 60 * 24)
+def fetch_pricecharting_image_url(reference_link: str) -> str:
+    """
+    Tries to extract a representative card image from the PriceCharting game page.
+    Prefers og:image (usually best).
+    """
+    link = (reference_link or "").strip()
+    if not link or "pricecharting.com" not in link.lower():
+        return ""
+
+    r = http_get_with_backoff(link, timeout=25, max_tries=6)
+    soup = BeautifulSoup(r.text, _bs_parser())
+
+    # Best: OpenGraph image
+    og = soup.find("meta", attrs={"property": "og:image"})
+    if og and og.get("content"):
+        return og["content"].strip()
+
+    # Twitter image fallback
+    tw = soup.find("meta", attrs={"name": "twitter:image"})
+    if tw and tw.get("content"):
+        return tw["content"].strip()
+
+    # Try common image elements
+    for sel in [
+        "img.product-image",
+        "img#product-image",
+        "img.game-image",
+        "img",
+    ]:
+        img = soup.select_one(sel)
+        if img and img.get("src"):
+            src = img["src"].strip()
+            if src.startswith("http"):
+                return src
+            if src.startswith("//"):
+                return "https:" + src
+
+    return ""
 
 
 # =========================
@@ -448,7 +539,7 @@ def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 20) 
 
 
 # =========================
-# PSA9 scraper from ".completed-auctions-graded" (WORKING)
+# PSA9 scraper from ".completed-auctions-graded" (WORKING - DO NOT CHANGE)
 # =========================
 def _find_graded_sales_table(soup: BeautifulSoup):
     tables = soup.select("div.completed-auctions-graded table")
@@ -544,7 +635,8 @@ def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame) -> pd.DataFrame:
     if wdf is None or wdf.empty:
         return pd.DataFrame(columns=SALES_HISTORY_HEADERS)
 
-    for h in WATCHLIST_HEADERS_EXPECTED:
+    # do NOT require Image for sales scraping; only the normal expected cols
+    for h in ["Generation", "Set", "Card Name", "Card No", "Link"]:
         if h not in wdf.columns:
             wdf[h] = ""
 
@@ -645,14 +737,69 @@ def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame) -> pd.DataFrame:
 
     df_out["price"] = df_out["price"].apply(lambda v: safe_float(v, 0.0))
     df_out["sale_date_dt"] = pd.to_datetime(df_out["sale_date"], errors="coerce")
-    df_out = df_out.sort_values(["Card Name", "Card No", "grade_bucket", "sale_date_dt"], ascending=[True, True, True, False]).drop(columns=["sale_date_dt"])
+    df_out = df_out.sort_values(
+        ["Card Name", "Card No", "grade_bucket", "sale_date_dt"],
+        ascending=[True, True, True, False],
+    ).drop(columns=["sale_date_dt"])
     return df_out[SALES_HISTORY_HEADERS].copy()
 
 
 # =========================
-# Summary table builder (from grading_sales_history)
+# GemRates loader + matcher
 # =========================
-def build_summary_from_sales_history(sdf: pd.DataFrame) -> pd.DataFrame:
+def load_gemrates_df(sheet) -> pd.DataFrame:
+    try:
+        gr_ws = get_ws(sheet, GEMRATES_WS_NAME)
+        gdf = read_ws_df(gr_ws)
+        return gdf
+    except Exception:
+        return pd.DataFrame()
+
+def build_gemrates_lookup(gdf: pd.DataFrame) -> dict[tuple[str, str], dict]:
+    """
+    Returns dict keyed by (set_norm, cardno_norm) => {total, gem_rate}
+    If multiple rows exist for same key, chooses the row with largest Total.
+    """
+    if gdf is None or gdf.empty:
+        return {}
+
+    # tolerate column name variance
+    col_set = "Set Name" if "Set Name" in gdf.columns else ("Set" if "Set" in gdf.columns else None)
+    col_card = "Card #" if "Card #" in gdf.columns else ("Card No" if "Card No" in gdf.columns else None)
+    col_total = "Total" if "Total" in gdf.columns else None
+    col_rate = "Gem rate - All time" if "Gem rate - All time" in gdf.columns else ("Gem rate" if "Gem rate" in gdf.columns else None)
+
+    if not col_set or not col_card:
+        return {}
+
+    tmp = gdf.copy()
+    tmp["_set_norm"] = tmp[col_set].apply(_norm_set)
+    tmp["_card_norm"] = tmp[col_card].apply(_norm_cardno)
+
+    if col_total:
+        tmp["_total_num"] = tmp[col_total].apply(lambda v: safe_float(v, 0.0))
+    else:
+        tmp["_total_num"] = 0.0
+
+    # pick best row per key (max Total)
+    tmp = tmp.sort_values("_total_num", ascending=False)
+
+    out = {}
+    for _, r in tmp.iterrows():
+        k = (safe_str(r["_set_norm"]), safe_str(r["_card_norm"]))
+        if k in out:
+            continue
+        out[k] = {
+            "Total": safe_str(r.get(col_total, "")).strip() if col_total else "",
+            "Gem rate - All time": safe_str(r.get(col_rate, "")).strip() if col_rate else "",
+        }
+    return out
+
+
+# =========================
+# Summary table builder (from grading_sales_history + watchlist image + gemrates)
+# =========================
+def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_lookup: dict) -> pd.DataFrame:
     if sdf is None or sdf.empty:
         return pd.DataFrame()
 
@@ -674,7 +821,6 @@ def build_summary_from_sales_history(sdf: pd.DataFrame) -> pd.DataFrame:
     )
 
     def _bucket_cols(bucket: str):
-        b = bucket.lower()
         return {
             "mean": f"{bucket.upper()} Avg",
             "min": f"{bucket.upper()} Min",
@@ -684,16 +830,8 @@ def build_summary_from_sales_history(sdf: pd.DataFrame) -> pd.DataFrame:
     out = None
     for bucket in ["ungraded", "psa9", "psa10"]:
         sub = stats[stats["grade_bucket"] == bucket].copy()
-        if sub.empty:
-            cols = keys + [_bucket_cols(bucket)["mean"], _bucket_cols(bucket)["min"], _bucket_cols(bucket)["max"]]
-            empty = pd.DataFrame(columns=cols)
-            if out is None:
-                out = empty
-            else:
-                out = out.merge(empty, on=keys, how="outer")
-            continue
 
-        sub = sub[keys + ["mean", "min", "max"]].copy()
+        sub = sub[keys + ["mean", "min", "max"]].copy() if not sub.empty else pd.DataFrame(columns=keys + ["mean", "min", "max"])
         rename = _bucket_cols(bucket)
         sub = sub.rename(columns={"mean": rename["mean"], "min": rename["min"], "max": rename["max"]})
 
@@ -704,25 +842,96 @@ def build_summary_from_sales_history(sdf: pd.DataFrame) -> pd.DataFrame:
 
     out = out.fillna(0.0)
 
-    # nicer formatting: keep as numeric but rounded
+    # round numeric stats
     for c in out.columns:
         if c.endswith(" Avg") or c.endswith(" Min") or c.endswith(" Max"):
             out[c] = out[c].apply(lambda v: round(safe_float(v, 0.0), 2))
+
+    # bring in Image from watchlist (by the same keys)
+    img_map = {}
+    if wdf is not None and not wdf.empty:
+        for col in ["Generation", "Set", "Card Name", "Card No", "Link", "Image"]:
+            if col not in wdf.columns:
+                wdf[col] = ""
+        w2 = wdf.copy()
+        w2["Link"] = w2["Link"].astype(str).str.strip()
+        w2["Image"] = w2["Image"].astype(str).str.strip()
+        for _, r in w2.iterrows():
+            k = (
+                safe_str(r.get("Generation", "")).strip(),
+                safe_str(r.get("Set", "")).strip(),
+                safe_str(r.get("Card Name", "")).strip(),
+                safe_str(r.get("Card No", "")).strip(),
+                safe_str(r.get("Link", "")).strip(),
+            )
+            img_map[k] = safe_str(r.get("Image", "")).strip()
+
+    out["Image"] = out.apply(
+        lambda rr: img_map.get(
+            (
+                safe_str(rr.get("Generation", "")).strip(),
+                safe_str(rr.get("Set", "")).strip(),
+                safe_str(rr.get("Card Name", "")).strip(),
+                safe_str(rr.get("Card No", "")).strip(),
+                safe_str(rr.get("Link", "")).strip(),
+            ),
+            "",
+        ),
+        axis=1,
+    )
+
+    # gemrates join by Set + Card No
+    out["_set_norm"] = out["Set"].apply(_norm_set)
+    out["_card_norm"] = out["Card No"].apply(_norm_cardno)
+
+    out["Gem rate - All time"] = out.apply(
+        lambda rr: (gem_lookup.get((rr["_set_norm"], rr["_card_norm"]), {}) or {}).get("Gem rate - All time", ""),
+        axis=1,
+    )
+    out["Total graded"] = out.apply(
+        lambda rr: (gem_lookup.get((rr["_set_norm"], rr["_card_norm"]), {}) or {}).get("Total", ""),
+        axis=1,
+    )
+
+    out = out.drop(columns=["_set_norm", "_card_norm"], errors="ignore")
+
+    # column order (Image next to Link)
+    ordered = [
+        "Generation",
+        "Set",
+        "Card Name",
+        "Card No",
+        "Link",
+        "Image",
+        "Gem rate - All time",
+        "Total graded",
+        "UNGRADED Avg", "UNGRADED Min", "UNGRADED Max",
+        "PSA9 Avg", "PSA9 Min", "PSA9 Max",
+        "PSA10 Avg", "PSA10 Min", "PSA10 Max",
+    ]
+    # tolerate missing columns
+    final_cols = [c for c in ordered if c in out.columns] + [c for c in out.columns if c not in ordered]
+    out = out[final_cols].copy()
 
     out = out.sort_values(["Card Name", "Card No"], ascending=[True, True]).reset_index(drop=True)
     return out
 
 
 # =========================
-# UI
+# UI + workflow
 # =========================
 sheet = get_sheet()
 watch_ws = get_ws(sheet, WATCHLIST_WS_NAME)
 sales_ws = get_ws(sheet, SALES_HISTORY_WS_NAME)
 
+# ensure sales history headers (unchanged)
 ensure_headers(sales_ws, SALES_HISTORY_HEADERS)
 
 wdf = read_ws_df(watch_ws)
+
+# Load gemrates once for the page render
+gdf = load_gemrates_df(sheet)
+gem_lookup = build_gemrates_lookup(gdf)
 
 top = st.container()
 with top:
@@ -733,25 +942,68 @@ with top:
                 st.warning(f"No rows found in `{WATCHLIST_WS_NAME}`.")
             else:
                 try:
-                    with st.spinner("Refreshing sales history (Ungraded + PSA9 + PSA10)..."):
+                    with st.spinner("Refreshing images + sales history (Ungraded + PSA9 + PSA10)..."):
+                        # ---------- (1) Fill Image column in watchlist (blank cells only) ----------
+                        wdf2 = wdf.copy()
+                        if "Image" not in wdf2.columns:
+                            wdf2["Image"] = ""
+
+                        to_write = {}
+                        for idx, row in wdf2.iterrows():
+                            link = safe_str(row.get("Link", "")).strip()
+                            img = safe_str(row.get("Image", "")).strip()
+                            if img:
+                                continue
+                            if "pricecharting.com" not in link.lower():
+                                continue
+                            # polite delay (light)
+                            if to_write:
+                                time.sleep(0.35)
+                            url = fetch_pricecharting_image_url(link)
+                            if url:
+                                to_write[idx] = url
+                                wdf2.at[idx, "Image"] = url
+
+                        if to_write:
+                            update_watchlist_image_column(watch_ws, wdf2, to_write)
+
+                        # refresh local watchlist df after updating
+                        wdf = read_ws_df(watch_ws)
+
+                        # ---------- (2) Pull sales + write sales history ----------
                         out_df = build_sales_history_rows_from_watchlist(wdf)
                         write_ws_df(sales_ws, out_df, SALES_HISTORY_HEADERS)
+
                     st.success(f"Refreshed. Wrote {len(out_df):,} rows to `{SALES_HISTORY_WS_NAME}`.")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Refresh failed: {e}")
                     st.exception(e)
+
     with c2:
-        st.caption("Summary is calculated from your `grading_sales_history` sheet (last 5 sales per grade bucket).")
+        st.caption("Summary is calculated from `grading_sales_history` + watchlist Image + gemrates (Set + Card #).")
 
 st.divider()
 
 # Read sales history and show summary
 sdf = read_ws_df(sales_ws)
 
-summary_df = build_summary_from_sales_history(sdf)
+summary_df = build_summary_from_sales_history(sdf, wdf, gem_lookup)
 
 if summary_df is None or summary_df.empty:
     st.info("No sales history yet. Click **Refresh** to populate `grading_sales_history` and see the summary.")
 else:
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    # Render image column nicely
+    col_config = {}
+    if "Image" in summary_df.columns:
+        col_config["Image"] = st.column_config.ImageColumn("Image", help="Scraped from PriceCharting ref link", width="small")
+
+    if "Link" in summary_df.columns:
+        col_config["Link"] = st.column_config.LinkColumn("Link")
+
+    st.dataframe(
+        summary_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config=col_config,
+    )
