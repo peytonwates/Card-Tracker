@@ -8,9 +8,13 @@
 # - (Optionally) filter to eBay-only rows
 # - Write those rows to Google Sheet tab: grading_sales_history (overwrite)
 #
-# PSA10 ADDITION:
+# PSA10 ADDITION (WORKING - DO NOT CHANGE):
 # - Also pull last up-to-5 PSA10 sales from ".completed-auctions-manual-only"
 # - Add grade_bucket column in sales history output
+#
+# PSA9 ADDITION (NEW - SEPARATE):
+# - Pull last up-to-5 PSA9 sales from ".completed-auctions-graded"
+# - Add DEBUG button for PSA9 similar to PSA10
 # ---------------------------------------------------------
 
 import json
@@ -59,6 +63,7 @@ SALES_HISTORY_HEADERS = [
 ]
 
 PSA10_PER_ITEM = 5
+PSA9_PER_ITEM = 5  # <-- NEW
 
 
 # =========================
@@ -352,7 +357,7 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
 
 
 # =========================
-# PSA10 scraper from ".completed-auctions-manual-only"
+# PSA10 scraper from ".completed-auctions-manual-only"  (WORKING - DO NOT CHANGE)
 # =========================
 def _find_manual_only_sales_table(soup: BeautifulSoup):
     tables = soup.select("div.completed-auctions-manual-only table")
@@ -489,7 +494,144 @@ def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 20) 
 
 
 # =========================
-# Core: build sales-history rows (ungraded + PSA10)
+# PSA9 scraper from ".completed-auctions-graded"  (NEW - SEPARATE)
+# =========================
+def _find_graded_sales_table(soup: BeautifulSoup):
+    tables = soup.select("div.completed-auctions-graded table")
+    if not tables:
+        return None
+
+    def looks_like_sales_table(tbl):
+        ths = [th.get_text(" ", strip=True).lower() for th in tbl.find_all("th")]
+        return any("sale date" in t for t in ths) and any("price" == t or "price" in t for t in ths)
+
+    for t in tables:
+        if looks_like_sales_table(t):
+            return t
+    return tables[0]
+
+
+def fetch_pricecharting_psa9_graded_with_debug(reference_link: str, limit: int = 20):
+    debug = {
+        "url": reference_link,
+        "http_status": None,
+        "response_chars": None,
+        "has_graded_string": None,
+        "graded_sections_found": 0,
+        "tables_under_graded": 0,
+        "picked_table_found": False,
+        "tr_count": 0,
+        "sample_tr_ids": [],
+        "first_price_cell_texts": [],
+        "first_title_texts": [],
+        "first_date_texts": [],
+    }
+
+    link = (reference_link or "").strip()
+    if not link or "pricecharting.com" not in link.lower():
+        debug["error"] = "Invalid link"
+        return [], debug
+
+    r = http_get_with_backoff(link, timeout=25, max_tries=6)
+    debug["http_status"] = r.status_code
+    debug["response_chars"] = len(r.text or "")
+    debug["has_graded_string"] = ("completed-auctions-graded" in (r.text or ""))
+
+    soup = BeautifulSoup(r.text, _bs_parser())
+
+    secs = soup.find_all(class_=re.compile(r"\bcompleted-auctions-graded\b"))
+    debug["graded_sections_found"] = len(secs)
+
+    tables = soup.select("div.completed-auctions-graded table")
+    debug["tables_under_graded"] = len(tables)
+
+    table = _find_graded_sales_table(soup)
+    if table is None:
+        debug["picked_table_found"] = False
+        return [], debug
+
+    debug["picked_table_found"] = True
+
+    trs = table.find_all("tr")
+    debug["tr_count"] = len(trs)
+
+    sales = []
+    for tr in trs:
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+
+        tr_id = tr.get("id", "") or ""
+        if (tr_id.startswith("ebay-") or tr_id) and len(debug["sample_tr_ids"]) < 8:
+            debug["sample_tr_ids"].append(tr_id)
+
+        date_td = tr.find("td", class_="date")
+        title_td = tr.find("td", class_="title")
+
+        price_td = tr.select_one("td.numeric:not(.listed-price)")
+        if price_td is None:
+            price_td = tr.select_one("td.numeric")
+
+        sale_date_txt = (date_td.get_text(" ", strip=True) if date_td else "")
+        title_txt = (title_td.get_text(" ", strip=True) if title_td else "")
+        price_cell_text = (price_td.get_text(" ", strip=True) if price_td else "")
+
+        if len(debug["first_date_texts"]) < 5:
+            debug["first_date_texts"].append(sale_date_txt)
+        if len(debug["first_title_texts"]) < 5:
+            debug["first_title_texts"].append(title_txt)
+        if len(debug["first_price_cell_texts"]) < 5:
+            debug["first_price_cell_texts"].append(price_cell_text)
+
+        d = _parse_any_date(sale_date_txt)
+        if not d:
+            continue
+
+        title = (title_txt or "").strip()
+        if _classify_grade_from_title(title) != "psa9":
+            continue
+
+        if price_td is None:
+            continue
+
+        price = 0.0
+        spans = price_td.find_all("span", class_=re.compile(r"\bjs-price\b"))
+        for sp in spans:
+            p = _price_from_cell_text(sp.get_text(" ", strip=True))
+            if p > 0:
+                price = p
+                break
+
+        if price <= 0:
+            price = _price_from_cell_text(price_cell_text)
+
+        if price <= 0:
+            continue
+
+        sale_key = f"{d.isoformat()}|{price:.2f}|psa9|{title[:90].strip().lower()}"
+        sales.append(
+            {
+                "sale_date": d,
+                "price": float(price),
+                "title": title,
+                "grade_bucket": "psa9",
+                "sale_key": sale_key,
+            }
+        )
+
+    by_key = {s["sale_key"]: s for s in sales if s.get("sale_key")}
+    out = list(by_key.values())
+    out.sort(key=lambda x: (x["sale_date"], x["price"]), reverse=True)
+    return out[: max(1, int(limit))], debug
+
+
+def fetch_pricecharting_psa9_graded(reference_link: str, limit: int = 20) -> list[dict]:
+    sales, _dbg = fetch_pricecharting_psa9_graded_with_debug(reference_link, limit=limit)
+    return sales
+
+
+# =========================
+# Core: build sales-history rows (ungraded + PSA10 + PSA9)
 # =========================
 def build_sales_history_rows_from_watchlist(
     wdf: pd.DataFrame,
@@ -567,6 +709,30 @@ def build_sales_history_rows_from_watchlist(
                     }
                 )
 
+        # ---------- PSA9 (graded section) (NEW) ----------
+        psa9_sales = fetch_pricecharting_psa9_graded(link, limit=50)
+        if psa9_sales:
+            if ebay_only:
+                psa9_sales = [s for s in psa9_sales if "[ebay]" in (s.get("title", "").lower())]
+            psa9_sales = psa9_sales[:PSA9_PER_ITEM]
+
+            for s in psa9_sales:
+                rows_out.append(
+                    {
+                        "Generation": safe_str(r.get("Generation", "")).strip(),
+                        "Set": safe_str(r.get("Set", "")).strip(),
+                        "Card Name": safe_str(r.get("Card Name", "")).strip(),
+                        "Card No": safe_str(r.get("Card No", "")).strip(),
+                        "Link": link,
+                        "grade_bucket": "psa9",
+                        "sale_date": s["sale_date"].isoformat() if isinstance(s.get("sale_date"), date) else safe_str(s.get("sale_date", "")).strip(),
+                        "price": float(safe_float(s.get("price", 0.0), 0.0)),
+                        "title": safe_str(s.get("title", "")).strip(),
+                        "sale_key": safe_str(s.get("sale_key", "")).strip(),
+                        "updated_utc": now_utc,
+                    }
+                )
+
     df_out = pd.DataFrame(rows_out)
     if df_out.empty:
         return pd.DataFrame(columns=SALES_HISTORY_HEADERS)
@@ -585,7 +751,7 @@ def build_sales_history_rows_from_watchlist(
 # =========================
 st.caption(
     "Reads `grading_watch_list`, scrapes SOLD comps from PriceCharting, keeps the latest **ungraded** sales per item, "
-    "and also adds latest **PSA 10 (manual-only)** sales, then overwrites `grading_sales_history`."
+    "and also adds latest **PSA 10 (manual-only)** + **PSA 9 (graded)** sales, then overwrites `grading_sales_history`."
 )
 
 sheet = get_sheet()
@@ -597,7 +763,7 @@ ensure_headers(sales_ws, SALES_HISTORY_HEADERS)
 
 wdf = read_ws_df(watch_ws)
 
-c1, c2, c3, c4 = st.columns([1, 1, 2, 2])
+c1, c2, c3, c4, c5 = st.columns([1, 1, 2, 2, 2])
 
 with c1:
     per_item_n = st.number_input("Ungraded sales per item", min_value=1, max_value=20, value=5, step=1)
@@ -611,7 +777,7 @@ with c3:
             st.warning(f"No rows found in `{WATCHLIST_WS_NAME}`.")
         else:
             try:
-                with st.spinner("Scraping PriceCharting (ungraded + PSA10 manual-only) and writing sheet..."):
+                with st.spinner("Scraping PriceCharting (ungraded + PSA10 manual-only + PSA9 graded) and writing sheet..."):
                     out_df = build_sales_history_rows_from_watchlist(
                         wdf,
                         per_item_n=int(per_item_n),
@@ -636,6 +802,24 @@ with c4:
                 st.subheader("Debug output")
                 st.json(dbg)
                 st.subheader(f"Extracted PSA10 rows: {len(sales)}")
+                if sales:
+                    st.dataframe(pd.DataFrame(sales), use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.error(f"Debug failed: {e}")
+                st.exception(e)
+
+with c5:
+    if st.button("DEBUG PSA9 (first watchlist link)", use_container_width=True):
+        if wdf is None or wdf.empty or "Link" not in wdf.columns:
+            st.warning("Watchlist is empty or missing Link column.")
+        else:
+            link = str(wdf["Link"].iloc[0]).strip()
+            st.write(f"Debugging link: {link}")
+            try:
+                sales, dbg = fetch_pricecharting_psa9_graded_with_debug(link, limit=50)
+                st.subheader("Debug output")
+                st.json(dbg)
+                st.subheader(f"Extracted PSA9 rows: {len(sales)}")
                 if sales:
                     st.dataframe(pd.DataFrame(sales), use_container_width=True, hide_index=True)
             except Exception as e:
