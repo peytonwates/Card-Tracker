@@ -4,8 +4,9 @@
 # Goal:
 # - Read rows from Google Sheet tab: grading_watch_list
 # - For each row, use the "Link" (PriceCharting) to pull the most recent SOLD sales
-# - Keep ONLY the latest 5 "ungraded" sales per watchlist item
-# - Write those rows to Google Sheet tab: grading_sales_history
+# - Keep ONLY the latest N "ungraded" sales per watchlist item
+# - (Optionally) filter to eBay-only rows
+# - Write those rows to Google Sheet tab: grading_sales_history (overwrite)
 # ---------------------------------------------------------
 
 import json
@@ -88,7 +89,7 @@ def _bs_parser():
 
 def _classify_grade_from_title(title: str) -> str:
     """
-    Very simple classifier:
+    Simple classifier:
     - PSA 9/10 => graded
     - else => ungraded
     """
@@ -98,6 +99,31 @@ def _classify_grade_from_title(title: str) -> str:
     if re.search(r"\bPSA\s*9\b", t) or re.search(r"\bMINT\s*9\b", t):
         return "psa9"
     return "ungraded"
+
+def _parse_any_date(text: str):
+    """
+    PriceCharting sold listings typically show YYYY-MM-DD.
+    We'll be flexible anyway.
+    """
+    if not text:
+        return None
+    d = pd.to_datetime(text, errors="coerce")
+    if pd.isna(d):
+        return None
+    if d.year < 2000:
+        return None
+    return d.date()
+
+def _price_from_cell_text(text: str) -> float:
+    """
+    Pull a single $X.XX from a *cell*, not from a whole row blob.
+    """
+    if not text:
+        return 0.0
+    m = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", text)
+    if not m:
+        return 0.0
+    return safe_float(m.group(1), 0.0)
 
 
 # =========================
@@ -164,8 +190,8 @@ def ensure_headers(ws, headers: list[str]):
         _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
         return
     current = [safe_str(x).strip() for x in (values[0] or [])]
-    if [c for c in current if c] != headers:
-        # For this simple page, we just overwrite the header row to match our expected schema.
+    # For this simple page, overwrite header if different.
+    if current != headers:
         _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
 
 def read_ws_df(ws) -> pd.DataFrame:
@@ -242,12 +268,12 @@ def http_get_with_backoff(url: str, *, timeout=25, max_tries=6):
 
 
 # =========================
-# PriceCharting sold sales scraper (simple)
+# PriceCharting sold sales scraper (FIXED)
 # =========================
 @st.cache_data(ttl=60 * 60 * 6)
-def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 60) -> list[dict]:
+def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list[dict]:
     """
-    Return recent sold sales from a PriceCharting product page.
+    Parse sold listings by reading the actual table cells, not row text.
 
     Output:
       { sale_date: date, price: float, title: str, grade_bucket: str, sale_key: str }
@@ -259,84 +285,74 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 60) -> list
     r = http_get_with_backoff(link, timeout=25, max_tries=6)
     soup = BeautifulSoup(r.text, _bs_parser())
 
-    price_re = re.compile(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})")
-    iso_date_re = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
-    slash_date_re = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b")
-    month_date_re = re.compile(
-        r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+20\d{2}\b",
-        re.IGNORECASE,
-    )
+    # Find a table whose header contains "Sale Date" and "Price"
+    target_table = None
+    for tbl in soup.find_all("table"):
+        ths = [th.get_text(" ", strip=True) for th in tbl.find_all("th")]
+        ths_norm = [t.lower() for t in ths if t]
+        if any("sale date" in t for t in ths_norm) and any(t.strip() == "price" or "price" in t for t in ths_norm):
+            target_table = tbl
+            break
 
-    def parse_any_date(text: str):
-        if not text:
-            return None
+    if target_table is None:
+        return []
 
-        m = iso_date_re.search(text)
-        if m:
-            d = pd.to_datetime(m.group(1), errors="coerce")
-            if pd.notna(d):
-                return d.date()
+    # Map header names -> column index
+    header_cells = [th.get_text(" ", strip=True) for th in target_table.find_all("th")]
+    header_norm = [h.strip().lower() for h in header_cells]
 
-        m = slash_date_re.search(text)
-        if m:
-            d = pd.to_datetime(m.group(1), errors="coerce")
-            if pd.notna(d):
-                return d.date()
-
-        m = month_date_re.search(text)
-        if m:
-            d = pd.to_datetime(m.group(0), errors="coerce")
-            if pd.notna(d):
-                return d.date()
-
-        d = pd.to_datetime(text, errors="coerce")
-        if pd.notna(d) and d.year >= 2000:
-            return d.date()
-
+    def _find_col_idx(needle: str):
+        for i, h in enumerate(header_norm):
+            if needle in h:
+                return i
         return None
 
+    sale_date_idx = _find_col_idx("sale date")
+    title_idx = _find_col_idx("title")
+    price_idx = _find_col_idx("price")
+
+    # If we can't find a clean mapping, fallback to common layout:
+    # [Sale Date, TW, Title, Price]
+    if sale_date_idx is None:
+        sale_date_idx = 0
+    if title_idx is None:
+        title_idx = 2
+    if price_idx is None:
+        price_idx = 3
+
     sales = []
-
-    # Attempt: parse table rows
-    for tr in soup.select("tr"):
-        t = tr.get_text(" ", strip=True)
-        if not t or "$" not in t:
+    for tr in target_table.find_all("tr"):
+        tds = tr.find_all("td")
+        if not tds:
             continue
 
-        pm = price_re.search(t)
-        if not pm:
-            continue
+        # Safe get
+        def cell(i: int) -> str:
+            if i < 0 or i >= len(tds):
+                return ""
+            return tds[i].get_text(" ", strip=True)
 
-        d = parse_any_date(t)
+        sale_date_txt = cell(sale_date_idx)
+        title_txt = cell(title_idx)
+        price_txt = cell(price_idx)
+
+        d = _parse_any_date(sale_date_txt)
         if not d:
             continue
 
-        price = safe_float(pm.group(1), 0.0)
+        price = _price_from_cell_text(price_txt)
         if price <= 0:
             continue
 
-        cells = [td.get_text(" ", strip=True) for td in tr.select("td")]
-        cells = [c for c in cells if c]
-        title = ""
-        if cells:
-            filtered = []
-            for c in cells:
-                if "$" in c and price_re.search(c):
-                    continue
-                if parse_any_date(c):
-                    continue
-                filtered.append(c)
-            title = max(filtered, key=len) if filtered else t
-        else:
-            title = t
-
+        title = title_txt.strip()
         bucket = _classify_grade_from_title(title)
+
         sale_key = f"{d.isoformat()}|{price:.2f}|{bucket}|{title[:90].strip().lower()}"
         sales.append(
             {
                 "sale_date": d,
                 "price": float(price),
-                "title": title.strip(),
+                "title": title,
                 "grade_bucket": bucket,
                 "sale_key": sale_key,
             }
@@ -350,13 +366,16 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 60) -> list
 
 
 # =========================
-# Core: build sales-history rows (last 5 ungraded per item)
+# Core: build sales-history rows (last N ungraded per item)
 # =========================
-def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame, per_item_n: int = 5) -> pd.DataFrame:
+def build_sales_history_rows_from_watchlist(
+    wdf: pd.DataFrame,
+    per_item_n: int = 5,
+    ebay_only: bool = True,
+) -> pd.DataFrame:
     if wdf is None or wdf.empty:
         return pd.DataFrame(columns=SALES_HISTORY_HEADERS)
 
-    # Normalize columns
     for h in WATCHLIST_HEADERS_EXPECTED:
         if h not in wdf.columns:
             wdf[h] = ""
@@ -364,25 +383,30 @@ def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame, per_item_n: int =
     rows_out = []
     now_utc = datetime.utcnow().isoformat()
 
-    # Only rows with a link
     wdf2 = wdf.copy()
     wdf2["Link"] = wdf2["Link"].astype(str).str.strip()
     wdf2 = wdf2[wdf2["Link"] != ""].copy()
 
-    for i, r in wdf2.iterrows():
+    for _, r in wdf2.iterrows():
         link = safe_str(r.get("Link", "")).strip()
         if "pricecharting.com" not in link.lower():
             continue
 
-        # Small pause between items to be polite
-        if len(rows_out) > 0:
+        # Polite delay between items
+        if rows_out:
             time.sleep(0.75)
 
-        sales = fetch_pricecharting_sold_sales(link, limit=80)
+        sales = fetch_pricecharting_sold_sales(link, limit=120)
         if not sales:
             continue
 
+        # Filter to ungraded
         ungraded = [s for s in sales if (s.get("grade_bucket") or "").lower() == "ungraded"]
+
+        # Filter to eBay only (matches PriceCharting label style)
+        if ebay_only:
+            ungraded = [s for s in ungraded if "[ebay]" in (s.get("title", "").lower())]
+
         ungraded = ungraded[: int(per_item_n)]
 
         for s in ungraded:
@@ -405,7 +429,6 @@ def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame, per_item_n: int =
     if df_out.empty:
         return pd.DataFrame(columns=SALES_HISTORY_HEADERS)
 
-    # Stable ordering
     df_out["price"] = df_out["price"].apply(lambda v: safe_float(v, 0.0))
     df_out["sale_date_dt"] = pd.to_datetime(df_out["sale_date"], errors="coerce")
     df_out = df_out.sort_values(["Card Name", "Card No", "sale_date_dt"], ascending=[True, True, False]).drop(columns=["sale_date_dt"])
@@ -416,43 +439,48 @@ def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame, per_item_n: int =
 # UI
 # =========================
 st.caption(
-    "This page ONLY does one thing: reads `grading_watch_list`, scrapes the latest SOLD comps from PriceCharting, "
-    "keeps the latest 5 **ungraded** sales per item, and writes them to `grading_sales_history`."
+    "This page ONLY does one thing: reads `grading_watch_list`, scrapes SOLD comps from PriceCharting, "
+    "keeps the latest **ungraded** sales per item, and overwrites `grading_sales_history`."
 )
 
 sheet = get_sheet()
 watch_ws = get_ws(sheet, WATCHLIST_WS_NAME)
 sales_ws = get_ws(sheet, SALES_HISTORY_WS_NAME)
 
-# Ensure headers exist / correct (simple overwrite behavior)
 ensure_headers(sales_ws, SALES_HISTORY_HEADERS)
 
 wdf = read_ws_df(watch_ws)
 
-c1, c2 = st.columns([1, 2])
+c1, c2, c3 = st.columns([1, 1, 2])
 
 with c1:
     per_item_n = st.number_input("Ungraded sales per item", min_value=1, max_value=20, value=5, step=1)
 
+with c2:
+    ebay_only = st.checkbox("eBay only", value=True)
+
+with c3:
     if st.button("Pull sales + overwrite grading_sales_history", type="primary", use_container_width=True):
         if wdf is None or wdf.empty:
             st.warning(f"No rows found in `{WATCHLIST_WS_NAME}`.")
         else:
-            out_df = build_sales_history_rows_from_watchlist(wdf, per_item_n=int(per_item_n))
-
-            # OVERWRITE the sales history sheet with only what we just pulled
+            out_df = build_sales_history_rows_from_watchlist(
+                wdf,
+                per_item_n=int(per_item_n),
+                ebay_only=bool(ebay_only),
+            )
             write_ws_df(sales_ws, out_df, SALES_HISTORY_HEADERS)
-
             st.success(f"Wrote {len(out_df):,} row(s) to `{SALES_HISTORY_WS_NAME}`.")
             st.rerun()
 
-with c2:
-    st.markdown("#### Watchlist preview")
-    if wdf is None or wdf.empty:
-        st.info(f"`{WATCHLIST_WS_NAME}` is empty.")
-    else:
-        show_cols = [c for c in WATCHLIST_HEADERS_EXPECTED if c in wdf.columns]
-        st.dataframe(wdf[show_cols], use_container_width=True, hide_index=True)
+st.divider()
+
+st.markdown("#### Watchlist preview")
+if wdf is None or wdf.empty:
+    st.info(f"`{WATCHLIST_WS_NAME}` is empty.")
+else:
+    show_cols = [c for c in WATCHLIST_HEADERS_EXPECTED if c in wdf.columns]
+    st.dataframe(wdf[show_cols], use_container_width=True, hide_index=True)
 
 st.divider()
 
@@ -461,7 +489,6 @@ sdf = read_ws_df(sales_ws)
 if sdf is None or sdf.empty:
     st.info(f"`{SALES_HISTORY_WS_NAME}` is empty.")
 else:
-    # Make it readable
     if "price" in sdf.columns:
         sdf["price"] = sdf["price"].apply(lambda v: safe_float(v, 0.0))
     if "sale_date" in sdf.columns:
