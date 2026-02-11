@@ -8,9 +8,10 @@
 # - (Optionally) filter to eBay-only rows
 # - Write those rows to Google Sheet tab: grading_sales_history (overwrite)
 #
-# ADDITION (DO NOT CHANGE UNGRADED LOGIC):
-# - Also pull last up-to-5 PSA 10 sales from the page's ".completed-auctions-manual-only" section
-#   (this corresponds to the UI tab that you reach with #completed-auctions-manual-only)
+# PSA10 ADDITION:
+# - Also attempt to pull last up-to-5 PSA10 sales from the page's
+#   ".completed-auctions-manual-only" section.
+# - Added DEBUG tools to show exactly what's happening.
 # ---------------------------------------------------------
 
 import json
@@ -57,8 +58,7 @@ SALES_HISTORY_HEADERS = [
     "updated_utc",   # ISO timestamp
 ]
 
-# PSA10 behavior (added)
-PSA10_PER_ITEM_DEFAULT = 5
+PSA10_PER_ITEM = 5
 
 
 # =========================
@@ -95,11 +95,6 @@ def _bs_parser():
         return "html.parser"
 
 def _classify_grade_from_title(title: str) -> str:
-    """
-    Simple classifier:
-    - PSA 9/10 => graded
-    - else => ungraded
-    """
     t = (title or "").upper()
     if re.search(r"\bPSA\s*10\b", t) or re.search(r"\bGEM\s*(MINT|MT)\s*10\b", t):
         return "psa10"
@@ -108,10 +103,6 @@ def _classify_grade_from_title(title: str) -> str:
     return "ungraded"
 
 def _parse_any_date(text: str):
-    """
-    PriceCharting sold listings typically show YYYY-MM-DD.
-    We'll be flexible anyway.
-    """
     if not text:
         return None
     d = pd.to_datetime(text, errors="coerce")
@@ -122,9 +113,6 @@ def _parse_any_date(text: str):
     return d.date()
 
 def _price_from_cell_text(text: str) -> float:
-    """
-    Pull a single $X.XX from a *cell*, not from a whole row blob.
-    """
     if not text:
         return 0.0
     m = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", text)
@@ -143,20 +131,17 @@ def get_gspread_client():
         "https://www.googleapis.com/auth/drive",
     ]
 
-    # Streamlit Cloud: secrets as TOML table
     if "gcp_service_account" in st.secrets and not isinstance(st.secrets["gcp_service_account"], str):
         sa = st.secrets["gcp_service_account"]
         sa_info = {k: sa[k] for k in sa.keys()}
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         return gspread.authorize(creds)
 
-    # Streamlit Cloud: secrets as JSON string
     if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], str):
         sa_info = json.loads(st.secrets["gcp_service_account"])
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         return gspread.authorize(creds)
 
-    # Local dev: file path in secrets
     if "service_account_json_path" in st.secrets:
         sa_rel = st.secrets["service_account_json_path"]
         p = Path(sa_rel)
@@ -197,7 +182,6 @@ def ensure_headers(ws, headers: list[str]):
         _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
         return
     current = [safe_str(x).strip() for x in (values[0] or [])]
-    # For this simple page, overwrite header if different.
     if current != headers:
         _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
 
@@ -232,12 +216,16 @@ def write_ws_df(ws, df: pd.DataFrame, headers: list[str]):
 
 
 # =========================
-# HTTP (basic backoff)
+# HTTP
 # =========================
 @st.cache_resource
 def get_http_session():
     s = requests.Session()
-    s.headers.update({"User-Agent": "Mozilla/5.0 (CardTracker; Streamlit)"})
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
     return s
 
 def http_get_with_backoff(url: str, *, timeout=25, max_tries=6):
@@ -279,12 +267,6 @@ def http_get_with_backoff(url: str, *, timeout=25, max_tries=6):
 # =========================
 @st.cache_data(ttl=60 * 60 * 6)
 def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list[dict]:
-    """
-    Parse sold listings by reading the actual table cells, not row text.
-
-    Output:
-      { sale_date: date, price: float, title: str, grade_bucket: str, sale_key: str }
-    """
     link = (reference_link or "").strip()
     if not link or "pricecharting.com" not in link.lower():
         return []
@@ -292,7 +274,6 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
     r = http_get_with_backoff(link, timeout=25, max_tries=6)
     soup = BeautifulSoup(r.text, _bs_parser())
 
-    # Find a table whose header contains "Sale Date" and "Price"
     target_table = None
     for tbl in soup.find_all("table"):
         ths = [th.get_text(" ", strip=True) for th in tbl.find_all("th")]
@@ -304,7 +285,6 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
     if target_table is None:
         return []
 
-    # Map header names -> column index
     header_cells = [th.get_text(" ", strip=True) for th in target_table.find_all("th")]
     header_norm = [h.strip().lower() for h in header_cells]
 
@@ -318,8 +298,6 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
     title_idx = _find_col_idx("title")
     price_idx = _find_col_idx("price")
 
-    # If we can't find a clean mapping, fallback to common layout:
-    # [Sale Date, TW, Title, Price]
     if sale_date_idx is None:
         sale_date_idx = 0
     if title_idx is None:
@@ -333,7 +311,6 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
         if not tds:
             continue
 
-        # Safe get
         def cell(i: int) -> str:
             if i < 0 or i >= len(tds):
                 return ""
@@ -365,7 +342,6 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
             }
         )
 
-    # Dedup + sort newest first
     by_key = {s["sale_key"]: s for s in sales if s.get("sale_key")}
     out = list(by_key.values())
     out.sort(key=lambda x: (x["sale_date"], x["price"]), reverse=True)
@@ -373,39 +349,82 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
 
 
 # =========================
-# PriceCharting PSA 10 scraper (NEW - manual-only section)
+# PSA10 from "manual-only" section + DEBUG
 # =========================
-@st.cache_data(ttl=60 * 60 * 6)
-def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 20) -> list[dict]:
+def fetch_pricecharting_psa10_manual_only_with_debug(reference_link: str, limit: int = 20):
     """
-    Pull PSA 10 sold rows from the page's ".completed-auctions-manual-only" section.
+    Returns: (sales_list, debug_dict)
+    """
+    debug = {
+        "url": reference_link,
+        "http_status": None,
+        "response_chars": None,
+        "has_manual_only_string": None,
+        "manual_only_sections_found": 0,
+        "table_found": False,
+        "tr_count": 0,
+        "sample_tr_ids": [],
+        "first_price_cell_texts": [],
+        "first_title_texts": [],
+    }
 
-    Key detail (from your DevTools):
-    - Price cell contains one or more: <span class="js-price">...</span>
-      The FIRST $ amount in span.js-price is the accepted sale price.
-      (There may also be a "listed price" shown afterwards; we ignore it.)
-    """
     link = (reference_link or "").strip()
     if not link or "pricecharting.com" not in link.lower():
-        return []
+        debug["error"] = "Invalid link"
+        return [], debug
 
     r = http_get_with_backoff(link, timeout=25, max_tries=6)
+    debug["http_status"] = r.status_code
+    debug["response_chars"] = len(r.text or "")
+    debug["has_manual_only_string"] = ("completed-auctions-manual-only" in (r.text or ""))
+
     soup = BeautifulSoup(r.text, _bs_parser())
 
-    section = soup.select_one("div.completed-auctions-manual-only")
-    if section is None:
-        return []
+    # Find section robustly (css selector AND regex class match)
+    sections = []
+    sec1 = soup.select("div.completed-auctions-manual-only")
+    if sec1:
+        sections.extend(sec1)
 
+    # Sometimes class could be on a different tag; find anything with that class
+    sec2 = soup.find_all(class_=re.compile(r"\bcompleted-auctions-manual-only\b"))
+    if sec2:
+        # avoid duplicates
+        for x in sec2:
+            if x not in sections:
+                sections.append(x)
+
+    debug["manual_only_sections_found"] = len(sections)
+
+    if not sections:
+        # extra clue: do we see any ebay- ids at all in the HTML?
+        debug["has_ebay_row_ids_in_html"] = bool(re.search(r'\bid="ebay-\d{6,}"', r.text or ""))
+        # snippet around manual-only if present
+        if debug["has_manual_only_string"]:
+            idx = (r.text or "").find("completed-auctions-manual-only")
+            debug["manual_only_snippet"] = (r.text or "")[max(0, idx - 300): idx + 300]
+        return [], debug
+
+    section = sections[0]
     table = section.find("table")
     if table is None:
-        return []
+        debug["table_found"] = False
+        return [], debug
+
+    debug["table_found"] = True
+
+    trs = table.find_all("tr")
+    debug["tr_count"] = len(trs)
 
     sales = []
-    for tr in table.find_all("tr"):
-        # Expect rows like: <tr id="ebay-###########"> ...
+    for tr in trs:
         tds = tr.find_all("td")
         if not tds:
             continue
+
+        tr_id = tr.get("id", "") or ""
+        if tr_id and tr_id.startswith("ebay-") and len(debug["sample_tr_ids"]) < 8:
+            debug["sample_tr_ids"].append(tr_id)
 
         date_td = tr.find("td", class_="date")
         title_td = tr.find("td", class_="title")
@@ -413,6 +432,12 @@ def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 20) 
 
         sale_date_txt = (date_td.get_text(" ", strip=True) if date_td else (tds[0].get_text(" ", strip=True) if len(tds) > 0 else ""))
         title_txt = (title_td.get_text(" ", strip=True) if title_td else (tds[2].get_text(" ", strip=True) if len(tds) > 2 else ""))
+        price_cell_text = (price_td.get_text(" ", strip=True) if price_td else "")
+
+        if len(debug["first_title_texts"]) < 5:
+            debug["first_title_texts"].append(title_txt)
+        if len(debug["first_price_cell_texts"]) < 5:
+            debug["first_price_cell_texts"].append(price_cell_text)
 
         d = _parse_any_date(sale_date_txt)
         if not d:
@@ -423,17 +448,19 @@ def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 20) 
             continue
 
         price = 0.0
+
+        # Your rule: first js-price $ is accepted sale price
         if price_td is not None:
-            # Take FIRST js-price $... as the sale price
-            for sp in price_td.find_all("span", class_="js-price"):
+            spans = price_td.find_all("span", class_=re.compile(r"\bjs-price\b"))
+            for sp in spans:
                 txt = sp.get_text(" ", strip=True)
                 p = _price_from_cell_text(txt)
                 if p > 0:
                     price = p
                     break
+
             if price <= 0:
-                # fallback: first $ in full cell text
-                price = _price_from_cell_text(price_td.get_text(" ", strip=True))
+                price = _price_from_cell_text(price_cell_text)
 
         if price <= 0:
             continue
@@ -449,17 +476,19 @@ def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 20) 
             }
         )
 
-    # Dedup + newest first
     by_key = {s["sale_key"]: s for s in sales if s.get("sale_key")}
     out = list(by_key.values())
     out.sort(key=lambda x: (x["sale_date"], x["price"]), reverse=True)
-    return out[: max(1, int(limit))]
+    return out[: max(1, int(limit))], debug
+
+
+def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 20) -> list[dict]:
+    sales, _debug = fetch_pricecharting_psa10_manual_only_with_debug(reference_link, limit=limit)
+    return sales
 
 
 # =========================
 # Core: build sales-history rows
-# - Keep last N ungraded per item (existing behavior)
-# - PLUS last up-to-5 PSA10 from manual-only section (new behavior)
 # =========================
 def build_sales_history_rows_from_watchlist(
     wdf: pd.DataFrame,
@@ -485,20 +514,15 @@ def build_sales_history_rows_from_watchlist(
         if "pricecharting.com" not in link.lower():
             continue
 
-        # Polite delay between items
         if rows_out:
             time.sleep(0.75)
 
-        # -------------------------
-        # 1) UNGRADED (DO NOT CHANGE)
-        # -------------------------
+        # UNGRADED (unchanged)
         sales = fetch_pricecharting_sold_sales(link, limit=120)
         if sales:
             ungraded = [s for s in sales if (s.get("grade_bucket") or "").lower() == "ungraded"]
-
             if ebay_only:
                 ungraded = [s for s in ungraded if "[ebay]" in (s.get("title", "").lower())]
-
             ungraded = ungraded[: int(per_item_n)]
 
             for s in ungraded:
@@ -517,16 +541,12 @@ def build_sales_history_rows_from_watchlist(
                     }
                 )
 
-        # -------------------------
-        # 2) PSA 10 (NEW)
-        # - pull from completed-auctions-manual-only section
-        # -------------------------
+        # PSA10 (manual-only)
         psa10_sales = fetch_pricecharting_psa10_manual_only(link, limit=50)
         if psa10_sales:
             if ebay_only:
                 psa10_sales = [s for s in psa10_sales if "[ebay]" in (s.get("title", "").lower())]
-
-            psa10_sales = psa10_sales[:PSA10_PER_ITEM_DEFAULT]
+            psa10_sales = psa10_sales[:PSA10_PER_ITEM]
 
             for s in psa10_sales:
                 rows_out.append(
@@ -548,7 +568,6 @@ def build_sales_history_rows_from_watchlist(
     if df_out.empty:
         return pd.DataFrame(columns=SALES_HISTORY_HEADERS)
 
-    # De-dupe by sale_key across both ungraded + psa10
     if "sale_key" in df_out.columns:
         df_out = df_out.drop_duplicates(subset=["sale_key"], keep="first")
 
@@ -562,9 +581,8 @@ def build_sales_history_rows_from_watchlist(
 # UI
 # =========================
 st.caption(
-    "This page reads `grading_watch_list`, scrapes SOLD comps from PriceCharting, "
-    "keeps the latest **ungraded** sales per item, and ALSO adds the latest **PSA 10** sales "
-    "from the page's **manual-only** section, then overwrites `grading_sales_history`."
+    "Reads `grading_watch_list`, scrapes SOLD comps from PriceCharting, keeps the latest **ungraded** sales per item, "
+    "and also attempts to add latest **PSA 10 (manual-only)** sales, then overwrites `grading_sales_history`."
 )
 
 sheet = get_sheet()
@@ -575,7 +593,7 @@ ensure_headers(sales_ws, SALES_HISTORY_HEADERS)
 
 wdf = read_ws_df(watch_ws)
 
-c1, c2, c3 = st.columns([1, 1, 2])
+c1, c2, c3, c4 = st.columns([1, 1, 2, 2])
 
 with c1:
     per_item_n = st.number_input("Ungraded sales per item", min_value=1, max_value=20, value=5, step=1)
@@ -600,6 +618,24 @@ with c3:
                 st.rerun()
             except Exception as e:
                 st.error(f"Pull failed: {e}")
+                st.exception(e)
+
+with c4:
+    if st.button("DEBUG PSA10 (first watchlist link)", use_container_width=True):
+        if wdf is None or wdf.empty or "Link" not in wdf.columns:
+            st.warning("Watchlist is empty or missing Link column.")
+        else:
+            link = str(wdf["Link"].iloc[0]).strip()
+            st.write(f"Debugging link: {link}")
+            try:
+                sales, dbg = fetch_pricecharting_psa10_manual_only_with_debug(link, limit=50)
+                st.subheader("Debug output")
+                st.json(dbg)
+                st.subheader(f"Extracted PSA10 rows: {len(sales)}")
+                if sales:
+                    st.dataframe(pd.DataFrame(sales), use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.error(f"Debug failed: {e}")
                 st.exception(e)
 
 st.divider()
