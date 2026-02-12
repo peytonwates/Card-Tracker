@@ -5,6 +5,12 @@
 # Root cause: update_ws_column_by_header() was doing 1 API call PER ROW (cell-by-cell).
 # Fix: batch update the Image column in ONE call (or a few large calls) using ws.update(range, values).
 #
+# NEW (THIS UPDATE):
+# - Pull TCGplayer Market Price (no API) from a tcgplayer product URL stored in watchlist column: `tcgplayer_link`
+# - Show in Summary table:
+#     - "TCGplayer Price" next to "UNGRADED Avg"
+#     - "TCG - Ungraded" = TCGplayer Price - UNGRADED Avg
+#
 # IMPORTANT:
 # - Do NOT change ungraded / PSA9 / PSA10 scraping logic (left untouched).
 # - Keep the "unique sale_key per link" fix so new watchlist items don't get dropped.
@@ -325,6 +331,80 @@ def http_get_with_backoff(url: str, *, timeout=25, max_tries=6):
     if last_exc:
         raise last_exc
     raise requests.HTTPError(f"HTTPError: retries exhausted for {url}")
+
+
+# =========================
+# TCGplayer Market Price (NO API)
+# =========================
+def _extract_tcgplayer_market_price_from_html(html: str) -> float:
+    """
+    Try multiple HTML / embedded-data patterns to find TCGplayer Market Price.
+    Returns 0.0 if not found.
+    """
+    if not html:
+        return 0.0
+
+    soup = BeautifulSoup(html, _bs_parser())
+
+    # 1) Most common: the exact selector seen in DevTools screenshot
+    node = soup.select_one("span.price-points__upper__price")
+    if node:
+        v = _price_from_cell_text(node.get_text(" ", strip=True))
+        if v > 0:
+            return float(v)
+
+    # 2) Sometimes appears in the same table row with "Market Price" label
+    # Search any element containing "Market Price", then look near it for a $ value
+    text_all = soup.get_text(" ", strip=True)
+    # quick regex fallback on full text: "Market Price $39.74"
+    m = re.search(r"Market Price\s*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})", text_all, flags=re.IGNORECASE)
+    if m:
+        v = safe_float(m.group(1), 0.0)
+        if v > 0:
+            return float(v)
+
+    # 3) Embedded JSON-ish: look for market price style keys
+    # These patterns vary, so we search broad, then take first plausible dollar amount after key.
+    patterns = [
+        r'"marketPrice"\s*:\s*"?([0-9]+(?:\.[0-9]{1,2})?)"?',
+        r'"market_price"\s*:\s*"?([0-9]+(?:\.[0-9]{1,2})?)"?',
+        r'"marketPriceValue"\s*:\s*"?([0-9]+(?:\.[0-9]{1,2})?)"?',
+    ]
+    for pat in patterns:
+        mm = re.search(pat, html, flags=re.IGNORECASE)
+        if mm:
+            v = safe_float(mm.group(1), 0.0)
+            if v > 0:
+                return float(v)
+
+    # 4) Last resort: find a $ amount near "Market Price" in raw HTML
+    mm2 = re.search(r"Market Price.{0,80}?\$([0-9][0-9,]*\.?[0-9]{0,2})", html, flags=re.IGNORECASE | re.DOTALL)
+    if mm2:
+        v = safe_float(mm2.group(1), 0.0)
+        if v > 0:
+            return float(v)
+
+    return 0.0
+
+
+@st.cache_data(ttl=60 * 60 * 6)
+def fetch_tcgplayer_market_price(tcg_url: str) -> float:
+    """
+    Fetch TCGplayer product page and extract Market Price (Near Mint / selected filters).
+    Note: if the site fully JS-renders the price, requests HTML may not include it,
+    and this will return 0.0. (Then we'd switch to Playwright.)
+    """
+    url = (tcg_url or "").strip()
+    if not url or "tcgplayer.com" not in url.lower():
+        return 0.0
+
+    try:
+        r = http_get_with_backoff(url, timeout=25, max_tries=6)
+    except Exception:
+        return 0.0
+
+    price = _extract_tcgplayer_market_price_from_html(r.text)
+    return float(price) if price and price > 0 else 0.0
 
 
 # =========================
@@ -877,12 +957,28 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
     if out is None or out.empty:
         return pd.DataFrame()
 
+    # --- Image map (PriceCharting) ---
     img_map = {}
-    if wdf is not None and not wdf.empty and "Link" in wdf.columns and "Image" in wdf.columns:
-        for _, r in wdf.iterrows():
+    # --- TCGplayer link map (keyed by PriceCharting Link) ---
+    tcg_link_map = {}
+
+    if wdf is not None and not wdf.empty and "Link" in wdf.columns:
+        wdf2 = wdf.copy()
+        wdf2["Link"] = wdf2["Link"].astype(str).str.strip()
+
+        has_img = "Image" in wdf2.columns
+        has_tcg = "tcgplayer_link" in wdf2.columns
+
+        for _, r in wdf2.iterrows():
             lk = safe_str(r.get("Link", "")).strip()
-            if lk:
+            if not lk:
+                continue
+
+            if has_img:
                 img_map[lk] = safe_str(r.get("Image", "")).strip()
+
+            if has_tcg:
+                tcg_link_map[lk] = safe_str(r.get("tcgplayer_link", "")).strip()
 
     out["Image"] = out["Link"].map(lambda x: img_map.get(safe_str(x).strip(), ""))
 
@@ -900,6 +996,24 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
         if rec:
             out.at[i, "Gem rate (all time)"] = round(float(rec.get("gem_rate", 0.0)), 4)
             out.at[i, "Total graded"] = int(rec.get("total", 0))
+
+    # --- TCGplayer price pull (no API) ---
+    # We only fetch if the watchlist row has a tcgplayer_link for that PriceCharting Link.
+    # Cached (6 hours) so it won't hammer TCGplayer.
+    out["TCGplayer Price"] = 0.0
+    for i, row in out.iterrows():
+        pc_link = safe_str(row.get("Link", "")).strip()
+        tcg_url = safe_str(tcg_link_map.get(pc_link, "")).strip()
+        if not tcg_url:
+            continue
+        price = fetch_tcgplayer_market_price(tcg_url)
+        out.at[i, "TCGplayer Price"] = round(safe_float(price, 0.0), 2)
+
+    # Difference vs PriceCharting-derived ungraded avg
+    if "UNGRADED Avg" not in out.columns:
+        out["UNGRADED Avg"] = 0.0
+    out["TCG - Ungraded"] = (out["TCGplayer Price"].apply(lambda v: safe_float(v, 0.0)) -
+                             out["UNGRADED Avg"].apply(lambda v: safe_float(v, 0.0))).apply(lambda v: round(v, 2))
 
     out = add_prospect_scoring(out)
     out = out.sort_values(["Set", "Card Name", "Card No"], ascending=[True, True, True]).reset_index(drop=True)
@@ -998,7 +1112,8 @@ with top:
     with c2:
         st.caption(
             f"Summary is calculated from `grading_sales_history` (last 5 sales per grade bucket). "
-            f"Prospect Score uses all-in grading cost = ${GRADING_ALL_IN_COST:.2f} and gemrate confidence."
+            f"Prospect Score uses all-in grading cost = ${GRADING_ALL_IN_COST:.2f} and gemrate confidence. "
+            f"TCGplayer Price is scraped (no API) from `tcgplayer_link` in the watchlist."
         )
 
 st.divider()
@@ -1091,7 +1206,10 @@ preferred_cols = [
     "Total graded",
     "Gem conf",
     "P10 adj",
-    "UNGRADED Avg", "UNGRADED Min", "UNGRADED Max",
+
+    # Put TCG next to Ungraded Avg
+    "UNGRADED Avg", "TCGplayer Price", "TCG - Ungraded", "UNGRADED Min", "UNGRADED Max",
+
     "PSA9 Avg", "PSA9 Min", "PSA9 Max",
     "PSA10 Avg", "PSA10 Min", "PSA10 Max",
     "Net 9",
