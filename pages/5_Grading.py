@@ -1,14 +1,13 @@
 # pages/5_Grading.py
 # ---------------------------------------------------------
-# Grading > Analysis (CLEAN + IMAGE + GEMRATES + SCORING + FILTERS)
+# FIX: Google Sheets quota exceeded when refreshing images for many new watchlist rows
 #
-# FIX (IMPORTANT):
-# If you add new cards to grading_watch_list and click Refresh, they MUST appear.
-# The issue was sale_key de-duping across different watchlist rows (sale_key did not include the card/link),
-# which could silently drop rows for newly-added items.
+# Root cause: update_ws_column_by_header() was doing 1 API call PER ROW (cell-by-cell).
+# Fix: batch update the Image column in ONE call (or a few large calls) using ws.update(range, values).
 #
-# We DO NOT change how Ungraded / PSA9 / PSA10 scraping works.
-# We ONLY make the written sale_key unique per card by prefixing it with the card Link.
+# IMPORTANT:
+# - Do NOT change ungraded / PSA9 / PSA10 scraping logic (left untouched).
+# - Keep the "unique sale_key per link" fix so new watchlist items don't get dropped.
 # ---------------------------------------------------------
 
 import json
@@ -40,7 +39,7 @@ st.title("Grading — Analysis")
 # =========================
 WATCHLIST_WS_NAME = st.secrets.get("grading_watchlist_worksheet", "grading_watch_list")
 SALES_HISTORY_WS_NAME = st.secrets.get("grading_sales_history_worksheet", "grading_sales_history")
-GEMRATES_WS_NAME = st.secrets.get("gemrates_worksheet", "gemrates")  # tab name "gemrates"
+GEMRATES_WS_NAME = st.secrets.get("gemrates_worksheet", "gemrates")
 
 WATCHLIST_HEADERS_EXPECTED = ["Generation", "Set", "Card Name", "Card No", "Link", "Image"]
 
@@ -51,22 +50,20 @@ SALES_HISTORY_HEADERS = [
     "Card No",
     "Link",
     "grade_bucket",
-    "sale_date",     # YYYY-MM-DD
-    "price",         # numeric
+    "sale_date",
+    "price",
     "title",
-    "sale_key",      # stable key to dedupe
-    "updated_utc",   # ISO timestamp
+    "sale_key",
+    "updated_utc",
 ]
 
-# Fixed behavior (no UI controls)
 PER_ITEM_N = 5
 PSA10_PER_ITEM = 5
 PSA9_PER_ITEM = 5
-EBAY_ONLY = True  # fixed
+EBAY_ONLY = True
 
-# Scoring config
-GRADING_ALL_IN_COST = float(st.secrets.get("grading_all_in_cost", 25.0))  # you can set in secrets
-CONF_K = float(st.secrets.get("gemrate_conf_k", 250.0))                   # confidence saturation
+GRADING_ALL_IN_COST = float(st.secrets.get("grading_all_in_cost", 25.0))
+CONF_K = float(st.secrets.get("gemrate_conf_k", 250.0))
 
 
 # =========================
@@ -154,9 +151,6 @@ def _normalize_cardno(v: str) -> str:
     return str(int(digits))
 
 def _unique_sale_key(link: str, base_sale_key: str) -> str:
-    """
-    FIX: Make keys unique per card/link so new watchlist rows don't get dropped by de-dupe.
-    """
     lk = (link or "").strip()
     bk = (base_sale_key or "").strip()
     if not bk:
@@ -199,8 +193,8 @@ def get_gspread_client():
     raise KeyError('Missing secrets: add "gcp_service_account" (Cloud) or "service_account_json_path" (local).')
 
 def _gs_write_retry(fn, *args, **kwargs):
-    max_tries = 6
-    base_sleep = 0.8
+    max_tries = 8
+    base_sleep = 1.0
     for attempt in range(1, max_tries + 1):
         try:
             return fn(*args, **kwargs)
@@ -257,25 +251,33 @@ def write_ws_df(ws, df: pd.DataFrame, headers: list[str]):
     rng = f"A1:{last_col}{len(values)}"
     _gs_write_retry(ws.update, range_name=rng, values=values, value_input_option="RAW")
 
-def update_ws_column_by_header(ws, header_name: str, values_by_row_index_1based: dict[int, str]):
-    all_vals = ws.get_all_values()
-    if not all_vals or not all_vals[0]:
+
+def ensure_watchlist_image_col(watch_ws):
+    """Guarantee 'Image' header exists (single header update, not per-row)."""
+    values = watch_ws.get_all_values()
+    if not values or not values[0]:
+        _gs_write_retry(watch_ws.update, values=[WATCHLIST_HEADERS_EXPECTED], range_name="1:1", value_input_option="RAW")
+        return WATCHLIST_HEADERS_EXPECTED, WATCHLIST_HEADERS_EXPECTED.index("Image") + 1
+
+    headers = [safe_str(x).strip() for x in values[0]]
+    if "Image" not in headers:
+        headers.append("Image")
+        _gs_write_retry(watch_ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
+    return headers, headers.index("Image") + 1
+
+
+def batch_update_column_values(ws, col_idx_1based: int, start_row_1based: int, values_list: list[str]):
+    """
+    Write a whole contiguous block in one call.
+    values_list is one value per row, corresponding to start_row_1based..start_row_1based+len(values_list)-1
+    """
+    if not values_list:
         return
-
-    headers = [safe_str(x).strip() for x in all_vals[0]]
-    if header_name not in headers:
-        headers.append(header_name)
-        _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
-        col_idx = len(headers)
-    else:
-        col_idx = headers.index(header_name) + 1
-
-    col_letter = a1_col_letter(col_idx)
-    for row_1based, val in values_by_row_index_1based.items():
-        if row_1based <= 1:
-            continue
-        cell = f"{col_letter}{row_1based}"
-        _gs_write_retry(ws.update, range_name=cell, values=[[safe_str(val)]], value_input_option="RAW")
+    col_letter = a1_col_letter(col_idx_1based)
+    end_row = start_row_1based + len(values_list) - 1
+    rng = f"{col_letter}{start_row_1based}:{col_letter}{end_row}"
+    payload = [[safe_str(v)] for v in values_list]
+    _gs_write_retry(ws.update, range_name=rng, values=payload, value_input_option="RAW")
 
 
 # =========================
@@ -326,7 +328,7 @@ def http_get_with_backoff(url: str, *, timeout=25, max_tries=6):
 
 
 # =========================
-# Image scraping (your working snippet)
+# Image scraping (working)
 # =========================
 def _find_best_image(soup: BeautifulSoup) -> str:
     if soup is None:
@@ -397,7 +399,7 @@ def fetch_pricecharting_image_url(reference_link: str) -> str:
 
 
 # =========================
-# PriceCharting sold sales scraper (UNGRADED)  (DO NOT CHANGE)
+# Sold sales scrapers (DO NOT CHANGE)
 # =========================
 @st.cache_data(ttl=60 * 60 * 6)
 def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list[dict]:
@@ -467,13 +469,7 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
 
         sale_key = f"{d.isoformat()}|{price:.2f}|{bucket}|{title[:90].strip().lower()}"
         sales.append(
-            {
-                "sale_date": d,
-                "price": float(price),
-                "title": title,
-                "grade_bucket": bucket,
-                "sale_key": sale_key,
-            }
+            {"sale_date": d, "price": float(price), "title": title, "grade_bucket": bucket, "sale_key": sale_key}
         )
 
     by_key = {s["sale_key"]: s for s in sales if s.get("sale_key")}
@@ -482,9 +478,6 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
     return out[: max(1, int(limit))]
 
 
-# =========================
-# PSA10 scraper from ".completed-auctions-manual-only"  (WORKING - DO NOT CHANGE)
-# =========================
 def _find_manual_only_sales_table(soup: BeautifulSoup):
     tables = soup.select("div.completed-auctions-manual-only table")
     if not tables:
@@ -556,15 +549,7 @@ def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 20) 
             continue
 
         sale_key = f"{d.isoformat()}|{price:.2f}|psa10|{title[:90].strip().lower()}"
-        sales.append(
-            {
-                "sale_date": d,
-                "price": float(price),
-                "title": title,
-                "grade_bucket": "psa10",
-                "sale_key": sale_key,
-            }
-        )
+        sales.append({"sale_date": d, "price": float(price), "title": title, "grade_bucket": "psa10", "sale_key": sale_key})
 
     by_key = {s["sale_key"]: s for s in sales if s.get("sale_key")}
     out = list(by_key.values())
@@ -572,9 +557,6 @@ def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 20) 
     return out[: max(1, int(limit))]
 
 
-# =========================
-# PSA9 scraper from ".completed-auctions-graded" (WORKING - DO NOT CHANGE)
-# =========================
 def _find_graded_sales_table(soup: BeautifulSoup):
     tables = soup.select("div.completed-auctions-graded table")
     if not tables:
@@ -646,15 +628,7 @@ def fetch_pricecharting_psa9_graded(reference_link: str, limit: int = 20) -> lis
             continue
 
         sale_key = f"{d.isoformat()}|{price:.2f}|psa9|{title[:90].strip().lower()}"
-        sales.append(
-            {
-                "sale_date": d,
-                "price": float(price),
-                "title": title,
-                "grade_bucket": "psa9",
-                "sale_key": sale_key,
-            }
-        )
+        sales.append({"sale_date": d, "price": float(price), "title": title, "grade_bucket": "psa9", "sale_key": sale_key})
 
     by_key = {s["sale_key"]: s for s in sales if s.get("sale_key")}
     out = list(by_key.values())
@@ -663,7 +637,7 @@ def fetch_pricecharting_psa9_graded(reference_link: str, limit: int = 20) -> lis
 
 
 # =========================
-# Core: build sales-history rows (ungraded + PSA10 + PSA9)
+# Build sales history rows
 # =========================
 def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame) -> pd.DataFrame:
     if wdf is None or wdf.empty:
@@ -688,7 +662,6 @@ def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame) -> pd.DataFrame:
         if rows_out:
             time.sleep(0.75)
 
-        # ---------- UNGRADED ----------
         sales = fetch_pricecharting_sold_sales(link, limit=120)
         if sales:
             ungraded = [s for s in sales if (s.get("grade_bucket") or "").lower() == "ungraded"]
@@ -709,18 +682,16 @@ def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame) -> pd.DataFrame:
                         "sale_date": s["sale_date"].isoformat() if isinstance(s.get("sale_date"), date) else safe_str(s.get("sale_date", "")).strip(),
                         "price": float(safe_float(s.get("price", 0.0), 0.0)),
                         "title": safe_str(s.get("title", "")).strip(),
-                        "sale_key": _unique_sale_key(link, base_key),  # FIX
+                        "sale_key": _unique_sale_key(link, base_key),
                         "updated_utc": now_utc,
                     }
                 )
 
-        # ---------- PSA10 (manual-only) ----------
         psa10_sales = fetch_pricecharting_psa10_manual_only(link, limit=50)
         if psa10_sales:
             if EBAY_ONLY:
                 psa10_sales = [s for s in psa10_sales if "[ebay]" in (s.get("title", "").lower())]
             psa10_sales = psa10_sales[:PSA10_PER_ITEM]
-
             for s in psa10_sales:
                 base_key = safe_str(s.get("sale_key", "")).strip()
                 rows_out.append(
@@ -734,18 +705,16 @@ def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame) -> pd.DataFrame:
                         "sale_date": s["sale_date"].isoformat() if isinstance(s.get("sale_date"), date) else safe_str(s.get("sale_date", "")).strip(),
                         "price": float(safe_float(s.get("price", 0.0), 0.0)),
                         "title": safe_str(s.get("title", "")).strip(),
-                        "sale_key": _unique_sale_key(link, base_key),  # FIX
+                        "sale_key": _unique_sale_key(link, base_key),
                         "updated_utc": now_utc,
                     }
                 )
 
-        # ---------- PSA9 (graded) ----------
         psa9_sales = fetch_pricecharting_psa9_graded(link, limit=50)
         if psa9_sales:
             if EBAY_ONLY:
                 psa9_sales = [s for s in psa9_sales if "[ebay]" in (s.get("title", "").lower())]
             psa9_sales = psa9_sales[:PSA9_PER_ITEM]
-
             for s in psa9_sales:
                 base_key = safe_str(s.get("sale_key", "")).strip()
                 rows_out.append(
@@ -759,7 +728,7 @@ def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame) -> pd.DataFrame:
                         "sale_date": s["sale_date"].isoformat() if isinstance(s.get("sale_date"), date) else safe_str(s.get("sale_date", "")).strip(),
                         "price": float(safe_float(s.get("price", 0.0), 0.0)),
                         "title": safe_str(s.get("title", "")).strip(),
-                        "sale_key": _unique_sale_key(link, base_key),  # FIX
+                        "sale_key": _unique_sale_key(link, base_key),
                         "updated_utc": now_utc,
                     }
                 )
@@ -781,7 +750,7 @@ def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# Gemrates loader (key = Set Name + Card #)
+# Gemrates loader
 # =========================
 def load_gemrates_lookup(gdf: pd.DataFrame) -> dict[tuple[str, str], dict]:
     if gdf is None or gdf.empty:
@@ -817,7 +786,7 @@ def load_gemrates_lookup(gdf: pd.DataFrame) -> dict[tuple[str, str], dict]:
 
 
 # =========================
-# Prospect scoring
+# Scoring
 # =========================
 def add_prospect_scoring(summary: pd.DataFrame) -> pd.DataFrame:
     if summary is None or summary.empty:
@@ -841,7 +810,6 @@ def add_prospect_scoring(summary: pd.DataFrame) -> pd.DataFrame:
     df["Gem conf"] = df["Total graded"].apply(
         lambda n: round(1.0 - exp(-max(0, safe_int(n, 0)) / max(1.0, CONF_K)), 4)
     )
-
     df["P10 adj"] = (df["Gem rate (all time)"] * df["Gem conf"]).apply(
         lambda v: round(clamp(safe_float(v, 0.0), 0.0, 1.0), 4)
     )
@@ -875,11 +843,7 @@ def add_prospect_scoring(summary: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # Summary table builder
 # =========================
-def build_summary_from_sales_history(
-    sdf: pd.DataFrame,
-    wdf: pd.DataFrame,
-    gem_lookup: dict[tuple[str, str], dict],
-) -> pd.DataFrame:
+def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_lookup: dict) -> pd.DataFrame:
     if sdf is None or sdf.empty:
         return pd.DataFrame()
 
@@ -901,24 +865,18 @@ def build_summary_from_sales_history(
     )
 
     def _bucket_cols(bucket: str):
-        return {
-            "mean": f"{bucket.upper()} Avg",
-            "min": f"{bucket.upper()} Min",
-            "max": f"{bucket.upper()} Max",
-        }
+        return {"mean": f"{bucket.upper()} Avg", "min": f"{bucket.upper()} Min", "max": f"{bucket.upper()} Max"}
 
     out = None
     for bucket in ["ungraded", "psa9", "psa10"]:
         sub = stats[stats["grade_bucket"] == bucket].copy()
         sub = sub[keys + ["mean", "min", "max"]].copy() if not sub.empty else pd.DataFrame(columns=keys + ["mean", "min", "max"])
-        rename = _bucket_cols(bucket)
-        sub = sub.rename(columns={"mean": rename["mean"], "min": rename["min"], "max": rename["max"]})
+        sub = sub.rename(columns={"mean": _bucket_cols(bucket)["mean"], "min": _bucket_cols(bucket)["min"], "max": _bucket_cols(bucket)["max"]})
         out = sub if out is None else out.merge(sub, on=keys, how="outer")
 
     if out is None or out.empty:
         return pd.DataFrame()
 
-    # add image from watchlist (by Link)
     img_map = {}
     if wdf is not None and not wdf.empty and "Link" in wdf.columns and "Image" in wdf.columns:
         for _, r in wdf.iterrows():
@@ -928,12 +886,10 @@ def build_summary_from_sales_history(
 
     out["Image"] = out["Link"].map(lambda x: img_map.get(safe_str(x).strip(), ""))
 
-    # numeric rounding
     for c in out.columns:
         if c.endswith(" Avg") or c.endswith(" Min") or c.endswith(" Max"):
             out[c] = out[c].apply(lambda v: round(safe_float(v, 0.0), 2))
 
-    # gemrates
     out["Gem rate (all time)"] = 0.0
     out["Total graded"] = 0
 
@@ -951,24 +907,36 @@ def build_summary_from_sales_history(
 
 
 # =========================
-# Refresh: scrape/write Image column in watchlist
+# REFRESH IMAGES (BATCH WRITE)  <-- FIXED
 # =========================
-def refresh_watchlist_images(watch_ws, wdf: pd.DataFrame):
+def refresh_watchlist_images_batched(watch_ws, wdf: pd.DataFrame):
+    """
+    Only scrape images for rows missing Image, then batch-write the Image column
+    in ONE update call (or a few contiguous block calls).
+
+    This prevents quota blow-ups.
+    """
     if wdf is None or wdf.empty or "Link" not in wdf.columns:
         return
 
-    if "Image" not in wdf.columns:
-        wdf["Image"] = ""
+    headers, img_col_idx = ensure_watchlist_image_col(watch_ws)
 
-    updates = {}
-    for idx0, row in wdf.reset_index(drop=True).iterrows():
-        sheet_row = idx0 + 2
+    # re-read after header change to ensure alignment
+    wdf2 = wdf.copy()
+    if "Image" not in wdf2.columns:
+        wdf2["Image"] = ""
+
+    # Build a full column vector (row 2..N) that we will write back
+    image_values = [safe_str(v).strip() for v in wdf2["Image"].tolist()]
+
+    # Fill missing
+    for i, row in wdf2.reset_index(drop=True).iterrows():
         link = safe_str(row.get("Link", "")).strip()
         if not link or "pricecharting.com" not in link.lower():
             continue
 
-        cur_img = safe_str(row.get("Image", "")).strip()
-        if cur_img and (cur_img.startswith("http://") or cur_img.startswith("https://")):
+        cur = safe_str(image_values[i]).strip()
+        if cur and (cur.startswith("http://") or cur.startswith("https://")):
             continue
 
         try:
@@ -977,12 +945,14 @@ def refresh_watchlist_images(watch_ws, wdf: pd.DataFrame):
             img = ""
 
         if img:
-            updates[sheet_row] = img
+            image_values[i] = img
 
-        time.sleep(0.25)
+        # tiny delay so we don't hammer PriceCharting
+        time.sleep(0.2)
 
-    if updates:
-        update_ws_column_by_header(watch_ws, "Image", updates)
+    # Batch update the whole Image column range in ONE API call
+    start_row = 2
+    batch_update_column_values(watch_ws, img_col_idx, start_row, image_values)
 
 
 # =========================
@@ -1009,9 +979,12 @@ with top:
                 st.warning(f"No rows found in `{WATCHLIST_WS_NAME}`.")
             else:
                 try:
-                    with st.spinner("Refreshing sales history + images..."):
-                        refresh_watchlist_images(watch_ws, wdf)
-                        wdf = read_ws_df(watch_ws)  # reload watchlist (now includes any new rows + images)
+                    with st.spinner("Refreshing images + sales history..."):
+                        # FIX: batch write images (1 call) instead of cell-by-cell
+                        refresh_watchlist_images_batched(watch_ws, wdf)
+
+                        # reload watchlist so Image column is current + includes new rows
+                        wdf = read_ws_df(watch_ws)
 
                         out_df = build_sales_history_rows_from_watchlist(wdf)
                         write_ws_df(sales_ws, out_df, SALES_HISTORY_HEADERS)
@@ -1037,9 +1010,6 @@ if summary_df is None or summary_df.empty:
     st.info("No sales history yet. Click **Refresh** to populate `grading_sales_history` and see the summary.")
     st.stop()
 
-# -------------------------
-# Filters
-# -------------------------
 with st.expander("Filters", expanded=True):
     f1, f2, f3, f4 = st.columns([1.2, 1.2, 1.2, 1.2])
 
@@ -1127,7 +1097,6 @@ preferred_cols = [
     "Net 9",
     "Net 10",
 ]
-
 final_cols = [c for c in preferred_cols if c in fdf.columns] + [c for c in fdf.columns if c not in preferred_cols]
 fdf = fdf[final_cols].copy()
 
