@@ -1,26 +1,21 @@
 # pages/5_Grading.py
 # ---------------------------------------------------------
-# FIX: Google Sheets quota exceeded when refreshing images for many new watchlist rows
-#
-# Root cause: update_ws_column_by_header() was doing 1 API call PER ROW (cell-by-cell).
-# Fix: batch update the Image column in ONE call (or a few large calls) using ws.update(range, values).
-#
-# NEW (THIS UPDATE):
-# - Pull TCGplayer Market Price from a tcgplayer product URL stored in watchlist column: `tcgplayer_link`
-# - TCGplayer is JS-rendered -> use Playwright headless browser to load + extract Market Price.
-# - Show in Summary table:
-#     - "TCGplayer Price" next to "UNGRADED Avg"
-#     - "TCG - Ungraded" = TCGplayer Price - UNGRADED Avg
-#
-# IMPORTANT:
-# - Do NOT change ungraded / PSA9 / PSA10 scraping logic (left untouched).
-# - Keep the "unique sale_key per link" fix so new watchlist items don't get dropped.
+# Updates in this version:
+# - Add refresh mode control:
+#     * PriceCharting only (images + sales history)
+#     * TCGplayer only (market price)
+#     * Both
+# - TCGplayer prices are JS-rendered => Playwright
+# - IMPORTANT PERFORMANCE FIX:
+#     * We DO NOT scrape TCGplayer during summary building anymore.
+#     * We scrape and STORE tcgplayer_price into watchlist (batch write).
+#     * Summary reads the stored price = fast filtering / reruns.
 # ---------------------------------------------------------
 
 import json
 import re
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from math import exp
 
@@ -50,6 +45,11 @@ GEMRATES_WS_NAME = st.secrets.get("gemrates_worksheet", "gemrates")
 
 WATCHLIST_HEADERS_EXPECTED = ["Generation", "Set", "Card Name", "Card No", "Link", "Image"]
 
+# NEW watchlist cols (optional, will be created if missing)
+TCG_LINK_COL = "tcgplayer_link"
+TCG_PRICE_COL = "tcgplayer_price"
+TCG_UPDATED_COL = "tcgplayer_price_updated_utc"
+
 SALES_HISTORY_HEADERS = [
     "Generation",
     "Set",
@@ -71,6 +71,9 @@ EBAY_ONLY = True
 
 GRADING_ALL_IN_COST = float(st.secrets.get("grading_all_in_cost", 25.0))
 CONF_K = float(st.secrets.get("gemrate_conf_k", 250.0))
+
+# How often to refresh TCG prices automatically (if you re-run TCG refresh)
+TCG_PRICE_TTL_HOURS = float(st.secrets.get("tcgplayer_price_ttl_hours", 6.0))
 
 
 # =========================
@@ -163,6 +166,17 @@ def _unique_sale_key(link: str, base_sale_key: str) -> str:
     if not bk:
         return lk
     return f"{lk}|{bk}"
+
+def _utc_now_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat()
+
+def _parse_utc_iso(s: str):
+    try:
+        if not s:
+            return None
+        return datetime.fromisoformat(s.replace("Z", ""))
+    except Exception:
+        return None
 
 
 # =========================
@@ -259,6 +273,26 @@ def write_ws_df(ws, df: pd.DataFrame, headers: list[str]):
     _gs_write_retry(ws.update, range_name=rng, values=values, value_input_option="RAW")
 
 
+def ensure_watchlist_col(ws, col_name: str):
+    """
+    Ensure a column exists in watchlist sheet; return (headers, 1-based col index).
+    """
+    values = ws.get_all_values()
+    if not values or not values[0]:
+        # If empty, create baseline headers plus requested col
+        headers = WATCHLIST_HEADERS_EXPECTED.copy()
+        if col_name not in headers:
+            headers.append(col_name)
+        _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
+        return headers, headers.index(col_name) + 1
+
+    headers = [safe_str(x).strip() for x in values[0]]
+    if col_name not in headers:
+        headers.append(col_name)
+        _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
+    return headers, headers.index(col_name) + 1
+
+
 def ensure_watchlist_image_col(watch_ws):
     """Guarantee 'Image' header exists (single header update, not per-row)."""
     values = watch_ws.get_all_values()
@@ -338,9 +372,6 @@ def http_get_with_backoff(url: str, *, timeout=25, max_tries=6):
 # TCGplayer Market Price (JS-rendered -> Playwright)
 # =========================
 def _extract_tcgplayer_market_price_from_dom_text(dom_text: str) -> float:
-    """
-    Parse a dollar value from a text snippet or DOM extracted string.
-    """
     if not dom_text:
         return 0.0
     v = _price_from_cell_text(dom_text)
@@ -352,32 +383,18 @@ def _extract_tcgplayer_market_price_from_dom_text(dom_text: str) -> float:
         return float(vv) if vv > 0 else 0.0
     return 0.0
 
-
 @st.cache_resource
 def _get_playwright_browser():
-    """
-    Launch Chromium once per Streamlit process.
-    NOTE: This requires Playwright installed + Chromium downloaded at build time.
-    """
     from playwright.sync_api import sync_playwright  # lazy import
 
     p = sync_playwright().start()
     browser = p.chromium.launch(
         headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-        ],
+        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
     )
     return {"p": p, "browser": browser}
 
-
 def _tcgplayer_price_via_playwright(url: str) -> float:
-    """
-    Load the page with a headless browser, wait for price element, extract.
-    Returns 0.0 if not found.
-    """
     url = (url or "").strip()
     if not url or "tcgplayer.com" not in url.lower():
         return 0.0
@@ -395,33 +412,25 @@ def _tcgplayer_price_via_playwright(url: str) -> float:
 
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
-
-        # Give their JS a moment
         page.wait_for_timeout(1200)
 
-        # Primary selector from your screenshot
         sel = "span.price-points__upper__price"
 
-        # Wait up to ~10s for the element to appear (sometimes slower)
         try:
             page.wait_for_selector(sel, timeout=10000)
         except Exception:
-            # If selector never appears, try text-based approach on full page
             txt = page.inner_text("body")
-            # Pattern like: "Market Price $39.74"
             m = re.search(r"Market Price\s*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})", txt, flags=re.IGNORECASE)
             if m:
                 vv = safe_float(m.group(1), 0.0)
                 return float(vv) if vv > 0 else 0.0
             return 0.0
 
-        # Pull the price text
         price_text = page.locator(sel).first.inner_text().strip()
         price = _extract_tcgplayer_market_price_from_dom_text(price_text)
         if price > 0:
             return float(price)
 
-        # Fallback: read row containing "Market Price"
         body_txt = page.inner_text("body")
         m = re.search(r"Market Price\s*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})", body_txt, flags=re.IGNORECASE)
         if m:
@@ -440,16 +449,77 @@ def _tcgplayer_price_via_playwright(url: str) -> float:
         except Exception:
             pass
 
-
 @st.cache_data(ttl=60 * 60 * 6)
 def fetch_tcgplayer_market_price(tcg_url: str) -> float:
-    """
-    Cached wrapper (6 hours) around Playwright extraction.
-    """
     try:
         return float(_tcgplayer_price_via_playwright(tcg_url))
     except Exception:
         return 0.0
+
+
+def refresh_watchlist_tcg_prices_batched(watch_ws, wdf: pd.DataFrame):
+    """
+    Refresh ONLY tcgplayer_price (+ updated timestamp) for rows with tcgplayer_link.
+    - Writes back to the watchlist sheet in TWO batch calls (price column + updated column).
+    - Only refreshes rows that are missing OR stale (older than TCG_PRICE_TTL_HOURS).
+    """
+    if wdf is None or wdf.empty:
+        return
+
+    # Ensure columns exist
+    _, link_idx = ensure_watchlist_col(watch_ws, TCG_LINK_COL)
+    _, price_idx = ensure_watchlist_col(watch_ws, TCG_PRICE_COL)
+    _, upd_idx = ensure_watchlist_col(watch_ws, TCG_UPDATED_COL)
+
+    # Re-read so df has newly created columns aligned
+    wdf2 = read_ws_df(watch_ws)
+    if wdf2 is None or wdf2.empty:
+        return
+
+    if TCG_LINK_COL not in wdf2.columns:
+        return
+
+    if TCG_PRICE_COL not in wdf2.columns:
+        wdf2[TCG_PRICE_COL] = ""
+    if TCG_UPDATED_COL not in wdf2.columns:
+        wdf2[TCG_UPDATED_COL] = ""
+
+    tcg_links = [safe_str(v).strip() for v in wdf2[TCG_LINK_COL].tolist()]
+    prices = [safe_str(v).strip() for v in wdf2[TCG_PRICE_COL].tolist()]
+    updated = [safe_str(v).strip() for v in wdf2[TCG_UPDATED_COL].tolist()]
+
+    now = datetime.utcnow()
+    max_age = timedelta(hours=float(TCG_PRICE_TTL_HOURS))
+
+    for i in range(len(tcg_links)):
+        url = tcg_links[i]
+        if not url:
+            continue
+
+        # decide if stale
+        ts = _parse_utc_iso(updated[i])
+        is_stale = (ts is None) or ((now - ts) > max_age)
+
+        # if we already have a price and it's not stale, skip
+        cur_price = safe_float(prices[i], 0.0)
+        if cur_price > 0 and not is_stale:
+            continue
+
+        p = fetch_tcgplayer_market_price(url)
+        if p > 0:
+            prices[i] = f"{p:.2f}"
+            updated[i] = _utc_now_iso()
+        else:
+            # keep existing (but still stamp update attempt so it doesn't hammer every click)
+            updated[i] = _utc_now_iso()
+
+        # small delay; cache + TTL does most of the work
+        time.sleep(0.15)
+
+    # Batch write back (row 2..N)
+    start_row = 2
+    batch_update_column_values(watch_ws, price_idx, start_row, prices)
+    batch_update_column_values(watch_ws, upd_idx, start_row, updated)
 
 
 # =========================
@@ -773,7 +843,7 @@ def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame) -> pd.DataFrame:
             wdf[h] = ""
 
     rows_out = []
-    now_utc = datetime.utcnow().isoformat()
+    now_utc = _utc_now_iso()
 
     wdf2 = wdf.copy()
     wdf2["Link"] = wdf2["Link"].astype(str).str.strip()
@@ -1002,28 +1072,18 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
     if out is None or out.empty:
         return pd.DataFrame()
 
-    # --- Image map (PriceCharting) ---
     img_map = {}
-    # --- TCGplayer link map (keyed by PriceCharting Link) ---
-    tcg_link_map = {}
+    tcg_price_map = {}
 
     if wdf is not None and not wdf.empty and "Link" in wdf.columns:
-        wdf2 = wdf.copy()
-        wdf2["Link"] = wdf2["Link"].astype(str).str.strip()
-
-        has_img = "Image" in wdf2.columns
-        has_tcg = "tcgplayer_link" in wdf2.columns
-
-        for _, r in wdf2.iterrows():
+        for _, r in wdf.iterrows():
             lk = safe_str(r.get("Link", "")).strip()
             if not lk:
                 continue
-
-            if has_img:
+            if "Image" in wdf.columns:
                 img_map[lk] = safe_str(r.get("Image", "")).strip()
-
-            if has_tcg:
-                tcg_link_map[lk] = safe_str(r.get("tcgplayer_link", "")).strip()
+            if TCG_PRICE_COL in wdf.columns:
+                tcg_price_map[lk] = safe_float(r.get(TCG_PRICE_COL, 0.0), 0.0)
 
     out["Image"] = out["Link"].map(lambda x: img_map.get(safe_str(x).strip(), ""))
 
@@ -1042,22 +1102,8 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
             out.at[i, "Gem rate (all time)"] = round(float(rec.get("gem_rate", 0.0)), 4)
             out.at[i, "Total graded"] = int(rec.get("total", 0))
 
-    # --- TCGplayer price pull (Playwright) ---
-    out["TCGplayer Price"] = 0.0
-    for i, row in out.iterrows():
-        pc_link = safe_str(row.get("Link", "")).strip()
-        tcg_url = safe_str(tcg_link_map.get(pc_link, "")).strip()
-        if not tcg_url:
-            continue
-        price = fetch_tcgplayer_market_price(tcg_url)
-        out.at[i, "TCGplayer Price"] = round(safe_float(price, 0.0), 2)
-
-        # tiny delay so we don't look botty if many rows (cache helps too)
-        time.sleep(0.15)
-
-    if "UNGRADED Avg" not in out.columns:
-        out["UNGRADED Avg"] = 0.0
-
+    # TCG price is READ (stored in watchlist) — no scraping here.
+    out["TCGplayer Price"] = out["Link"].map(lambda x: round(safe_float(tcg_price_map.get(safe_str(x).strip(), 0.0), 0.0), 2))
     out["TCG - Ungraded"] = (
         out["TCGplayer Price"].apply(lambda v: safe_float(v, 0.0)) -
         out["UNGRADED Avg"].apply(lambda v: safe_float(v, 0.0))
@@ -1069,29 +1115,20 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
 
 
 # =========================
-# REFRESH IMAGES (BATCH WRITE)  <-- FIXED
+# REFRESH IMAGES (BATCH WRITE)
 # =========================
 def refresh_watchlist_images_batched(watch_ws, wdf: pd.DataFrame):
-    """
-    Only scrape images for rows missing Image, then batch-write the Image column
-    in ONE update call (or a few contiguous block calls).
-
-    This prevents quota blow-ups.
-    """
     if wdf is None or wdf.empty or "Link" not in wdf.columns:
         return
 
     headers, img_col_idx = ensure_watchlist_image_col(watch_ws)
 
-    # re-read after header change to ensure alignment
     wdf2 = wdf.copy()
     if "Image" not in wdf2.columns:
         wdf2["Image"] = ""
 
-    # Build a full column vector (row 2..N) that we will write back
     image_values = [safe_str(v).strip() for v in wdf2["Image"].tolist()]
 
-    # Fill missing
     for i, row in wdf2.reset_index(drop=True).iterrows():
         link = safe_str(row.get("Link", "")).strip()
         if not link or "pricecharting.com" not in link.lower():
@@ -1109,10 +1146,8 @@ def refresh_watchlist_images_batched(watch_ws, wdf: pd.DataFrame):
         if img:
             image_values[i] = img
 
-        # tiny delay so we don't hammer PriceCharting
         time.sleep(0.2)
 
-    # Batch update the whole Image column range in ONE API call
     start_row = 2
     batch_update_column_values(watch_ws, img_col_idx, start_row, image_values)
 
@@ -1133,44 +1168,57 @@ gem_lookup = load_gemrates_lookup(gdf)
 
 top = st.container()
 with top:
-    c1, c2 = st.columns([1, 3])
+    c1, c2 = st.columns([1.2, 3])
 
     with c1:
-        if st.button("Refresh", type="primary", use_container_width=True):
-            if wdf is None or wdf.empty:
-                st.warning(f"No rows found in `{WATCHLIST_WS_NAME}`.")
-            else:
-                try:
-                    with st.spinner("Refreshing images + sales history..."):
-                        # FIX: batch write images (1 call) instead of cell-by-cell
-                        refresh_watchlist_images_batched(watch_ws, wdf)
+        refresh_mode = st.radio(
+            "Refresh mode",
+            ["TCGplayer only", "PriceCharting only", "Both"],
+            index=2,
+        )
 
-                        # reload watchlist so Image column is current + includes new rows
+        if st.button("Run Refresh", type="primary", use_container_width=True):
+            try:
+                with st.spinner("Refreshing..."):
+                    # Always re-read watchlist before actions
+                    wdf = read_ws_df(watch_ws)
+
+                    if refresh_mode in ("TCGplayer only", "Both"):
+                        refresh_watchlist_tcg_prices_batched(watch_ws, wdf)
+                        wdf = read_ws_df(watch_ws)
+
+                    if refresh_mode in ("PriceCharting only", "Both"):
+                        refresh_watchlist_images_batched(watch_ws, wdf)
                         wdf = read_ws_df(watch_ws)
 
                         out_df = build_sales_history_rows_from_watchlist(wdf)
                         write_ws_df(sales_ws, out_df, SALES_HISTORY_HEADERS)
 
-                    st.success(f"Refreshed. Wrote {len(out_df):,} rows to `{SALES_HISTORY_WS_NAME}`.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Refresh failed: {e}")
-                    st.exception(e)
+                st.success("Refresh complete.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Refresh failed: {e}")
+                st.exception(e)
 
     with c2:
         st.caption(
-            f"Summary is calculated from `grading_sales_history` (last 5 sales per grade bucket). "
-            f"Prospect Score uses all-in grading cost = ${GRADING_ALL_IN_COST:.2f} and gemrate confidence. "
-            f"TCGplayer Price is loaded via headless browser (Playwright) from `tcgplayer_link` in the watchlist."
+            f"Tip: Use **TCGplayer only** for fast price updates. "
+            f"TCG prices are stored in the watchlist columns `{TCG_PRICE_COL}` and `{TCG_UPDATED_COL}` "
+            f"(TTL {TCG_PRICE_TTL_HOURS:g}h) so filtering does not re-scrape."
         )
 
 st.divider()
 
+# Load sales history + build summary
 sdf = read_ws_df(sales_ws)
+
+# Important: re-read watchlist so stored tcg prices are included
+wdf = read_ws_df(watch_ws)
+
 summary_df = build_summary_from_sales_history(sdf, wdf, gem_lookup)
 
 if summary_df is None or summary_df.empty:
-    st.info("No sales history yet. Click **Refresh** to populate `grading_sales_history` and see the summary.")
+    st.info("No sales history yet. Run **PriceCharting only** (or **Both**) at least once.")
     st.stop()
 
 with st.expander("Filters", expanded=True):
