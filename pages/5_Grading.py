@@ -6,7 +6,8 @@
 # Fix: batch update the Image column in ONE call (or a few large calls) using ws.update(range, values).
 #
 # NEW (THIS UPDATE):
-# - Pull TCGplayer Market Price (no API) from a tcgplayer product URL stored in watchlist column: `tcgplayer_link`
+# - Pull TCGplayer Market Price from a tcgplayer product URL stored in watchlist column: `tcgplayer_link`
+# - TCGplayer is JS-rendered -> use Playwright headless browser to load + extract Market Price.
 # - Show in Summary table:
 #     - "TCGplayer Price" next to "UNGRADED Avg"
 #     - "TCG - Ungraded" = TCGplayer Price - UNGRADED Avg
@@ -334,77 +335,121 @@ def http_get_with_backoff(url: str, *, timeout=25, max_tries=6):
 
 
 # =========================
-# TCGplayer Market Price (NO API)
+# TCGplayer Market Price (JS-rendered -> Playwright)
 # =========================
-def _extract_tcgplayer_market_price_from_html(html: str) -> float:
+def _extract_tcgplayer_market_price_from_dom_text(dom_text: str) -> float:
     """
-    Try multiple HTML / embedded-data patterns to find TCGplayer Market Price.
+    Parse a dollar value from a text snippet or DOM extracted string.
+    """
+    if not dom_text:
+        return 0.0
+    v = _price_from_cell_text(dom_text)
+    if v > 0:
+        return float(v)
+    m = re.search(r"([0-9][0-9,]*\.?[0-9]{0,2})", dom_text)
+    if m:
+        vv = safe_float(m.group(1), 0.0)
+        return float(vv) if vv > 0 else 0.0
+    return 0.0
+
+
+@st.cache_resource
+def _get_playwright_browser():
+    """
+    Launch Chromium once per Streamlit process.
+    NOTE: This requires Playwright installed + Chromium downloaded at build time.
+    """
+    from playwright.sync_api import sync_playwright  # lazy import
+
+    p = sync_playwright().start()
+    browser = p.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ],
+    )
+    return {"p": p, "browser": browser}
+
+
+def _tcgplayer_price_via_playwright(url: str) -> float:
+    """
+    Load the page with a headless browser, wait for price element, extract.
     Returns 0.0 if not found.
     """
-    if not html:
+    url = (url or "").strip()
+    if not url or "tcgplayer.com" not in url.lower():
         return 0.0
 
-    soup = BeautifulSoup(html, _bs_parser())
+    holder = _get_playwright_browser()
+    browser = holder["browser"]
 
-    # 1) Most common: the exact selector seen in DevTools screenshot
-    node = soup.select_one("span.price-points__upper__price")
-    if node:
-        v = _price_from_cell_text(node.get_text(" ", strip=True))
-        if v > 0:
-            return float(v)
+    context = browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        locale="en-US",
+        viewport={"width": 1280, "height": 800},
+    )
+    page = context.new_page()
 
-    # 2) Sometimes appears in the same table row with "Market Price" label
-    # Search any element containing "Market Price", then look near it for a $ value
-    text_all = soup.get_text(" ", strip=True)
-    # quick regex fallback on full text: "Market Price $39.74"
-    m = re.search(r"Market Price\s*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})", text_all, flags=re.IGNORECASE)
-    if m:
-        v = safe_float(m.group(1), 0.0)
-        if v > 0:
-            return float(v)
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
 
-    # 3) Embedded JSON-ish: look for market price style keys
-    # These patterns vary, so we search broad, then take first plausible dollar amount after key.
-    patterns = [
-        r'"marketPrice"\s*:\s*"?([0-9]+(?:\.[0-9]{1,2})?)"?',
-        r'"market_price"\s*:\s*"?([0-9]+(?:\.[0-9]{1,2})?)"?',
-        r'"marketPriceValue"\s*:\s*"?([0-9]+(?:\.[0-9]{1,2})?)"?',
-    ]
-    for pat in patterns:
-        mm = re.search(pat, html, flags=re.IGNORECASE)
-        if mm:
-            v = safe_float(mm.group(1), 0.0)
-            if v > 0:
-                return float(v)
+        # Give their JS a moment
+        page.wait_for_timeout(1200)
 
-    # 4) Last resort: find a $ amount near "Market Price" in raw HTML
-    mm2 = re.search(r"Market Price.{0,80}?\$([0-9][0-9,]*\.?[0-9]{0,2})", html, flags=re.IGNORECASE | re.DOTALL)
-    if mm2:
-        v = safe_float(mm2.group(1), 0.0)
-        if v > 0:
-            return float(v)
+        # Primary selector from your screenshot
+        sel = "span.price-points__upper__price"
 
-    return 0.0
+        # Wait up to ~10s for the element to appear (sometimes slower)
+        try:
+            page.wait_for_selector(sel, timeout=10000)
+        except Exception:
+            # If selector never appears, try text-based approach on full page
+            txt = page.inner_text("body")
+            # Pattern like: "Market Price $39.74"
+            m = re.search(r"Market Price\s*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})", txt, flags=re.IGNORECASE)
+            if m:
+                vv = safe_float(m.group(1), 0.0)
+                return float(vv) if vv > 0 else 0.0
+            return 0.0
+
+        # Pull the price text
+        price_text = page.locator(sel).first.inner_text().strip()
+        price = _extract_tcgplayer_market_price_from_dom_text(price_text)
+        if price > 0:
+            return float(price)
+
+        # Fallback: read row containing "Market Price"
+        body_txt = page.inner_text("body")
+        m = re.search(r"Market Price\s*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})", body_txt, flags=re.IGNORECASE)
+        if m:
+            vv = safe_float(m.group(1), 0.0)
+            return float(vv) if vv > 0 else 0.0
+
+        return 0.0
+
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+        try:
+            context.close()
+        except Exception:
+            pass
 
 
 @st.cache_data(ttl=60 * 60 * 6)
 def fetch_tcgplayer_market_price(tcg_url: str) -> float:
     """
-    Fetch TCGplayer product page and extract Market Price (Near Mint / selected filters).
-    Note: if the site fully JS-renders the price, requests HTML may not include it,
-    and this will return 0.0. (Then we'd switch to Playwright.)
+    Cached wrapper (6 hours) around Playwright extraction.
     """
-    url = (tcg_url or "").strip()
-    if not url or "tcgplayer.com" not in url.lower():
-        return 0.0
-
     try:
-        r = http_get_with_backoff(url, timeout=25, max_tries=6)
+        return float(_tcgplayer_price_via_playwright(tcg_url))
     except Exception:
         return 0.0
-
-    price = _extract_tcgplayer_market_price_from_html(r.text)
-    return float(price) if price and price > 0 else 0.0
 
 
 # =========================
@@ -997,9 +1042,7 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
             out.at[i, "Gem rate (all time)"] = round(float(rec.get("gem_rate", 0.0)), 4)
             out.at[i, "Total graded"] = int(rec.get("total", 0))
 
-    # --- TCGplayer price pull (no API) ---
-    # We only fetch if the watchlist row has a tcgplayer_link for that PriceCharting Link.
-    # Cached (6 hours) so it won't hammer TCGplayer.
+    # --- TCGplayer price pull (Playwright) ---
     out["TCGplayer Price"] = 0.0
     for i, row in out.iterrows():
         pc_link = safe_str(row.get("Link", "")).strip()
@@ -1009,11 +1052,16 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
         price = fetch_tcgplayer_market_price(tcg_url)
         out.at[i, "TCGplayer Price"] = round(safe_float(price, 0.0), 2)
 
-    # Difference vs PriceCharting-derived ungraded avg
+        # tiny delay so we don't look botty if many rows (cache helps too)
+        time.sleep(0.15)
+
     if "UNGRADED Avg" not in out.columns:
         out["UNGRADED Avg"] = 0.0
-    out["TCG - Ungraded"] = (out["TCGplayer Price"].apply(lambda v: safe_float(v, 0.0)) -
-                             out["UNGRADED Avg"].apply(lambda v: safe_float(v, 0.0))).apply(lambda v: round(v, 2))
+
+    out["TCG - Ungraded"] = (
+        out["TCGplayer Price"].apply(lambda v: safe_float(v, 0.0)) -
+        out["UNGRADED Avg"].apply(lambda v: safe_float(v, 0.0))
+    ).apply(lambda v: round(v, 2))
 
     out = add_prospect_scoring(out)
     out = out.sort_values(["Set", "Card Name", "Card No"], ascending=[True, True, True]).reset_index(drop=True)
@@ -1113,7 +1161,7 @@ with top:
         st.caption(
             f"Summary is calculated from `grading_sales_history` (last 5 sales per grade bucket). "
             f"Prospect Score uses all-in grading cost = ${GRADING_ALL_IN_COST:.2f} and gemrate confidence. "
-            f"TCGplayer Price is scraped (no API) from `tcgplayer_link` in the watchlist."
+            f"TCGplayer Price is loaded via headless browser (Playwright) from `tcgplayer_link` in the watchlist."
         )
 
 st.divider()
