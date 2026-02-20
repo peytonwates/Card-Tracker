@@ -1122,27 +1122,42 @@ if not txn.empty:
     if tx_status_col and tx_status_col in txn.columns:
         txn["__status"] = txn[tx_status_col].astype(str).str.upper().str.strip()
         txn = txn[txn["__status"].eq("SOLD")].copy()
-
+    #Start
     # Always capture shipping (used in tables even if net_proceeds exists)
     if tx_ship_charged_col and tx_ship_charged_col in txn.columns:
         txn["__ship_charged"] = _to_num(txn[tx_ship_charged_col])
     else:
         txn["__ship_charged"] = 0.0
 
-    # Proceeds (what you actually walk away with)
-    # If you have a net_proceeds column, trust it.
+    # ✅ NEW: pull these directly from Transactions sheet columns if they exist
+    tx_total_fees_col = (
+        _pick_col(txn, "total_fees", None)
+        or _pick_col(txn, "fees_total", None)
+        or _pick_col(txn, "total_fee", None)
+    )
+    tx_profit_col = _pick_col(txn, "profit", None)
+
+    # Dollar sales (gross item price)
+    txn["__dollar_sales"] = _to_num(txn["__sold_price"])
+
+    # ✅ Total Fees = the Total Fees column (if present). Otherwise fallback to old logic.
+    if tx_total_fees_col and tx_total_fees_col in txn.columns:
+        txn["__total_fees"] = _to_num(txn[tx_total_fees_col])
+    else:
+        txn["__total_fees"] = (txn["__fees"] + txn["__ship_charged"]).fillna(0.0)
+
+    # ✅ Proceeds = the Net Proceeds column (if present). Otherwise fallback.
     if tx_net_proceeds_col and tx_net_proceeds_col in txn.columns:
         txn["__net"] = _to_num(txn[tx_net_proceeds_col])
     else:
-        # Otherwise compute proceeds as sold_price - fees - shipping_charged
-        txn["__net"] = (txn["__sold_price"] - txn["__fees"] - txn["__ship_charged"]).fillna(0.0)
+        txn["__net"] = (txn["__dollar_sales"] - txn["__total_fees"]).fillna(0.0)
 
-    # Total fees (fees + shipping)
-    txn["__total_fees"] = (txn["__fees"] + txn["__ship_charged"]).fillna(0.0)
-
-    # Dollar sales (gross item price; change later if you want to include buyer-paid shipping as revenue)
-    txn["__dollar_sales"] = _to_num(txn["__sold_price"])
-
+    # ✅ Profit = the Profit column (if present). Otherwise leave NaN (we’ll fallback later where needed).
+    if tx_profit_col and tx_profit_col in txn.columns:
+        txn["__profit"] = _to_num(txn[tx_profit_col])
+    else:
+        txn["__profit"] = np.nan
+    #End
     # ✅ FIX: fallback “sold rows only” guard even if status col was missing upstream
     txn = txn[~(txn["__sold_dt"].isna() & (txn["__sold_price"] <= 0) & (txn["__net"] <= 0))].copy()
 
@@ -1627,6 +1642,7 @@ with tab_bs:
         st.dataframe(sty2, use_container_width=True, hide_index=True)
 
     # -------------------------
+    # -------------------------
     # SALES (right side)
     # -------------------------
     with right:
@@ -1722,6 +1738,35 @@ with tab_bs:
             if "__net" not in tx.columns:
                 tx["__net"] = (tx["__dollar_sales"] - tx["__total_fees"]).fillna(0.0)
 
+            # ✅ FIX: if the Transactions sheet has these columns, USE THEM (just totals)
+            def _pick_raw_col(df: pd.DataFrame, name: str):
+                target = _norm_key(name)
+                for c in df.columns:
+                    sc = str(c)
+                    if sc.startswith("__"):
+                        continue
+                    if _norm_key(_base_col(sc)) == target:
+                        return c
+                return None
+
+            raw_total_fees_col = (
+                _pick_raw_col(tx, "total_fees")
+                or _pick_raw_col(tx, "fees_total")
+                or _pick_raw_col(tx, "total_fee")
+            )
+            raw_net_proceeds_col = (
+                _pick_raw_col(tx, "net_proceeds")
+                or _pick_raw_col(tx, "net_proceed")
+                or _pick_raw_col(tx, "proceeds")
+            )
+            raw_profit_col = _pick_raw_col(tx, "profit")
+
+            if raw_total_fees_col:
+                tx["__total_fees"] = _to_num(tx[raw_total_fees_col]).fillna(0.0)
+
+            if raw_net_proceeds_col:
+                tx["__net"] = _to_num(tx[raw_net_proceeds_col]).fillna(0.0)
+
             # COGS per sold line from inventory (plus unsynced grading)
             def _cogs_for_inv_id(inv_id: str) -> float:
                 k = _safe_str(inv_id).strip()
@@ -1734,12 +1779,18 @@ with tab_bs:
 
             tx["__cogs"] = tx["__inventory_id"].apply(_cogs_for_inv_id)
 
+            # ✅ Profit = Profit column if present, otherwise fallback
+            if raw_profit_col:
+                tx["__profit"] = _to_num(tx[raw_profit_col]).fillna(0.0)
+            else:
+                tx["__profit"] = (tx["__net"] - tx["__cogs"]).fillna(0.0)
+
             sales_count_total = int(len(tx))
             gross_total = float(tx["__dollar_sales"].sum())
             fees_total = float(tx["__total_fees"].sum())
             net_total = float(tx["__net"].sum())
             cogs_total = float(tx["__cogs"].sum())
-            profit_total = float((tx["__net"] - tx["__cogs"]).sum())
+            profit_total = float(tx["__profit"].sum())
 
             rows = []
             for ct in ["Sports", "Pokemon"]:
@@ -1754,7 +1805,7 @@ with tab_bs:
                     float(sub["__dollar_sales"].sum()),
                     float(sub["__total_fees"].sum()),
                     float(sub["__net"].sum()),
-                    float((sub["__net"] - sub["__cogs"]).sum()),
+                    float(sub["__profit"].sum()),
                 ])
 
                 for b in ["Cards", "Graded Cards", "Sealed"]:
@@ -1766,7 +1817,7 @@ with tab_bs:
                         float(sb["__dollar_sales"].sum()),
                         float(sb["__total_fees"].sum()),
                         float(sb["__net"].sum()),
-                        float((sb["__net"] - sb["__cogs"]).sum()),
+                        float(sb["__profit"].sum()),
                     ])
 
             sales_df = pd.DataFrame(rows, columns=["Sales", "# of Sales", "Cost of Goods", "Dollar Sales", "Total Fees", "Proceeds", "Profit"])
