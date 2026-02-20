@@ -1251,6 +1251,7 @@ with tab_create:
                     st.rerun()
 
         # -----------------------------------------
+        # -----------------------------------------
         # SINGLE MODE
         # -----------------------------------------
         else:
@@ -1288,223 +1289,235 @@ with tab_create:
 
             st.markdown("---")
 
-            with st.form("create_tx_form", clear_on_submit=False):
-                c1, c2, c3 = st.columns([1.2, 1.2, 2.0])
+            # ✅ NO FORM — widgets rerun live, so estimate updates instantly
+            c1, c2, c3 = st.columns([1.2, 1.2, 2.0])
 
-                with c1:
-                    tx_type = st.selectbox("Transaction type*", TX_TYPES, index=0)
+            with c1:
+                tx_type = st.selectbox("Transaction type*", TX_TYPES, index=0)
 
-                with c2:
-                    platform = st.text_input(
-                        "Platform*",
-                        value="eBay" if tx_type in ["Auction", "Buy It Now"] else "Trade In",
-                        placeholder="eBay, Whatnot, LCS, Trade-in shop, etc.",
+            with c2:
+                platform_default = "eBay" if tx_type in ["Auction", "Buy It Now"] else "Trade In"
+                platform = st.text_input(
+                    "Platform*",
+                    value=platform_default,
+                    placeholder="eBay, Whatnot, LCS, Trade-in shop, etc.",
+                )
+
+            with c3:
+                notes = st.text_input("Notes (optional)", value="", placeholder="Anything helpful...")
+
+            # Defaults to keep variables defined
+            list_date = ""
+            list_price = 0.0
+            shipping_type = ""
+            sold_date = ""
+            sold_price = 0.0
+            fees = 0.0
+            shipping_charged = 0.0
+
+            if tx_type in ["Auction", "Buy It Now"]:
+                l1, l2, l3 = st.columns(3)
+                with l1:
+                    list_date = st.date_input("List date*", value=date.today())
+
+                with l2:
+                    list_price = st.number_input(
+                        "List price*",
+                        min_value=0.0,
+                        step=1.0,
+                        format="%.2f",
                     )
 
-                with c3:
-                    notes = st.text_input("Notes (optional)", value="", placeholder="Anything helpful...")
-
-                if tx_type in ["Auction", "Buy It Now"]:
-                    l1, l2, l3 = st.columns(3)
-                    with l1:
-                        list_date = st.date_input("List date*", value=date.today())
-
-                    with l2:
-                        list_price = st.number_input("List price*", min_value=0.0, step=1.0, format="%.2f")
-
-                    with l3:
-                        # Show shipping type input; required only if platform is eBay
-                        if _is_ebay_platform(platform):
-                            shipping_type = st.selectbox("Shipping type (eBay only)*", EBAY_SHIPPING_TYPES, index=0)
-                        else:
-                            shipping_type = st.selectbox("Shipping type (eBay only)", [""] + EBAY_SHIPPING_TYPES, index=0)
-                            st.caption("Only used for eBay estimates.")
-
-                    # Live estimate preview
-                    purchase_total_tmp = float(selected_row.get("total_price", 0.0) or 0.0)
-                    grading_fee_total_tmp = float(gr_info.get("grading_fee_total", 0.0) or 0.0)
-                    all_in_cost_tmp = float(round(purchase_total_tmp + grading_fee_total_tmp, 2))
-
-                    est = _estimate_profit_loss(
-                        platform=platform,
-                        list_price=list_price,
-                        all_in_cost=all_in_cost_tmp,
-                        shipping_type=shipping_type,
+                with l3:
+                    # Always show it; only "required" if platform is eBay
+                    shipping_type = st.selectbox(
+                        "Shipping type (eBay only)",
+                        [""] + EBAY_SHIPPING_TYPES,
+                        index=1 if _is_ebay_platform(platform) else 0,  # default Envelope on eBay
                     )
-
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Est Profit/Loss", _money(est["profit"]))
                     if _is_ebay_platform(platform):
-                        m2.metric("Est eBay fee", _money(est["fee"]))
-                        m3.metric("Est tax (9%)", _money(est["tax"]))
-                        m4.metric("Total buyer pays", _money(est["total_paid"]))
+                        st.caption("Required for eBay estimates.")
                     else:
-                        m2.metric("Fees", _money(0))
-                        m3.metric("Tax", _money(0))
-                        m4.metric("Buyer pays", _money(est["total_paid"]))
+                        st.caption("Only used for eBay estimates.")
 
-                    st.caption("Estimate uses assumptions; actual fees/tax/shipping can differ. Enter actuals when sold in Tab 2.")
+                # ✅ Live estimate preview (updates immediately as list_price changes)
+                purchase_total_tmp = float(selected_row.get("total_price", 0.0) or 0.0)
+                grading_fee_total_tmp = float(gr_info.get("grading_fee_total", 0.0) or 0.0)
+                all_in_cost_tmp = float(round(purchase_total_tmp + grading_fee_total_tmp, 2))
 
-                    sold_date = ""
-                    sold_price = 0.0
-                    fees = 0.0
-                    shipping_charged = 0.0
+                est = _estimate_profit_loss(
+                    platform=platform,
+                    list_price=list_price,
+                    all_in_cost=all_in_cost_tmp,
+                    shipping_type=shipping_type,
+                )
 
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Est Profit/Loss", _money(est["profit"]))
+                if _is_ebay_platform(platform):
+                    m2.metric("Est eBay fee", _money(est["fee"]))
+                    m3.metric("Est tax (9%)", _money(est["tax"]))
+                    m4.metric("Total buyer pays", _money(est["total_paid"]))
                 else:
-                    l1, l2, l3, l4 = st.columns([1.2, 1.2, 1.2, 1.2])
-                    with l1:
-                        sold_date = st.date_input("Trade date*", value=date.today())
-                    with l2:
-                        sold_price = st.number_input("Trade-in amount (sold price)*", min_value=0.0, step=1.0, format="%.2f")
-                    with l3:
-                        fees = st.number_input("Fees (optional)", min_value=0.0, step=1.0, format="%.2f")
-                    with l4:
-                        shipping_charged = st.number_input(
-                            "Shipping charge (what you paid) (optional)",
-                            min_value=0.0,
-                            step=1.0,
-                            format="%.2f"
-                        )
+                    m2.metric("Fees", _money(0))
+                    m3.metric("Tax", _money(0))
+                    m4.metric("Buyer pays", _money(est["total_paid"]))
 
-                    # define for consistency
-                    shipping_type = ""
-                    list_date = ""
-                    list_price = 0.0
+                st.caption("Estimate updates live. Nothing is saved until you click Save below.")
 
-                submit = st.form_submit_button("Save", type="primary", use_container_width=True)
+            else:
+                # Trade In (no listing stage)
+                l1, l2, l3, l4 = st.columns([1.2, 1.2, 1.2, 1.2])
+                with l1:
+                    sold_date = st.date_input("Trade date*", value=date.today())
+                with l2:
+                    sold_price = st.number_input("Trade-in amount (sold price)*", min_value=0.0, step=1.0, format="%.2f")
+                with l3:
+                    fees = st.number_input("Fees (optional)", min_value=0.0, step=1.0, format="%.2f")
+                with l4:
+                    shipping_charged = st.number_input(
+                        "Shipping charge (what you paid) (optional)",
+                        min_value=0.0,
+                        step=1.0,
+                        format="%.2f"
+                    )
 
-            if submit:
+            # ✅ Save button OUTSIDE a form
+            save_btn = st.button("Save", type="primary", use_container_width=True)
+
+            if save_btn:
                 if not platform.strip():
                     st.error("Platform is required.")
-                elif tx_type in ["Auction", "Buy It Now"] and _is_ebay_platform(platform) and shipping_type not in EBAY_SHIPPING_TYPES:
+                    st.stop()
+
+                if tx_type in ["Auction", "Buy It Now"] and _is_ebay_platform(platform) and shipping_type not in EBAY_SHIPPING_TYPES:
                     st.error("For eBay listings, Shipping type is required (Ebay Envelope or Ground Advantage).")
+                    st.stop()
+
+                spreadsheet_id = st.secrets["spreadsheet_id"]
+                inv_ws_name = st.secrets.get("inventory_worksheet", INVENTORY_WS_DEFAULT)
+                tx_ws_name = st.secrets.get("transactions_worksheet", TRANSACTIONS_WS_DEFAULT)
+
+                inv_ws = _get_ws(spreadsheet_id, inv_ws_name)
+                tx_ws = _get_ws(spreadsheet_id, tx_ws_name)
+
+                inv_sheet_headers = _ensure_headers(inv_ws, INV_COLUMNS)
+                tx_sheet_headers = _ensure_headers(tx_ws, TX_COLUMNS)
+
+                inv_values = _with_backoff(lambda: inv_ws.get_all_values())
+
+                inv_header = inv_values[0] if inv_values else inv_sheet_headers
+                inv_id_col_idx = next((i for i, h in enumerate(inv_header, start=1) if sheet_header_to_internal(h) == "inventory_id"), None)
+                if inv_id_col_idx is None:
+                    st.error("Could not find 'inventory_id' column in the inventory sheet header.")
+                    st.stop()
+
+                img_url_final = str(selected_row.get("image_url", "")).strip()
+                if not img_url_final:
+                    img_url_final = scrape_image_url(str(selected_row.get("reference_link", "")).strip())
+
+                purchase_total = float(selected_row.get("total_price", 0.0) or 0.0)
+                grading_fee_total = float(gr_info.get("grading_fee_total", 0.0) or 0.0)
+                all_in_cost = float(round(purchase_total + grading_fee_total, 2))
+
+                tx_id = str(uuid.uuid4())
+                now_iso = pd.Timestamp.utcnow().isoformat()
+
+                card_type_norm = _normalize_card_type(selected_row.get("card_type", ""))
+
+                if tx_type == "Trade In":
+                    net, profit = _compute_net_and_profit(
+                        all_in_cost=all_in_cost,
+                        sold_price=sold_price,
+                        fees=fees,
+                        shipping_charge=shipping_charged,
+                    )
+                    fees_total = _compute_fees_total_for_dashboard(fees, shipping_charged)
+                    tx_status = TX_STATUS_SOLD
                 else:
-                    spreadsheet_id = st.secrets["spreadsheet_id"]
-                    inv_ws_name = st.secrets.get("inventory_worksheet", INVENTORY_WS_DEFAULT)
-                    tx_ws_name = st.secrets.get("transactions_worksheet", TRANSACTIONS_WS_DEFAULT)
+                    net, profit = 0.0, 0.0
+                    fees_total = 0.0
+                    tx_status = TX_STATUS_LISTED
 
-                    inv_ws = _get_ws(spreadsheet_id, inv_ws_name)
-                    tx_ws = _get_ws(spreadsheet_id, tx_ws_name)
+                tx_row = {
+                    "transaction_id": tx_id,
+                    "inventory_id": inv_id,
+                    "transaction_type": tx_type,
+                    "platform": platform.strip(),
+                    "list_date": str(list_date) if list_date else "",
+                    "list_price": float(list_price or 0.0),
+                    "sold_date": str(sold_date) if sold_date else "",
+                    "sold_price": float(sold_price or 0.0),
+                    "fees": float(fees or 0.0),
+                    "shipping_charged": float(shipping_charged or 0.0),
+                    "fees_total": float(fees_total),
+                    "net_proceeds": float(net),
+                    "profit": float(profit),
+                    "notes": notes.strip(),
+                    "status": tx_status,
+                    "created_at": now_iso,
+                    "updated_at": now_iso,
 
-                    inv_sheet_headers = _ensure_headers(inv_ws, INV_COLUMNS)
-                    tx_sheet_headers = _ensure_headers(tx_ws, TX_COLUMNS)
+                    "product_type": str(selected_row.get("product_type", "")).strip(),
+                    "sealed_product_type": str(selected_row.get("sealed_product_type", "")).strip(),
+                    "card_type": card_type_norm,
+                    "brand_or_league": str(selected_row.get("brand_or_league", "")).strip(),
+                    "set_name": str(selected_row.get("set_name", "")).strip(),
+                    "year": str(selected_row.get("year", "")).strip(),
+                    "card_name": str(selected_row.get("card_name", "")).strip(),
+                    "card_number": str(selected_row.get("card_number", "")).strip(),
+                    "variant": str(selected_row.get("variant", "")).strip(),
+                    "card_subtype": str(selected_row.get("card_subtype", "")).strip(),
+                    "reference_link": str(selected_row.get("reference_link", "")).strip(),
+                    "image_url": img_url_final,
+                    "purchase_date": str(selected_row.get("purchase_date", "")).strip(),
+                    "purchased_from": str(selected_row.get("purchased_from", "")).strip(),
 
-                    inv_values = _with_backoff(lambda: inv_ws.get_all_values())
+                    "purchase_total": float(purchase_total),
+                    "grading_fee_total": float(grading_fee_total),
+                    "all_in_cost": float(all_in_cost),
 
-                    inv_header = inv_values[0] if inv_values else inv_sheet_headers
-                    inv_id_col_idx = next((i for i, h in enumerate(inv_header, start=1) if sheet_header_to_internal(h) == "inventory_id"), None)
-                    if inv_id_col_idx is None:
-                        st.error("Could not find 'inventory_id' column in the inventory sheet header.")
-                        st.stop()
+                    "grading_company": str(gr_info.get("grading_company", "")).strip(),
+                    "grade": str(gr_info.get("grade", "")).strip(),
+                    "condition": str(selected_row.get("condition", "")).strip(),
+                }
 
-                    img_url_final = str(selected_row.get("image_url", "")).strip()
-                    if not img_url_final:
-                        img_url_final = scrape_image_url(str(selected_row.get("reference_link", "")).strip())
+                _append_row(tx_ws, tx_sheet_headers, tx_row)
 
-                    purchase_total = float(selected_row.get("total_price", 0.0) or 0.0)
-                    grading_fee_total = float(gr_info.get("grading_fee_total", 0.0) or 0.0)
-                    all_in_cost = float(round(purchase_total + grading_fee_total, 2))
-
-                    tx_id = str(uuid.uuid4())
-                    now_iso = pd.Timestamp.utcnow().isoformat()
-
-                    card_type_norm = _normalize_card_type(selected_row.get("card_type", ""))
-
-                    if tx_type == "Trade In":
-                        net, profit = _compute_net_and_profit(
-                            all_in_cost=all_in_cost,
-                            sold_price=sold_price,
-                            fees=fees,
-                            shipping_charge=shipping_charged,
-                        )
-                        fees_total = _compute_fees_total_for_dashboard(fees, shipping_charged)
-                        tx_status = TX_STATUS_SOLD
-                    else:
-                        net, profit = 0.0, 0.0
-                        fees_total = 0.0
-                        tx_status = TX_STATUS_LISTED
-
-                    tx_row = {
-                        "transaction_id": tx_id,
-                        "inventory_id": inv_id,
-                        "transaction_type": tx_type,
-                        "platform": platform.strip(),
-                        "list_date": str(list_date) if list_date else "",
-                        "list_price": float(list_price or 0.0),
-                        "sold_date": str(sold_date) if sold_date else "",
-                        "sold_price": float(sold_price or 0.0),
-                        "fees": float(fees or 0.0),
-                        "shipping_charged": float(shipping_charged or 0.0),
-                        "fees_total": float(fees_total),
-                        "net_proceeds": float(net),
-                        "profit": float(profit),
-                        "notes": notes.strip(),
-                        "status": tx_status,
-                        "created_at": now_iso,
-                        "updated_at": now_iso,
-
-                        "product_type": str(selected_row.get("product_type", "")).strip(),
-                        "sealed_product_type": str(selected_row.get("sealed_product_type", "")).strip(),
-                        "card_type": card_type_norm,
-                        "brand_or_league": str(selected_row.get("brand_or_league", "")).strip(),
-                        "set_name": str(selected_row.get("set_name", "")).strip(),
-                        "year": str(selected_row.get("year", "")).strip(),
-                        "card_name": str(selected_row.get("card_name", "")).strip(),
-                        "card_number": str(selected_row.get("card_number", "")).strip(),
-                        "variant": str(selected_row.get("variant", "")).strip(),
-                        "card_subtype": str(selected_row.get("card_subtype", "")).strip(),
-                        "reference_link": str(selected_row.get("reference_link", "")).strip(),
-                        "image_url": img_url_final,
-                        "purchase_date": str(selected_row.get("purchase_date", "")).strip(),
-                        "purchased_from": str(selected_row.get("purchased_from", "")).strip(),
-
-                        "purchase_total": float(purchase_total),
-                        "grading_fee_total": float(grading_fee_total),
-                        "all_in_cost": float(all_in_cost),
-
-                        "grading_company": str(gr_info.get("grading_company", "")).strip(),
-                        "grade": str(gr_info.get("grade", "")).strip(),
-
-                        "condition": str(selected_row.get("condition", "")).strip(),
-                    }
-
-                    _append_row(tx_ws, tx_sheet_headers, tx_row)
-
-                    inv_rownum = _find_rownum_by_id(inv_values, inv_id_col_idx, [inv_id]).get(inv_id)
-                    if not inv_rownum:
-                        st.warning("Transaction saved, but could not locate inventory row to update status.")
-                    else:
-                        row_vals = inv_values[inv_rownum - 1] if len(inv_values) >= inv_rownum else []
-                        if len(row_vals) < len(inv_header):
-                            row_vals = row_vals + [""] * (len(inv_header) - len(row_vals))
-                        row_dict_sheet = dict(zip(inv_header, row_vals))
-                        row_internal = {sheet_header_to_internal(k): v for k, v in row_dict_sheet.items()}
-                        row_internal = _coalesce_duplicate_columns(pd.DataFrame([row_internal])).iloc[0].to_dict()
-
-                        if tx_type == "Trade In":
-                            row_internal["inventory_status"] = STATUS_SOLD
-                        else:
-                            row_internal["inventory_status"] = STATUS_LISTED
-
-                        row_internal["listed_transaction_id"] = tx_id
-
-                        if "image_url" in row_internal and (not str(row_internal.get("image_url", "")).strip()):
-                            row_internal["image_url"] = img_url_final
-
-                        _update_row(inv_ws, inv_sheet_headers, inv_rownum, row_internal)
-
-                    st.session_state.pop("inv_df_cache_tx", None)
-                    st.session_state.pop("tx_df_cache", None)
-                    st.session_state.pop("gr_df_cache_tx", None)
-                    _read_sheet_values_cached.clear()
+                inv_rownum = _find_rownum_by_id(inv_values, inv_id_col_idx, [inv_id]).get(inv_id)
+                if not inv_rownum:
+                    st.warning("Transaction saved, but could not locate inventory row to update status.")
+                else:
+                    row_vals = inv_values[inv_rownum - 1] if len(inv_values) >= inv_rownum else []
+                    if len(row_vals) < len(inv_header):
+                        row_vals = row_vals + [""] * (len(inv_header) - len(row_vals))
+                    row_dict_sheet = dict(zip(inv_header, row_vals))
+                    row_internal = {sheet_header_to_internal(k): v for k, v in row_dict_sheet.items()}
+                    row_internal = _coalesce_duplicate_columns(pd.DataFrame([row_internal])).iloc[0].to_dict()
 
                     if tx_type == "Trade In":
-                        st.success("Trade In recorded and inventory marked SOLD.")
+                        row_internal["inventory_status"] = STATUS_SOLD
                     else:
-                        st.success("Listing created and inventory marked LISTED.")
+                        row_internal["inventory_status"] = STATUS_LISTED
 
-                    st.rerun()
+                    row_internal["listed_transaction_id"] = tx_id
 
+                    if "image_url" in row_internal and (not str(row_internal.get("image_url", "")).strip()):
+                        row_internal["image_url"] = img_url_final
+
+                    _update_row(inv_ws, inv_sheet_headers, inv_rownum, row_internal)
+
+                st.session_state.pop("inv_df_cache_tx", None)
+                st.session_state.pop("tx_df_cache", None)
+                st.session_state.pop("gr_df_cache_tx", None)
+                _read_sheet_values_cached.clear()
+
+                if tx_type == "Trade In":
+                    st.success("Trade In recorded and inventory marked SOLD.")
+                else:
+                    st.success("Listing created and inventory marked LISTED.")
+
+                st.rerun()
 
 # =========================================================
 # TAB 2: MARK SOLD / UPDATE LISTING
