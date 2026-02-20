@@ -1704,16 +1704,13 @@ with tab_bs:
                     ignore_index=True
                 )
 
-
         sty_listed = (
             _style_group_and_total_rows(listed_df, "Listed Items")
             .format({"Cost of Goods": "${:,.2f}", "List Price Total": "${:,.2f}", "Market Value": "${:,.2f}"})
             .set_table_styles(_styler_table_header())
         )
-
         st.dataframe(sty_listed, use_container_width=True, hide_index=True)
 
-        # BOTTOM TABLE: Sales (Net proceeds in period)
         # BOTTOM TABLE: Sales (in period)
         st.markdown("### Sales")
         if txn_f.empty:
@@ -1738,7 +1735,7 @@ with tab_bs:
             if "__net" not in tx.columns:
                 tx["__net"] = (tx["__dollar_sales"] - tx["__total_fees"]).fillna(0.0)
 
-            # ✅ FIX: if the Transactions sheet has these columns, USE THEM (just totals)
+            # ✅ Use raw Transactions columns if present (Total Fees / Net Proceeds / Profit / All In Cost)
             def _pick_raw_col(df: pd.DataFrame, name: str):
                 target = _norm_key(name)
                 for c in df.columns:
@@ -1761,13 +1758,23 @@ with tab_bs:
             )
             raw_profit_col = _pick_raw_col(tx, "profit")
 
+            # ✅ THIS is the COGS fix you want
+            raw_all_in_cost_col = (
+                _pick_raw_col(tx, "all_in_cost")
+                or _pick_raw_col(tx, "all_in")
+                or _pick_raw_col(tx, "cogs")
+                or _pick_raw_col(tx, "cost_of_goods")
+            )
+
             if raw_total_fees_col:
                 tx["__total_fees"] = _to_num(tx[raw_total_fees_col]).fillna(0.0)
 
             if raw_net_proceeds_col:
                 tx["__net"] = _to_num(tx[raw_net_proceeds_col]).fillna(0.0)
 
-            # COGS per sold line from inventory (plus unsynced grading)
+            # COGS per sold line:
+            # ✅ prefer Transactions "All In Cost"
+            # fallback = inventory total + unsynced grading cost
             def _cogs_for_inv_id(inv_id: str) -> float:
                 k = _safe_str(inv_id).strip()
                 rec = inv_by_id.get(k)
@@ -1777,9 +1784,12 @@ with tab_bs:
                 add = float(grading_cost_by_inv_id.get(k, 0.0) or 0.0)
                 return float(base + add)
 
-            tx["__cogs"] = tx["__inventory_id"].apply(_cogs_for_inv_id)
+            if raw_all_in_cost_col:
+                tx["__cogs"] = _to_num(tx[raw_all_in_cost_col]).fillna(0.0)
+            else:
+                tx["__cogs"] = tx["__inventory_id"].apply(_cogs_for_inv_id)
 
-            # ✅ Profit = Profit column if present, otherwise fallback
+            # Profit = Profit column if present, otherwise fallback
             if raw_profit_col:
                 tx["__profit"] = _to_num(tx[raw_profit_col]).fillna(0.0)
             else:
@@ -1853,7 +1863,6 @@ with tab_bs:
         )
         st.dataframe(sty3, use_container_width=True, hide_index=True)
 
-
         st.markdown("### Busienss  Summary")
 
         if not inv_f.empty:
@@ -1891,7 +1900,6 @@ with tab_bs:
             fees_ct = float(tx_ct["__total_fees"].sum()) if (not tx_ct.empty and "__total_fees" in tx_ct.columns) else float(tx_ct.get("__fees", 0.0).sum()) if not tx_ct.empty else 0.0
             net_ct = float(tx_ct["__net"].sum()) if not tx_ct.empty else 0.0
 
-
             if exp_ct == 0.0 and sales_ct == 0.0:
                 continue
 
@@ -1915,88 +1923,6 @@ with tab_bs:
             .set_table_styles(_styler_table_header())
         )
         st.dataframe(sty4, use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-    st.markdown("## Detail Tables (where totals come from)")
-
-    d1, d2 = st.columns(2)
-    with d1:
-        st.markdown("### Inventory Lines (purchases in period)")
-        if inv_f.empty:
-            st.info("No inventory lines.")
-        else:
-            show_cols = []
-            for want in ["inventory_id", "card_type", "product_type", "inventory_status", "purchase_date", "total_price", "purchased_from", "set_name", "year", "card_name", "card_number", "variant"]:
-                c = _pick_col(inv_f, want, None)
-                if c and c in inv_f.columns:
-                    show_cols.append(c)
-
-            out = inv_f[show_cols].copy() if show_cols else inv_f.copy()
-            out = _ensure_unique_columns(out)
-            st.dataframe(out, use_container_width=True, hide_index=True)
-
-    with d2:
-        st.markdown("### Sales Lines (sold in period)")
-        if txn_f.empty:
-            st.info("No sales lines.")
-        else:
-            out = txn_f.copy()
-            out["card_type"] = out.apply(_tx_card_type_rowaware, axis=1)
-            out["bucket"] = out["__inventory_id"].map(_tx_product_bucket).fillna("Cards")
-
-            cols = []
-            if tx_date_col and tx_date_col in out.columns:
-                cols.append(tx_date_col)
-            if tx_inv_col and tx_inv_col in out.columns:
-                cols.append(tx_inv_col)
-            cols += ["card_type", "bucket", "__sold_price", "__fees", "__net"]
-            cols = [c for c in cols if c in out.columns]
-
-            view = out[cols].copy()
-            view = view.rename(columns={
-                "__sold_price": "sold_price",
-                "__fees": "fees",
-                "__net": "net",
-            })
-            view = _ensure_unique_columns(view)
-            st.dataframe(view, use_container_width=True, hide_index=True)
-
-    d3, d4 = st.columns(2)
-    with d3:
-        st.markdown("### Grading Cost Lines (submitted/created in period)")
-        if grd_f.empty:
-            st.info("No grading lines.")
-        else:
-            out = grd_f.copy()
-            cols = []
-            for want in ["submission_date", "created_at", "inventory_id", "grading_company", "grading_fee_initial", "additional_costs", "__grading_cost", "status", "estimated_return_date", "received_grade", "returned_grade"]:
-                c = _pick_col(out, want, None)
-                if c and c in out.columns:
-                    cols.append(c)
-            if "__grading_cost" in out.columns and "__grading_cost" not in cols:
-                cols.append("__grading_cost")
-
-            view = out[cols].copy() if cols else out.copy()
-            view = view.rename(columns={"__grading_cost": "total_grading_cost"})
-            view = _ensure_unique_columns(view)
-            st.dataframe(view, use_container_width=True, hide_index=True)
-
-    with d4:
-        st.markdown("### Misc Expense Lines (in period)")
-        if misc_f.empty:
-            st.info("No misc lines.")
-        else:
-            out = misc_f.copy()
-            view = out.copy()
-            view = view.rename(columns={"__category": "category", "__amount": "amount"})
-            keep = [c for c in ["category", "amount"] if c in view.columns]
-            m_date = _pick_col(misc_f, "date", None) or _pick_col(misc_f, "expense_date", None)
-            if m_date and m_date in misc_f.columns:
-                view["date"] = misc_f[m_date]
-                keep = ["date"] + keep
-            view = view[keep].copy() if keep else view.copy()
-            view = _ensure_unique_columns(view)
-            st.dataframe(view, use_container_width=True, hide_index=True)
 
 
 # =========================================================
