@@ -1,6 +1,7 @@
 # pages/2_Inventory.py
 import json
 import re
+import time
 import uuid
 from datetime import date
 from pathlib import Path
@@ -201,6 +202,252 @@ def ensure_headers(ws):
         return new_headers
 
     return existing
+
+# =========================================================
+# HTTP / PRICING SCRAPE HELPERS
+# =========================================================
+
+def _bs_parser():
+    try:
+        import lxml  # noqa: F401
+        return "lxml"
+    except Exception:
+        return "html.parser"
+
+@st.cache_resource
+def get_http_session():
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    return s
+
+def http_get_with_backoff(url: str, *, timeout=20, max_tries=5):
+    sess = get_http_session()
+    sleep_s = 1.0
+    last_response = None
+    last_exc = None
+
+    req_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+        "Referer": "https://www.google.com/",
+    }
+
+    for _ in range(max_tries):
+        try:
+            r = sess.get(url, timeout=timeout, headers=req_headers, allow_redirects=True)
+            last_response = r
+        except Exception as e:
+            last_exc = e
+            time.sleep(sleep_s)
+            sleep_s = min(sleep_s * 1.7, 10.0)
+            continue
+
+        if r.status_code == 200:
+            return r
+
+        if r.status_code in {403, 429, 500, 502, 503, 504}:
+            time.sleep(sleep_s)
+            sleep_s = min(sleep_s * 1.8, 12.0)
+            continue
+
+        r.raise_for_status()
+
+    if last_response is not None:
+        raise requests.HTTPError(
+            f"{last_response.status_code} Client Error: {last_response.reason} for url: {url}",
+            response=last_response,
+        )
+
+    if last_exc:
+        raise last_exc
+
+    raise requests.HTTPError(f"HTTPError: retries exhausted for {url}")
+
+@st.cache_data(show_spinner=False, ttl=60 * 15)
+def fetch_pricecharting_html(reference_link: str) -> str:
+    link = (reference_link or "").strip()
+    if not link or "pricecharting.com" not in link.lower():
+        return ""
+
+    try:
+        r = http_get_with_backoff(link, timeout=20, max_tries=5)
+        return r.text or ""
+    except Exception:
+        return ""
+
+def _get_pricecharting_soup(reference_link: str):
+    html = fetch_pricecharting_html(reference_link)
+    if not html:
+        return None
+    return BeautifulSoup(html, _bs_parser())
+
+def _parse_any_date(text: str):
+    if not text:
+        return None
+    d = pd.to_datetime(text, errors="coerce")
+    if pd.isna(d):
+        return None
+    if d.year < 2000:
+        return None
+    return d.date()
+
+def _price_from_cell_text(text: str) -> float:
+    if not text:
+        return 0.0
+    m = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", text)
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1).replace(",", ""))
+    except Exception:
+        return 0.0
+
+def _find_manual_only_sales_table(soup: BeautifulSoup):
+    tables = soup.select("div.completed-auctions-manual-only table")
+    if not tables:
+        return None
+
+    def looks_like_sales_table(tbl):
+        ths = [th.get_text(" ", strip=True).lower() for th in tbl.find_all("th")]
+        return any("sale date" in t for t in ths) and any("price" == t or "price" in t for t in ths)
+
+    for t in tables:
+        if looks_like_sales_table(t):
+            return t
+    return tables[0]
+
+def _find_graded_sales_table(soup: BeautifulSoup):
+    tables = soup.select("div.completed-auctions-graded table")
+    if not tables:
+        return None
+
+    def looks_like_sales_table(tbl):
+        ths = [th.get_text(" ", strip=True).lower() for th in tbl.find_all("th")]
+        return any("sale date" in t for t in ths) and any("price" == t or "price" in t for t in ths)
+
+    for t in tables:
+        if looks_like_sales_table(t):
+            return t
+    return tables[0]
+
+def _iter_sales_from_table(table):
+    if table is None:
+        return []
+
+    sales = []
+    trs = table.find_all("tr")
+
+    for tr in trs:
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+
+        date_td = tr.find("td", class_="date")
+        title_td = tr.find("td", class_="title")
+
+        price_td = tr.select_one("td.numeric:not(.listed-price)")
+        if price_td is None:
+            price_td = tr.select_one("td.numeric")
+
+        sale_date_txt = (date_td.get_text(" ", strip=True) if date_td else "")
+        title_txt = (title_td.get_text(" ", strip=True) if title_td else "")
+        price_cell_text = (price_td.get_text(" ", strip=True) if price_td else "")
+
+        d = _parse_any_date(sale_date_txt)
+        if not d:
+            continue
+
+        title = (title_txt or "").strip()
+        if not title:
+            continue
+
+        price = 0.0
+        if price_td is not None:
+            spans = price_td.find_all("span", class_=re.compile(r"\bjs-price\b"))
+            for sp in spans:
+                p = _price_from_cell_text(sp.get_text(" ", strip=True))
+                if p > 0:
+                    price = p
+                    break
+
+        if price <= 0:
+            price = _price_from_cell_text(price_cell_text)
+        if price <= 0:
+            continue
+
+        sales.append({
+            "sale_date": d,
+            "price": float(price),
+            "title": title,
+        })
+
+    return sales
+
+def _title_matches_exact_grade(title: str, grading_company: str, grade: str) -> bool:
+    t = re.sub(r"\s+", " ", (title or "").upper()).strip()
+    company = re.sub(r"\s+", " ", (grading_company or "").upper()).strip()
+    grade_txt = re.sub(r"\s+", " ", (grade or "").upper()).strip()
+
+    if not t or not company or not grade_txt:
+        return False
+
+    if company == "PSA":
+        return re.search(rf"\bPSA\s*{re.escape(grade_txt)}(?![\d.])", t) is not None
+
+    if company == "CGC":
+        if grade_txt == "PRISTINE 10":
+            return ("PRISTINE 10" in t) and ("CGC" in t or "PRISTINE" in t)
+        return re.search(rf"\bCGC\s*{re.escape(grade_txt)}(?![\d.])", t) is not None
+
+    if company == "BECKETT":
+        if grade_txt == "BLACK LABEL 10":
+            return "BLACK LABEL 10" in t
+        return (
+            re.search(rf"\bBGS\s*{re.escape(grade_txt)}(?![\d.])", t) is not None
+            or re.search(rf"\bBECKETT\s*{re.escape(grade_txt)}(?![\d.])", t) is not None
+        )
+
+    return False
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def fetch_pricecharting_exact_grade_value(reference_link: str, grading_company: str, grade: str, n_sales: int = 5) -> float:
+    soup = _get_pricecharting_soup(reference_link)
+    if soup is None:
+        return 0.0
+
+    sales = []
+    for table in [_find_manual_only_sales_table(soup), _find_graded_sales_table(soup)]:
+        for s in _iter_sales_from_table(table):
+            if _title_matches_exact_grade(s.get("title", ""), grading_company, grade):
+                sales.append(s)
+
+    if not sales:
+        return 0.0
+
+    deduped = {}
+    for s in sales:
+        key = f"{s['sale_date'].isoformat()}|{s['price']:.2f}|{s['title'].strip().lower()[:120]}"
+        deduped[key] = s
+
+    out = list(deduped.values())
+    out.sort(key=lambda x: (x["sale_date"], x["price"]), reverse=True)
+    out = out[: max(1, int(n_sales))]
+
+    if not out:
+        return 0.0
+
+    return round(sum(x["price"] for x in out) / len(out), 2)
 
 # =========================================================
 # SCRAPING (DETAILS + IMAGE)
@@ -486,15 +733,12 @@ def fetch_details_and_image(url: str):
 @st.cache_data(ttl=60 * 60 * 12)
 def fetch_pricecharting_prices(reference_link: str) -> dict:
     out = {"raw": 0.0, "psa9": 0.0, "psa10": 0.0}
-    if not reference_link or "pricecharting.com" not in reference_link.lower():
+    soup = _get_pricecharting_soup(reference_link)
+    if soup is None:
         return out
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (CardTracker; +Streamlit)"}
-        r = requests.get(reference_link.strip(), headers=headers, timeout=12)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
 
-        nodes = soup.select(".price.js-price")
+    try:
+        nodes = soup.select(".price.js-price, .js-price")
         prices = []
         for n in nodes:
             t = n.get_text(" ", strip=True)
@@ -508,28 +752,35 @@ def fetch_pricecharting_prices(reference_link: str) -> dict:
     except Exception:
         return out
 
-def compute_market_price_for_row(reference_link: str, product_type: str, grade: str) -> float:
+def compute_market_price_for_row(reference_link: str, product_type: str, grade: str, grading_company: str = "") -> float:
     """
-    PriceCharting slots:
-      raw  = slot 1 -> prices[0]
-      psa9 = slot 4 -> prices[3]
-      psa10= slot 6 -> prices[5]
     Rules:
-      - Sealed: use raw slot
-      - Card (raw): use raw slot
-      - Graded Card: use graded slot by grade (10->psa10, 9->psa9, else raw fallback)
+      - Sealed: keep using raw slot
+      - Card (raw): keep using raw slot
+      - Graded Card: use recent exact-grade sold sales average when available
+        (same sold-sales scraping approach as grading watchlist),
+        then fall back to page PSA9/PSA10 slots, then raw.
     """
     prices = fetch_pricecharting_prices(reference_link or "")
     pt = (product_type or "").strip().lower()
-    g = (grade or "").strip().upper()
+    g = (grade or "").strip()
+    gc = (grading_company or "").strip()
 
     # default raw
     mv = float(prices.get("raw", 0.0) or 0.0)
 
     if "graded" in pt:
-        if "10" in g:
+        exact_grade_mv = 0.0
+        if reference_link and "pricecharting.com" in reference_link.lower() and gc and g:
+            exact_grade_mv = fetch_pricecharting_exact_grade_value(reference_link, gc, g, n_sales=5)
+
+        if exact_grade_mv > 0:
+            return float(exact_grade_mv)
+
+        g_upper = g.upper()
+        if "10" in g_upper:
             mv = float(prices.get("psa10", mv) or mv)
-        elif "9" in g:
+        elif "9" in g_upper:
             mv = float(prices.get("psa9", mv) or mv)
 
     return float(mv or 0.0)
@@ -900,7 +1151,12 @@ with tab_new:
                     ref_link = reference_link.strip() if reference_link else ""
                     mv = 0.0
                     if ref_link and "pricecharting.com" in ref_link.lower():
-                        mv = compute_market_price_for_row(ref_link, product_type, grade if product_type == "Graded Card" else "")
+                        mv = compute_market_price_for_row(
+                            ref_link,
+                            product_type,
+                            grade if product_type == "Graded Card" else "",
+                            grading_company if product_type == "Graded Card" else "",
+                        )
 
                     new_row = {
                         "inventory_id": str(uuid.uuid4())[:8],
