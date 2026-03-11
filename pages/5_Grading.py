@@ -3,19 +3,20 @@
 # COMBINED VERSION (Watchlist + Create Submission screens)
 #
 # Includes:
-# 1) Your current Watchlist Pricing + Summary (PriceCharting sales history + TCGplayer market price via Playwright)
-#    - Refresh mode: TCGplayer only / PriceCharting only / Both
-#    - Stores TCGplayer prices back into watchlist sheet (batch write) for speed
+# 1) Watchlist Pricing + Summary
+#    - PriceCharting sales history
+#    - PriceCharting image scraping
 #
-# 2) Restores your old Grading Submission UI:
+# 2) Grading Submission UI:
 #    - Analysis (single-card PSA9/PSA10 calc)
 #    - Create Submission (select inventory items -> write grading rows + set inventory status GRADING)
 #    - Update Returns (edit returned date / grade / costs, mark RETURNED, sync back to inventory)
 #    - Submission Summary (rollups by submission_id)
 #
-# IMPORTANT:
-# - PriceCharting sold-sales scraping logic for watchlist remains untouched.
-# - Grading submission logic uses the canonical grading columns you provided.
+# Notes:
+# - TCGplayer refresh flow has been removed from this page.
+# - PriceCharting fetches now use one shared cached HTML helper.
+# - A blocked/403 PriceCharting page will be skipped instead of killing the whole refresh.
 # ---------------------------------------------------------
 
 import json
@@ -52,10 +53,6 @@ GEMRATES_WS_NAME = st.secrets.get("gemrates_worksheet", "gemrates")
 
 WATCHLIST_HEADERS_EXPECTED = ["Generation", "Set", "Card Name", "Card No", "Link", "Image"]
 
-TCG_LINK_COL = "tcgplayer_link"
-TCG_PRICE_COL = "tcgplayer_price"
-TCG_UPDATED_COL = "tcgplayer_price_updated_utc"
-
 SALES_HISTORY_HEADERS = [
     "Generation",
     "Set",
@@ -77,7 +74,6 @@ EBAY_ONLY = True
 
 GRADING_ALL_IN_COST = float(st.secrets.get("grading_all_in_cost", 25.0))
 CONF_K = float(st.secrets.get("gemrate_conf_k", 250.0))
-TCG_PRICE_TTL_HOURS = float(st.secrets.get("tcgplayer_price_ttl_hours", 6.0))
 
 
 # =========================================================
@@ -112,8 +108,8 @@ GRADING_CANON_COLS = [
     "purchase_date",
     "purchase_total",
     "grading_company",
-    "grading_fee_initial",   # <-- use THIS
-    "additional_costs",      # <-- use THIS
+    "grading_fee_initial",
+    "additional_costs",
     "psa9_price",
     "psa10_price",
     "status",
@@ -132,9 +128,11 @@ GRADING_CANON_COLS = [
 def safe_str(x) -> str:
     return "" if x is None else str(x)
 
+
 def is_blank(x) -> bool:
     s = safe_str(x).strip()
     return s == "" or s.lower() in {"nan", "none", "null"}
+
 
 def safe_float(x, default=0.0) -> float:
     try:
@@ -149,6 +147,7 @@ def safe_float(x, default=0.0) -> float:
     except Exception:
         return default
 
+
 def safe_int(x, default=0) -> int:
     try:
         if x is None:
@@ -162,6 +161,7 @@ def safe_int(x, default=0) -> int:
     except Exception:
         return default
 
+
 def a1_col_letter(n: int) -> str:
     letters = ""
     while n:
@@ -169,8 +169,10 @@ def a1_col_letter(n: int) -> str:
         letters = chr(65 + r) + letters
     return letters
 
+
 def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
+
 
 def add_business_days(start_d: date, n: int) -> date:
     d = start_d
@@ -181,8 +183,10 @@ def add_business_days(start_d: date, n: int) -> date:
             added += 1
     return d
 
+
 def _utc_now_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat()
+
 
 def _parse_utc_iso(s: str):
     try:
@@ -192,12 +196,14 @@ def _parse_utc_iso(s: str):
     except Exception:
         return None
 
+
 def _bs_parser():
     try:
         import lxml  # noqa: F401
         return "lxml"
     except Exception:
         return "html.parser"
+
 
 def _parse_any_date(text: str):
     if not text:
@@ -209,6 +215,7 @@ def _parse_any_date(text: str):
         return None
     return d.date()
 
+
 def _price_from_cell_text(text: str) -> float:
     if not text:
         return 0.0
@@ -217,14 +224,17 @@ def _price_from_cell_text(text: str) -> float:
         return 0.0
     return safe_float(m.group(1), 0.0)
 
+
 def _normalize_set(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
+
 
 def _normalize_cardno(v: str) -> str:
     digits = re.sub(r"[^\d]", "", safe_str(v))
     if digits == "":
         return ""
     return str(int(digits))
+
 
 def _unique_sale_key(link: str, base_sale_key: str) -> str:
     lk = (link or "").strip()
@@ -268,6 +278,7 @@ def get_gspread_client():
 
     raise KeyError('Missing secrets: add "gcp_service_account" (Cloud) or "service_account_json_path" (local).')
 
+
 def _gs_write_retry(fn, *args, **kwargs):
     max_tries = 8
     base_sleep = 1.0
@@ -282,12 +293,15 @@ def _gs_write_retry(fn, *args, **kwargs):
             raise
     raise RuntimeError("Google Sheets API quota exceeded (retries exhausted).")
 
+
 def get_sheet():
     client = get_gspread_client()
     return client.open_by_key(st.secrets["spreadsheet_id"])
 
+
 def get_ws(sheet, ws_name: str):
     return sheet.worksheet(ws_name)
+
 
 def read_ws_df(ws) -> pd.DataFrame:
     values = ws.get_all_values()
@@ -309,8 +323,6 @@ def read_ws_df(ws) -> pd.DataFrame:
 
 # =========================================================
 # Header management
-#   - simple headers for watchlist/sales_history/gemrates
-#   - canonical header repair for grading/inventory (from your old section)
 # =========================================================
 def ensure_headers_simple(ws, headers: list[str]):
     values = ws.get_all_values()
@@ -321,15 +333,8 @@ def ensure_headers_simple(ws, headers: list[str]):
     if current != headers:
         _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
 
+
 def ensure_headers_canon(ws, needed_headers: list[str]):
-    """
-    Idempotent header repair (quota-safe):
-    - strips whitespace
-    - strips ANY stacked __dup suffixes
-    - rebuilds stable unique header set: foo, foo__dup2, foo__dup3...
-    - appends missing canonical columns by base-name
-    - optionally deletes duplicate columns that are completely blank (safe prune)
-    """
     def strip_dups(h: str) -> str:
         return re.sub(r"(?:__dup\d+)+$", "", str(h or "").strip())
 
@@ -369,7 +374,6 @@ def ensure_headers_canon(ws, needed_headers: list[str]):
         else:
             new_header.append(f"{b}__dup{counts[b]}")
 
-    # safe prune blank duplicate cols
     if len(values) > 1:
         data_rows = []
         for r in values[1:]:
@@ -438,21 +442,6 @@ def ensure_headers_canon(ws, needed_headers: list[str]):
     return new_header
 
 
-def ensure_watchlist_col(ws, col_name: str):
-    values = ws.get_all_values()
-    if not values or not values[0]:
-        headers = WATCHLIST_HEADERS_EXPECTED.copy()
-        if col_name not in headers:
-            headers.append(col_name)
-        _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
-        return headers, headers.index(col_name) + 1
-
-    headers = [safe_str(x).strip() for x in values[0]]
-    if col_name not in headers:
-        headers.append(col_name)
-        _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
-    return headers, headers.index(col_name) + 1
-
 def ensure_watchlist_image_col(watch_ws):
     values = watch_ws.get_all_values()
     if not values or not values[0]:
@@ -465,6 +454,7 @@ def ensure_watchlist_image_col(watch_ws):
         _gs_write_retry(watch_ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
     return headers, headers.index("Image") + 1
 
+
 def batch_update_column_values(ws, col_idx_1based: int, start_row_1based: int, values_list: list[str]):
     if not values_list:
         return
@@ -476,26 +466,47 @@ def batch_update_column_values(ws, col_idx_1based: int, start_row_1based: int, v
 
 
 # =========================
-# HTTP (basic backoff)
+# HTTP
 # =========================
 @st.cache_resource
 def get_http_session():
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
         "Accept-Language": "en-US,en;q=0.9",
     })
     return s
 
+
 def http_get_with_backoff(url: str, *, timeout=25, max_tries=6):
     sess = get_http_session()
-    sleep_s = 1.0
+    sleep_s = 1.25
+    last_response = None
     last_exc = None
+
+    req_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+        "Referer": "https://www.google.com/",
+    }
 
     for _ in range(max_tries):
         try:
-            r = sess.get(url, timeout=timeout)
+            r = sess.get(
+                url,
+                timeout=timeout,
+                headers=req_headers,
+                allow_redirects=True,
+            )
+            last_response = r
         except Exception as e:
             last_exc = e
             time.sleep(sleep_s)
@@ -505,7 +516,7 @@ def http_get_with_backoff(url: str, *, timeout=25, max_tries=6):
         if r.status_code == 200:
             return r
 
-        if r.status_code == 429:
+        if r.status_code in {403, 429}:
             time.sleep(sleep_s)
             sleep_s = min(sleep_s * 1.8, 25.0)
             continue
@@ -517,150 +528,40 @@ def http_get_with_backoff(url: str, *, timeout=25, max_tries=6):
 
         r.raise_for_status()
 
+    if last_response is not None:
+        raise requests.HTTPError(
+            f"{last_response.status_code} Client Error: {last_response.reason} for url: {url}",
+            response=last_response,
+        )
+
     if last_exc:
         raise last_exc
+
     raise requests.HTTPError(f"HTTPError: retries exhausted for {url}")
 
 
-# =========================
-# TCGplayer Market Price (JS-rendered -> Playwright)
-# =========================
-def _extract_tcgplayer_market_price_from_dom_text(dom_text: str) -> float:
-    if not dom_text:
-        return 0.0
-    v = _price_from_cell_text(dom_text)
-    if v > 0:
-        return float(v)
-    m = re.search(r"([0-9][0-9,]*\.?[0-9]{0,2})", dom_text)
-    if m:
-        vv = safe_float(m.group(1), 0.0)
-        return float(vv) if vv > 0 else 0.0
-    return 0.0
-
-@st.cache_resource
-def _get_playwright_browser():
-    from playwright.sync_api import sync_playwright  # lazy import
-    p = sync_playwright().start()
-    browser = p.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-    )
-    return {"p": p, "browser": browser}
-
-def _tcgplayer_price_via_playwright(url: str) -> float:
-    url = (url or "").strip()
-    if not url or "tcgplayer.com" not in url.lower():
-        return 0.0
-
-    holder = _get_playwright_browser()
-    browser = holder["browser"]
-
-    context = browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        locale="en-US",
-        viewport={"width": 1280, "height": 800},
-    )
-    page = context.new_page()
+@st.cache_data(ttl=60 * 15)
+def fetch_pricecharting_html(reference_link: str) -> str:
+    link = (reference_link or "").strip()
+    if not link or "pricecharting.com" not in link.lower():
+        return ""
 
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        page.wait_for_timeout(1200)
-
-        sel = "span.price-points__upper__price"
-
-        try:
-            page.wait_for_selector(sel, timeout=10000)
-        except Exception:
-            txt = page.inner_text("body")
-            m = re.search(r"Market Price\s*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})", txt, flags=re.IGNORECASE)
-            if m:
-                vv = safe_float(m.group(1), 0.0)
-                return float(vv) if vv > 0 else 0.0
-            return 0.0
-
-        price_text = page.locator(sel).first.inner_text().strip()
-        price = _extract_tcgplayer_market_price_from_dom_text(price_text)
-        if price > 0:
-            return float(price)
-
-        body_txt = page.inner_text("body")
-        m = re.search(r"Market Price\s*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})", body_txt, flags=re.IGNORECASE)
-        if m:
-            vv = safe_float(m.group(1), 0.0)
-            return float(vv) if vv > 0 else 0.0
-
-        return 0.0
-
-    finally:
-        try:
-            page.close()
-        except Exception:
-            pass
-        try:
-            context.close()
-        except Exception:
-            pass
-
-@st.cache_data(ttl=60 * 60 * 6)
-def fetch_tcgplayer_market_price(tcg_url: str) -> float:
-    try:
-        return float(_tcgplayer_price_via_playwright(tcg_url))
+        r = http_get_with_backoff(link, timeout=25, max_tries=5)
+        return r.text or ""
     except Exception:
-        return 0.0
+        return ""
 
 
-def refresh_watchlist_tcg_prices_batched(watch_ws, wdf: pd.DataFrame):
-    if wdf is None or wdf.empty:
-        return
-
-    _, _ = ensure_watchlist_col(watch_ws, TCG_LINK_COL)
-    _, price_idx = ensure_watchlist_col(watch_ws, TCG_PRICE_COL)
-    _, upd_idx = ensure_watchlist_col(watch_ws, TCG_UPDATED_COL)
-
-    wdf2 = read_ws_df(watch_ws)
-    if wdf2 is None or wdf2.empty:
-        return
-    if TCG_LINK_COL not in wdf2.columns:
-        return
-    if TCG_PRICE_COL not in wdf2.columns:
-        wdf2[TCG_PRICE_COL] = ""
-    if TCG_UPDATED_COL not in wdf2.columns:
-        wdf2[TCG_UPDATED_COL] = ""
-
-    tcg_links = [safe_str(v).strip() for v in wdf2[TCG_LINK_COL].tolist()]
-    prices = [safe_str(v).strip() for v in wdf2[TCG_PRICE_COL].tolist()]
-    updated = [safe_str(v).strip() for v in wdf2[TCG_UPDATED_COL].tolist()]
-
-    now = datetime.utcnow()
-    max_age = timedelta(hours=float(TCG_PRICE_TTL_HOURS))
-
-    for i in range(len(tcg_links)):
-        url = tcg_links[i]
-        if not url:
-            continue
-
-        ts = _parse_utc_iso(updated[i])
-        is_stale = (ts is None) or ((now - ts) > max_age)
-
-        cur_price = safe_float(prices[i], 0.0)
-        if cur_price > 0 and not is_stale:
-            continue
-
-        p = fetch_tcgplayer_market_price(url)
-        if p > 0:
-            prices[i] = f"{p:.2f}"
-        updated[i] = _utc_now_iso()
-
-        time.sleep(0.15)
-
-    start_row = 2
-    batch_update_column_values(watch_ws, price_idx, start_row, prices)
-    batch_update_column_values(watch_ws, upd_idx, start_row, updated)
+def _get_pricecharting_soup(reference_link: str):
+    html = fetch_pricecharting_html(reference_link)
+    if not html:
+        return None
+    return BeautifulSoup(html, _bs_parser())
 
 
 # =========================
-# Image scraping (PriceCharting image for watchlist) - unchanged
+# Image scraping (PriceCharting image for watchlist)
 # =========================
 def _find_best_image(soup: BeautifulSoup) -> str:
     if soup is None:
@@ -697,6 +598,7 @@ def _find_best_image(soup: BeautifulSoup) -> str:
 
     return ""
 
+
 def _find_pricecharting_main_image(soup: BeautifulSoup) -> str:
     if soup is None:
         return ""
@@ -717,16 +619,17 @@ def _find_pricecharting_main_image(soup: BeautifulSoup) -> str:
             candidates.append(href)
     return candidates[0] if candidates else ""
 
+
 @st.cache_data(ttl=60 * 60 * 24)
 def fetch_pricecharting_image_url(reference_link: str) -> str:
-    link = (reference_link or "").strip()
-    if not link or "pricecharting.com" not in link.lower():
+    soup = _get_pricecharting_soup(reference_link)
+    if soup is None:
         return ""
-    r = http_get_with_backoff(link, timeout=25, max_tries=6)
-    soup = BeautifulSoup(r.text, _bs_parser())
+
     img = _find_best_image(soup)
     if img:
         return img
+
     return _find_pricecharting_main_image(soup) or ""
 
 
@@ -766,7 +669,7 @@ def refresh_watchlist_images_batched(watch_ws, wdf: pd.DataFrame):
 
 
 # =========================
-# Watchlist Sold sales scrapers (DO NOT CHANGE)
+# Watchlist Sold sales scrapers
 # =========================
 def _classify_grade_from_title(title: str) -> str:
     t = (title or "").upper()
@@ -776,14 +679,12 @@ def _classify_grade_from_title(title: str) -> str:
         return "psa9"
     return "ungraded"
 
+
 @st.cache_data(ttl=60 * 60 * 6)
 def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list[dict]:
-    link = (reference_link or "").strip()
-    if not link or "pricecharting.com" not in link.lower():
+    soup = _get_pricecharting_soup(reference_link)
+    if soup is None:
         return []
-
-    r = http_get_with_backoff(link, timeout=25, max_tries=6)
-    soup = BeautifulSoup(r.text, _bs_parser())
 
     target_table = None
     for tbl in soup.find_all("table"):
@@ -843,7 +744,15 @@ def fetch_pricecharting_sold_sales(reference_link: str, limit: int = 80) -> list
         bucket = _classify_grade_from_title(title)
 
         sale_key = f"{d.isoformat()}|{price:.2f}|{bucket}|{title[:90].strip().lower()}"
-        sales.append({"sale_date": d, "price": float(price), "title": title, "grade_bucket": bucket, "sale_key": sale_key})
+        sales.append(
+            {
+                "sale_date": d,
+                "price": float(price),
+                "title": title,
+                "grade_bucket": bucket,
+                "sale_key": sale_key,
+            }
+        )
 
     by_key = {s["sale_key"]: s for s in sales if s.get("sale_key")}
     out = list(by_key.values())
@@ -865,13 +774,11 @@ def _find_manual_only_sales_table(soup: BeautifulSoup):
             return t
     return tables[0]
 
-def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 20) -> list[dict]:
-    link = (reference_link or "").strip()
-    if not link or "pricecharting.com" not in link.lower():
-        return []
 
-    r = http_get_with_backoff(link, timeout=25, max_tries=6)
-    soup = BeautifulSoup(r.text, _bs_parser())
+def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 20) -> list[dict]:
+    soup = _get_pricecharting_soup(reference_link)
+    if soup is None:
+        return []
 
     table = _find_manual_only_sales_table(soup)
     if table is None:
@@ -921,7 +828,15 @@ def fetch_pricecharting_psa10_manual_only(reference_link: str, limit: int = 20) 
             continue
 
         sale_key = f"{d.isoformat()}|{price:.2f}|psa10|{title[:90].strip().lower()}"
-        sales.append({"sale_date": d, "price": float(price), "title": title, "grade_bucket": "psa10", "sale_key": sale_key})
+        sales.append(
+            {
+                "sale_date": d,
+                "price": float(price),
+                "title": title,
+                "grade_bucket": "psa10",
+                "sale_key": sale_key,
+            }
+        )
 
     by_key = {s["sale_key"]: s for s in sales if s.get("sale_key")}
     out = list(by_key.values())
@@ -943,13 +858,11 @@ def _find_graded_sales_table(soup: BeautifulSoup):
             return t
     return tables[0]
 
-def fetch_pricecharting_psa9_graded(reference_link: str, limit: int = 20) -> list[dict]:
-    link = (reference_link or "").strip()
-    if not link or "pricecharting.com" not in link.lower():
-        return []
 
-    r = http_get_with_backoff(link, timeout=25, max_tries=6)
-    soup = BeautifulSoup(r.text, _bs_parser())
+def fetch_pricecharting_psa9_graded(reference_link: str, limit: int = 20) -> list[dict]:
+    soup = _get_pricecharting_soup(reference_link)
+    if soup is None:
+        return []
 
     table = _find_graded_sales_table(soup)
     if table is None:
@@ -999,7 +912,15 @@ def fetch_pricecharting_psa9_graded(reference_link: str, limit: int = 20) -> lis
             continue
 
         sale_key = f"{d.isoformat()}|{price:.2f}|psa9|{title[:90].strip().lower()}"
-        sales.append({"sale_date": d, "price": float(price), "title": title, "grade_bucket": "psa9", "sale_key": sale_key})
+        sales.append(
+            {
+                "sale_date": d,
+                "price": float(price),
+                "title": title,
+                "grade_bucket": "psa9",
+                "sale_key": sale_key,
+            }
+        )
 
     by_key = {s["sale_key"]: s for s in sales if s.get("sale_key")}
     out = list(by_key.values())
@@ -1008,7 +929,7 @@ def fetch_pricecharting_psa9_graded(reference_link: str, limit: int = 20) -> lis
 
 
 # =========================
-# Build sales history rows (watchlist) - unchanged
+# Build sales history rows (watchlist)
 # =========================
 def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame) -> pd.DataFrame:
     if wdf is None or wdf.empty:
@@ -1030,79 +951,87 @@ def build_sales_history_rows_from_watchlist(wdf: pd.DataFrame) -> pd.DataFrame:
         if "pricecharting.com" not in link.lower():
             continue
 
-        if rows_out:
-            time.sleep(0.75)
+        time.sleep(1.0)
 
-        sales = fetch_pricecharting_sold_sales(link, limit=120)
-        if sales:
-            ungraded = [s for s in sales if (s.get("grade_bucket") or "").lower() == "ungraded"]
-            if EBAY_ONLY:
-                ungraded = [s for s in ungraded if "[ebay]" in (s.get("title", "").lower())]
-            ungraded = ungraded[:PER_ITEM_N]
+        try:
+            sales = fetch_pricecharting_sold_sales(link, limit=120)
+            if sales:
+                ungraded = [s for s in sales if (s.get("grade_bucket") or "").lower() == "ungraded"]
+                if EBAY_ONLY:
+                    ungraded = [s for s in ungraded if "[ebay]" in (s.get("title", "").lower())]
+                ungraded = ungraded[:PER_ITEM_N]
 
-            for s in ungraded:
-                base_key = safe_str(s.get("sale_key", "")).strip()
-                rows_out.append(
-                    {
-                        "Generation": safe_str(r.get("Generation", "")).strip(),
-                        "Set": safe_str(r.get("Set", "")).strip(),
-                        "Card Name": safe_str(r.get("Card Name", "")).strip(),
-                        "Card No": safe_str(r.get("Card No", "")).strip(),
-                        "Link": link,
-                        "grade_bucket": "ungraded",
-                        "sale_date": s["sale_date"].isoformat() if isinstance(s.get("sale_date"), date) else safe_str(s.get("sale_date", "")).strip(),
-                        "price": float(safe_float(s.get("price", 0.0), 0.0)),
-                        "title": safe_str(s.get("title", "")).strip(),
-                        "sale_key": _unique_sale_key(link, base_key),
-                        "updated_utc": now_utc,
-                    }
-                )
+                for s in ungraded:
+                    base_key = safe_str(s.get("sale_key", "")).strip()
+                    rows_out.append(
+                        {
+                            "Generation": safe_str(r.get("Generation", "")).strip(),
+                            "Set": safe_str(r.get("Set", "")).strip(),
+                            "Card Name": safe_str(r.get("Card Name", "")).strip(),
+                            "Card No": safe_str(r.get("Card No", "")).strip(),
+                            "Link": link,
+                            "grade_bucket": "ungraded",
+                            "sale_date": s["sale_date"].isoformat() if isinstance(s.get("sale_date"), date) else safe_str(s.get("sale_date", "")).strip(),
+                            "price": float(safe_float(s.get("price", 0.0), 0.0)),
+                            "title": safe_str(s.get("title", "")).strip(),
+                            "sale_key": _unique_sale_key(link, base_key),
+                            "updated_utc": now_utc,
+                        }
+                    )
+        except Exception:
+            pass
 
-        psa10_sales = fetch_pricecharting_psa10_manual_only(link, limit=50)
-        if psa10_sales:
-            if EBAY_ONLY:
-                psa10_sales = [s for s in psa10_sales if "[ebay]" in (s.get("title", "").lower())]
-            psa10_sales = psa10_sales[:PSA10_PER_ITEM]
-            for s in psa10_sales:
-                base_key = safe_str(s.get("sale_key", "")).strip()
-                rows_out.append(
-                    {
-                        "Generation": safe_str(r.get("Generation", "")).strip(),
-                        "Set": safe_str(r.get("Set", "")).strip(),
-                        "Card Name": safe_str(r.get("Card Name", "")).strip(),
-                        "Card No": safe_str(r.get("Card No", "")).strip(),
-                        "Link": link,
-                        "grade_bucket": "psa10",
-                        "sale_date": s["sale_date"].isoformat() if isinstance(s.get("sale_date"), date) else safe_str(s.get("sale_date", "")).strip(),
-                        "price": float(safe_float(s.get("price", 0.0), 0.0)),
-                        "title": safe_str(s.get("title", "")).strip(),
-                        "sale_key": _unique_sale_key(link, base_key),
-                        "updated_utc": now_utc,
-                    }
-                )
+        try:
+            psa10_sales = fetch_pricecharting_psa10_manual_only(link, limit=50)
+            if psa10_sales:
+                if EBAY_ONLY:
+                    psa10_sales = [s for s in psa10_sales if "[ebay]" in (s.get("title", "").lower())]
+                psa10_sales = psa10_sales[:PSA10_PER_ITEM]
+                for s in psa10_sales:
+                    base_key = safe_str(s.get("sale_key", "")).strip()
+                    rows_out.append(
+                        {
+                            "Generation": safe_str(r.get("Generation", "")).strip(),
+                            "Set": safe_str(r.get("Set", "")).strip(),
+                            "Card Name": safe_str(r.get("Card Name", "")).strip(),
+                            "Card No": safe_str(r.get("Card No", "")).strip(),
+                            "Link": link,
+                            "grade_bucket": "psa10",
+                            "sale_date": s["sale_date"].isoformat() if isinstance(s.get("sale_date"), date) else safe_str(s.get("sale_date", "")).strip(),
+                            "price": float(safe_float(s.get("price", 0.0), 0.0)),
+                            "title": safe_str(s.get("title", "")).strip(),
+                            "sale_key": _unique_sale_key(link, base_key),
+                            "updated_utc": now_utc,
+                        }
+                    )
+        except Exception:
+            pass
 
-        psa9_sales = fetch_pricecharting_psa9_graded(link, limit=50)
-        if psa9_sales:
-            if EBAY_ONLY:
-                psa9_sales = [s for s in psa9_sales if "[ebay]" in (s.get("title", "").lower())]
-            psa9_sales = psa9_sales[:PSA9_PER_ITEM]
-            for s in psa9_sales:
-                base_key = safe_str(s.get("sale_key", "")).strip()
-                rows_out.append(
-                    {
-                        "Generation": safe_str(r.get("Generation", "")).strip(),
-                        "Set": safe_str(r.get("Set", "")).strip(),
-                        "Card Name": safe_str(r.get("Card Name", "")).strip(),
-                        "Card No": safe_str(r.get("Card No", "")).strip(),
-                        "Link": link,
-                        "grade_bucket": "psa9",
-                        "sale_date": s["sale_date"].isoformat() if isinstance(s.get("sale_date"), date) else safe_str(s.get("sale_date", "")).strip(),
-                        "price": float(safe_float(s.get("price", 0.0), 0.0)),
-                        "title": safe_str(s.get("title", "")).strip(),
-                        "sale_key": _unique_sale_key(link, base_key),
-                        "updated_utc": now_utc,
-                    }
-                )
+        try:
+            psa9_sales = fetch_pricecharting_psa9_graded(link, limit=50)
+            if psa9_sales:
+                if EBAY_ONLY:
+                    psa9_sales = [s for s in psa9_sales if "[ebay]" in (s.get("title", "").lower())]
+                psa9_sales = psa9_sales[:PSA9_PER_ITEM]
+                for s in psa9_sales:
+                    base_key = safe_str(s.get("sale_key", "")).strip()
+                    rows_out.append(
+                        {
+                            "Generation": safe_str(r.get("Generation", "")).strip(),
+                            "Set": safe_str(r.get("Set", "")).strip(),
+                            "Card Name": safe_str(r.get("Card Name", "")).strip(),
+                            "Card No": safe_str(r.get("Card No", "")).strip(),
+                            "Link": link,
+                            "grade_bucket": "psa9",
+                            "sale_date": s["sale_date"].isoformat() if isinstance(s.get("sale_date"), date) else safe_str(s.get("sale_date", "")).strip(),
+                            "price": float(safe_float(s.get("price", 0.0), 0.0)),
+                            "title": safe_str(s.get("title", "")).strip(),
+                            "sale_key": _unique_sale_key(link, base_key),
+                            "updated_utc": now_utc,
+                        }
+                    )
+        except Exception:
+            pass
 
     df_out = pd.DataFrame(rows_out)
     if df_out.empty:
@@ -1130,6 +1059,7 @@ def write_ws_df(ws, df: pd.DataFrame, headers: list[str]):
     values = [headers] + df2.astype(str).fillna("").values.tolist()
     last_col = a1_col_letter(len(headers))
     rng = f"A1:{last_col}{len(values)}"
+    _gs_write_retry(ws.clear)
     _gs_write_retry(ws.update, range_name=rng, values=values, value_input_option="RAW")
 
 
@@ -1246,20 +1176,29 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
     )
 
     def _bucket_cols(bucket: str):
-        return {"mean": f"{bucket.upper()} Avg", "min": f"{bucket.upper()} Min", "max": f"{bucket.upper()} Max"}
+        return {
+            "mean": f"{bucket.upper()} Avg",
+            "min": f"{bucket.upper()} Min",
+            "max": f"{bucket.upper()} Max",
+        }
 
     out = None
     for bucket in ["ungraded", "psa9", "psa10"]:
         sub = stats[stats["grade_bucket"] == bucket].copy()
         sub = sub[keys + ["mean", "min", "max"]].copy() if not sub.empty else pd.DataFrame(columns=keys + ["mean", "min", "max"])
-        sub = sub.rename(columns={"mean": _bucket_cols(bucket)["mean"], "min": _bucket_cols(bucket)["min"], "max": _bucket_cols(bucket)["max"]})
+        sub = sub.rename(
+            columns={
+                "mean": _bucket_cols(bucket)["mean"],
+                "min": _bucket_cols(bucket)["min"],
+                "max": _bucket_cols(bucket)["max"],
+            }
+        )
         out = sub if out is None else out.merge(sub, on=keys, how="outer")
 
     if out is None or out.empty:
         return pd.DataFrame()
 
     img_map = {}
-    tcg_price_map = {}
 
     if wdf is not None and not wdf.empty and "Link" in wdf.columns:
         for _, r in wdf.iterrows():
@@ -1268,8 +1207,6 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
                 continue
             if "Image" in wdf.columns:
                 img_map[lk] = safe_str(r.get("Image", "")).strip()
-            if TCG_PRICE_COL in wdf.columns:
-                tcg_price_map[lk] = safe_float(r.get(TCG_PRICE_COL, 0.0), 0.0)
 
     out["Image"] = out["Link"].map(lambda x: img_map.get(safe_str(x).strip(), ""))
 
@@ -1288,12 +1225,6 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
             out.at[i, "Gem rate (all time)"] = round(float(rec.get("gem_rate", 0.0)), 4)
             out.at[i, "Total graded"] = int(rec.get("total", 0))
 
-    out["TCGplayer Price"] = out["Link"].map(lambda x: round(safe_float(tcg_price_map.get(safe_str(x).strip(), 0.0), 0.0), 2))
-    out["TCG - Ungraded"] = (
-        out["TCGplayer Price"].apply(lambda v: safe_float(v, 0.0)) -
-        out["UNGRADED Avg"].apply(lambda v: safe_float(v, 0.0))
-    ).apply(lambda v: round(v, 2))
-
     out = add_prospect_scoring(out)
     out = out.sort_values(["Set", "Card Name", "Card No"], ascending=[True, True, True]).reset_index(drop=True)
     return out
@@ -1305,25 +1236,24 @@ def build_summary_from_sales_history(sdf: pd.DataFrame, wdf: pd.DataFrame, gem_l
 @st.cache_data(ttl=60 * 60 * 12)
 def fetch_pricecharting_prices(reference_link: str) -> dict:
     out = {"raw": 0.0, "psa9": 0.0, "psa10": 0.0}
-    if not reference_link or "pricecharting.com" not in reference_link.lower():
+    soup = _get_pricecharting_soup(reference_link)
+    if soup is None:
         return out
 
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (CardTracker; +Streamlit)"}
-        r = requests.get(reference_link.strip(), headers=headers, timeout=12)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
-
-        nodes = soup.select(".price.js-price")
+        nodes = soup.select(".price.js-price, .js-price")
         prices = []
+
         for n in nodes:
             t = n.get_text(" ", strip=True)
             m = re.search(r"\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", t)
-            prices.append(safe_float(m.group(1), 0.0) if m else 0.0)
+            if m:
+                prices.append(safe_float(m.group(1), 0.0))
 
         out["raw"] = float(prices[0] if len(prices) >= 1 else 0.0)
         out["psa9"] = float(prices[3] if len(prices) >= 4 else 0.0)
         out["psa10"] = float(prices[5] if len(prices) >= 6 else 0.0)
+
         return out
     except Exception:
         return out
@@ -1345,8 +1275,11 @@ def load_inventory_df():
         df["inventory_status"] = STATUS_ACTIVE
     df["inventory_status"] = df["inventory_status"].astype(str).replace("", STATUS_ACTIVE)
 
-    for c in ["inventory_id", "reference_link", "card_name", "set_name", "year", "total_price", "purchase_date", "purchased_from", "product_type",
-              "card_number", "variant", "card_subtype", "grading_company", "grade", "market_price", "market_value"]:
+    for c in [
+        "inventory_id", "reference_link", "card_name", "set_name", "year", "total_price",
+        "purchase_date", "purchased_from", "product_type", "card_number", "variant",
+        "card_subtype", "grading_company", "grade", "market_price", "market_value"
+    ]:
         if c not in df.columns:
             df[c] = ""
 
@@ -1442,6 +1375,9 @@ def load_grading_df():
 def refresh_all_grading():
     load_inventory_df.clear()
     load_grading_df.clear()
+    fetch_pricecharting_prices.clear()
+    fetch_pricecharting_html.clear()
+    fetch_pricecharting_sold_sales.clear()
     st.rerun()
 
 
@@ -1656,7 +1592,6 @@ wdf_watch = read_ws_df(watch_ws)
 gdf = read_ws_df(gem_ws)
 gem_lookup = load_gemrates_lookup(gdf)
 
-# grading submission data
 inv_df = load_inventory_df()
 grading_df = load_grading_df()
 
@@ -1668,7 +1603,7 @@ if not eligible_inv.empty:
 
 
 # =========================================================
-# UI TABS (combined)
+# UI TABS
 # =========================================================
 tab_watchlist, tab_analysis, tab_submit, tab_update, tab_summary = st.tabs(
     ["Watchlist / Market", "Analysis", "Create Submission", "Update Returns", "Submission Summary"]
@@ -1683,27 +1618,19 @@ with tab_watchlist:
         c1, c2 = st.columns([1.2, 3])
 
         with c1:
-            refresh_mode = st.radio(
-                "Refresh mode",
-                ["TCGplayer only", "PriceCharting only", "Both"],
-                index=2,
-            )
-
             if st.button("Run Refresh", type="primary", use_container_width=True):
                 try:
-                    with st.spinner("Refreshing..."):
+                    with st.spinner("Refreshing PriceCharting data..."):
+                        fetch_pricecharting_html.clear()
+                        fetch_pricecharting_sold_sales.clear()
+
                         wdf_watch = read_ws_df(watch_ws)
 
-                        if refresh_mode in ("TCGplayer only", "Both"):
-                            refresh_watchlist_tcg_prices_batched(watch_ws, wdf_watch)
-                            wdf_watch = read_ws_df(watch_ws)
+                        refresh_watchlist_images_batched(watch_ws, wdf_watch)
+                        wdf_watch = read_ws_df(watch_ws)
 
-                        if refresh_mode in ("PriceCharting only", "Both"):
-                            refresh_watchlist_images_batched(watch_ws, wdf_watch)
-                            wdf_watch = read_ws_df(watch_ws)
-
-                            out_df = build_sales_history_rows_from_watchlist(wdf_watch)
-                            write_ws_df(sales_ws, out_df, SALES_HISTORY_HEADERS)
+                        out_df = build_sales_history_rows_from_watchlist(wdf_watch)
+                        write_ws_df(sales_ws, out_df, SALES_HISTORY_HEADERS)
 
                     st.success("Refresh complete.")
                     st.rerun()
@@ -1713,9 +1640,8 @@ with tab_watchlist:
 
         with c2:
             st.caption(
-                f"Tip: Use **TCGplayer only** for fast price updates. "
-                f"TCG prices are stored in the watchlist columns `{TCG_PRICE_COL}` and `{TCG_UPDATED_COL}` "
-                f"(TTL {TCG_PRICE_TTL_HOURS:g}h) so filtering does not re-scrape."
+                "Refresh now updates only PriceCharting images and sold sales history. "
+                "TCGplayer refresh has been removed from this page."
             )
 
     st.divider()
@@ -1725,7 +1651,7 @@ with tab_watchlist:
     summary_df = build_summary_from_sales_history(sdf, wdf_watch, gem_lookup)
 
     if summary_df is None or summary_df.empty:
-        st.info("No sales history yet. Run **PriceCharting only** (or **Both**) at least once.")
+        st.info("No sales history yet. Run Refresh at least once.")
     else:
         with st.expander("Filters", expanded=True):
             f1, f2, f3, f4 = st.columns([1.2, 1.2, 1.2, 1.2])
@@ -1766,8 +1692,13 @@ with tab_watchlist:
             with g3:
                 ungraded_rng = st.slider("UNGRADED Avg ($)", 0.0, max(1.0, u_max), (0.0, u_max), 0.5)
             with g4:
-                ev_rng = st.slider("EV (vs ungraded)", min(-200.0, ev_min), max(200.0, ev_max),
-                                   (min(-200.0, ev_min), max(200.0, ev_max)), 0.5)
+                ev_rng = st.slider(
+                    "EV (vs ungraded)",
+                    min(-200.0, ev_min),
+                    max(200.0, ev_max),
+                    (min(-200.0, ev_min), max(200.0, ev_max)),
+                    0.5,
+                )
 
         fdf = summary_df.copy()
 
@@ -1777,29 +1708,39 @@ with tab_watchlist:
             fdf = fdf[fdf["Generation"].astype(str).isin(sel_gen)]
 
         if "Prospect Score" in fdf.columns:
-            fdf = fdf[(fdf["Prospect Score"].apply(lambda v: safe_float(v, 0.0)) >= score_rng[0]) &
-                      (fdf["Prospect Score"].apply(lambda v: safe_float(v, 0.0)) <= score_rng[1])]
+            fdf = fdf[
+                (fdf["Prospect Score"].apply(lambda v: safe_float(v, 0.0)) >= score_rng[0]) &
+                (fdf["Prospect Score"].apply(lambda v: safe_float(v, 0.0)) <= score_rng[1])
+            ]
 
         if "Total graded" in fdf.columns:
             fdf = fdf[fdf["Total graded"].apply(lambda v: safe_int(v, 0)) >= int(total_min)]
 
-        fdf = fdf[(fdf["PSA9 Avg"].apply(lambda v: safe_float(v, 0.0)) >= psa9_rng[0]) &
-                  (fdf["PSA9 Avg"].apply(lambda v: safe_float(v, 0.0)) <= psa9_rng[1])]
+        fdf = fdf[
+            (fdf["PSA9 Avg"].apply(lambda v: safe_float(v, 0.0)) >= psa9_rng[0]) &
+            (fdf["PSA9 Avg"].apply(lambda v: safe_float(v, 0.0)) <= psa9_rng[1])
+        ]
 
-        fdf = fdf[(fdf["PSA10 Avg"].apply(lambda v: safe_float(v, 0.0)) >= psa10_rng[0]) &
-                  (fdf["PSA10 Avg"].apply(lambda v: safe_float(v, 0.0)) <= psa10_rng[1])]
+        fdf = fdf[
+            (fdf["PSA10 Avg"].apply(lambda v: safe_float(v, 0.0)) >= psa10_rng[0]) &
+            (fdf["PSA10 Avg"].apply(lambda v: safe_float(v, 0.0)) <= psa10_rng[1])
+        ]
 
-        fdf = fdf[(fdf["UNGRADED Avg"].apply(lambda v: safe_float(v, 0.0)) >= ungraded_rng[0]) &
-                  (fdf["UNGRADED Avg"].apply(lambda v: safe_float(v, 0.0)) <= ungraded_rng[1])]
+        fdf = fdf[
+            (fdf["UNGRADED Avg"].apply(lambda v: safe_float(v, 0.0)) >= ungraded_rng[0]) &
+            (fdf["UNGRADED Avg"].apply(lambda v: safe_float(v, 0.0)) <= ungraded_rng[1])
+        ]
 
         if "EV (vs ungraded)" in fdf.columns:
-            fdf = fdf[(fdf["EV (vs ungraded)"].apply(lambda v: safe_float(v, 0.0)) >= ev_rng[0]) &
-                      (fdf["EV (vs ungraded)"].apply(lambda v: safe_float(v, 0.0)) <= ev_rng[1])]
+            fdf = fdf[
+                (fdf["EV (vs ungraded)"].apply(lambda v: safe_float(v, 0.0)) >= ev_rng[0]) &
+                (fdf["EV (vs ungraded)"].apply(lambda v: safe_float(v, 0.0)) <= ev_rng[1])
+            ]
 
         preferred_cols = [
             "Image", "Link", "Generation", "Set", "Card Name", "Card No",
             "Prospect Score", "EV (vs ungraded)", "Gem rate (all time)", "Total graded", "Gem conf", "P10 adj",
-            "UNGRADED Avg", "TCGplayer Price", "TCG - Ungraded", "UNGRADED Min", "UNGRADED Max",
+            "UNGRADED Avg", "UNGRADED Min", "UNGRADED Max",
             "PSA9 Avg", "PSA9 Min", "PSA9 Max",
             "PSA10 Avg", "PSA10 Min", "PSA10 Max",
             "Net 9", "Net 10",
@@ -1820,7 +1761,7 @@ with tab_watchlist:
 
 
 # ---------------------------------------------------------
-# TAB 2: Analysis (single-card PSA9/PSA10 calc)
+# TAB 2: Analysis
 # ---------------------------------------------------------
 with tab_analysis:
     st.subheader("Analysis (pull PSA 9/10 from PriceCharting)")
