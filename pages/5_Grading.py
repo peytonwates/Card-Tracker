@@ -17,6 +17,7 @@
 # - TCGplayer refresh flow has been removed from this page.
 # - PriceCharting fetches now use one shared cached HTML helper.
 # - A blocked/403 PriceCharting page will be skipped instead of killing the whole refresh.
+# - Google Sheets reads now use retry/backoff and cached loaders to reduce 429 quota issues.
 # ---------------------------------------------------------
 
 import json
@@ -188,15 +189,6 @@ def _utc_now_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat()
 
 
-def _parse_utc_iso(s: str):
-    try:
-        if not s:
-            return None
-        return datetime.fromisoformat(s.replace("Z", ""))
-    except Exception:
-        return None
-
-
 def _bs_parser():
     try:
         import lxml  # noqa: F401
@@ -279,21 +271,41 @@ def get_gspread_client():
     raise KeyError('Missing secrets: add "gcp_service_account" (Cloud) or "service_account_json_path" (local).')
 
 
-def _gs_write_retry(fn, *args, **kwargs):
+def _is_gs_quota_error(e: Exception) -> bool:
+    msg = str(e)
+    return (
+        "429" in msg
+        or "Quota exceeded" in msg
+        or "Read requests per minute per user" in msg
+        or "Write requests per minute per user" in msg
+    )
+
+
+def _gs_api_retry(fn, *args, **kwargs):
     max_tries = 8
     base_sleep = 1.0
+
     for attempt in range(1, max_tries + 1):
         try:
             return fn(*args, **kwargs)
         except APIError as e:
-            msg = str(e)
-            if "429" in msg or "Quota exceeded" in msg:
+            if _is_gs_quota_error(e):
                 time.sleep(base_sleep * (2 ** (attempt - 1)))
                 continue
             raise
+
     raise RuntimeError("Google Sheets API quota exceeded (retries exhausted).")
 
 
+def _gs_write_retry(fn, *args, **kwargs):
+    return _gs_api_retry(fn, *args, **kwargs)
+
+
+def _gs_read_retry(fn, *args, **kwargs):
+    return _gs_api_retry(fn, *args, **kwargs)
+
+
+@st.cache_resource
 def get_sheet():
     client = get_gspread_client()
     return client.open_by_key(st.secrets["spreadsheet_id"])
@@ -304,11 +316,13 @@ def get_ws(sheet, ws_name: str):
 
 
 def read_ws_df(ws) -> pd.DataFrame:
-    values = ws.get_all_values()
+    values = _gs_read_retry(ws.get_all_values)
     if not values or not values[0]:
         return pd.DataFrame()
+
     header = [safe_str(x).strip() for x in values[0]]
     rows = values[1:]
+
     out = []
     for r in rows:
         if len(r) < len(header):
@@ -316,6 +330,7 @@ def read_ws_df(ws) -> pd.DataFrame:
         elif len(r) > len(header):
             r = r[:len(header)]
         out.append(r)
+
     df = pd.DataFrame(out, columns=header)
     df = df.loc[:, ~df.columns.duplicated()].copy()
     return df
@@ -325,7 +340,7 @@ def read_ws_df(ws) -> pd.DataFrame:
 # Header management
 # =========================================================
 def ensure_headers_simple(ws, headers: list[str]):
-    values = ws.get_all_values()
+    values = _gs_read_retry(ws.get_all_values)
     if not values:
         _gs_write_retry(ws.update, values=[headers], range_name="1:1", value_input_option="RAW")
         return
@@ -338,7 +353,7 @@ def ensure_headers_canon(ws, needed_headers: list[str]):
     def strip_dups(h: str) -> str:
         return re.sub(r"(?:__dup\d+)+$", "", str(h or "").strip())
 
-    values = ws.get_all_values()
+    values = _gs_read_retry(ws.get_all_values)
     if not values:
         _gs_write_retry(ws.update, values=[needed_headers], range_name="1:1", value_input_option="USER_ENTERED")
         return needed_headers
@@ -403,13 +418,13 @@ def ensure_headers_canon(ws, needed_headers: list[str]):
         deleted_any = False
         for col in sorted(delete_col_idxs_1based, reverse=True):
             try:
-                ws.delete_columns(col)
+                _gs_write_retry(ws.delete_columns, col)
                 deleted_any = True
             except Exception:
                 pass
 
         if deleted_any:
-            values = ws.get_all_values()
+            values = _gs_read_retry(ws.get_all_values)
             raw = values[0] if values else []
             if not raw:
                 _gs_write_retry(ws.update, values=[needed_headers], range_name="1:1", value_input_option="USER_ENTERED")
@@ -443,7 +458,7 @@ def ensure_headers_canon(ws, needed_headers: list[str]):
 
 
 def ensure_watchlist_image_col(watch_ws):
-    values = watch_ws.get_all_values()
+    values = _gs_read_retry(watch_ws.get_all_values)
     if not values or not values[0]:
         _gs_write_retry(watch_ws.update, values=[WATCHLIST_HEADERS_EXPECTED], range_name="1:1", value_input_option="RAW")
         return WATCHLIST_HEADERS_EXPECTED, WATCHLIST_HEADERS_EXPECTED.index("Image") + 1
@@ -1059,6 +1074,7 @@ def write_ws_df(ws, df: pd.DataFrame, headers: list[str]):
     values = [headers] + df2.astype(str).fillna("").values.tolist()
     last_col = a1_col_letter(len(headers))
     rng = f"A1:{last_col}{len(values)}"
+
     _gs_write_retry(ws.clear)
     _gs_write_retry(ws.update, range_name=rng, values=values, value_input_option="RAW")
 
@@ -1097,6 +1113,37 @@ def load_gemrates_lookup(gdf: pd.DataFrame) -> dict[tuple[str, str], dict]:
 
         out[(set_norm, card_norm)] = {"gem_rate": float(rate), "total": int(total)}
     return out
+
+
+@st.cache_data(ttl=20)
+def load_watchlist_df():
+    sh = get_sheet()
+    ws = get_ws(sh, WATCHLIST_WS_NAME)
+    return read_ws_df(ws)
+
+
+@st.cache_data(ttl=20)
+def load_sales_history_df():
+    sh = get_sheet()
+    ws = get_ws(sh, SALES_HISTORY_WS_NAME)
+    return read_ws_df(ws)
+
+
+@st.cache_data(ttl=300)
+def load_gemrates_df():
+    sh = get_sheet()
+    ws = get_ws(sh, GEMRATES_WS_NAME)
+    return read_ws_df(ws)
+
+
+def clear_watchlist_market_caches():
+    load_watchlist_df.clear()
+    load_sales_history_df.clear()
+    load_gemrates_df.clear()
+    fetch_pricecharting_html.clear()
+    fetch_pricecharting_sold_sales.clear()
+    fetch_pricecharting_image_url.clear()
+    fetch_pricecharting_prices.clear()
 
 
 # =========================
@@ -1266,7 +1313,7 @@ def fetch_pricecharting_prices(reference_link: str) -> dict:
 def load_inventory_df():
     sh = get_sheet()
     ws = get_ws(sh, INVENTORY_WS_NAME)
-    records = ws.get_all_records()
+    records = _gs_read_retry(ws.get_all_records)
     df = pd.DataFrame(records)
     if df.empty:
         return df
@@ -1305,7 +1352,7 @@ def load_grading_df():
 
     _ = ensure_headers_canon(ws, GRADING_CANON_COLS)
 
-    values = ws.get_all_values()
+    values = _gs_read_retry(ws.get_all_values)
     if not values or len(values) < 1:
         return pd.DataFrame(columns=GRADING_CANON_COLS)
 
@@ -1378,6 +1425,9 @@ def refresh_all_grading():
     fetch_pricecharting_prices.clear()
     fetch_pricecharting_html.clear()
     fetch_pricecharting_sold_sales.clear()
+    load_watchlist_df.clear()
+    load_sales_history_df.clear()
+    load_gemrates_df.clear()
     st.rerun()
 
 
@@ -1411,7 +1461,7 @@ def append_grading_rows(rows: list[dict]):
                 v = _num_str(v)
             values.append(v)
 
-        ws.append_row(values, value_input_option="RAW")
+        _gs_write_retry(ws.append_row, values, value_input_option="RAW")
 
 
 def update_grading_rows_quota_safe(df_rows: pd.DataFrame):
@@ -1422,7 +1472,7 @@ def update_grading_rows_quota_safe(df_rows: pd.DataFrame):
     ws = get_ws(sh, GRADING_WS_NAME)
     _ = ensure_headers_canon(ws, GRADING_CANON_COLS)
 
-    values = ws.get_all_values()
+    values = _gs_read_retry(ws.get_all_values)
     if not values:
         return
     sheet_header = values[0] if values else []
@@ -1474,7 +1524,7 @@ def update_grading_rows_quota_safe(df_rows: pd.DataFrame):
                 v = _num_str(v)
             out_row.append(v)
 
-        ws.update(f"A{rownum}:{last_col}{rownum}", [out_row], value_input_option="RAW")
+        _gs_write_retry(ws.update, f"A{rownum}:{last_col}{rownum}", [out_row], value_input_option="RAW")
 
         if i % 5 == 0:
             time.sleep(0.6)
@@ -1485,7 +1535,7 @@ def update_inventory_status(inventory_id: str, new_status: str):
     inv_ws = get_ws(sh, INVENTORY_WS_NAME)
 
     _ = ensure_headers_canon(inv_ws, ["inventory_id", "inventory_status"])
-    headers = inv_ws.row_values(1)
+    headers = _gs_read_retry(inv_ws.row_values, 1)
     if not headers:
         return
 
@@ -1501,7 +1551,7 @@ def update_inventory_status(inventory_id: str, new_status: str):
         return
 
     id_col = headers.index(id_header) + 1
-    ids = inv_ws.col_values(id_col)
+    ids = _gs_read_retry(inv_ws.col_values, id_col)
 
     rownum = None
     for i, v in enumerate(ids[1:], start=2):
@@ -1512,7 +1562,7 @@ def update_inventory_status(inventory_id: str, new_status: str):
         return
 
     c = headers.index(st_header) + 1
-    inv_ws.update(f"{a1_col_letter(c)}{rownum}", [[new_status]], value_input_option="USER_ENTERED")
+    _gs_write_retry(inv_ws.update, f"{a1_col_letter(c)}{rownum}", [[new_status]], value_input_option="USER_ENTERED")
 
 
 def mark_inventory_as_graded(inventory_id: str, grading_company: str, grade: str):
@@ -1520,7 +1570,7 @@ def mark_inventory_as_graded(inventory_id: str, grading_company: str, grade: str
     inv_ws = get_ws(sh, INVENTORY_WS_NAME)
 
     _ = ensure_headers_canon(inv_ws, ["inventory_id", "product_type", "grading_company", "grade", "reference_link", "market_price", "market_value"])
-    headers = inv_ws.row_values(1)
+    headers = _gs_read_retry(inv_ws.row_values, 1)
     if not headers:
         return
 
@@ -1535,7 +1585,7 @@ def mark_inventory_as_graded(inventory_id: str, grading_company: str, grade: str
         return
 
     id_col = headers.index(id_header) + 1
-    ids = inv_ws.col_values(id_col)
+    ids = _gs_read_retry(inv_ws.col_values, id_col)
 
     rownum = None
     for i, v in enumerate(ids[1:], start=2):
@@ -1550,14 +1600,14 @@ def mark_inventory_as_graded(inventory_id: str, grading_company: str, grade: str
         if not target:
             return
         c = headers.index(target) + 1
-        inv_ws.update(f"{a1_col_letter(c)}{rownum}", [[value]], value_input_option="USER_ENTERED")
+        _gs_write_retry(inv_ws.update, f"{a1_col_letter(c)}{rownum}", [[value]], value_input_option="USER_ENTERED")
 
     def _get(base_name: str) -> str:
         target = _header_for(base_name)
         if not target:
             return ""
         c = headers.index(target) + 1
-        return str(inv_ws.cell(rownum, c).value or "").strip()
+        return str(_gs_read_retry(inv_ws.cell, rownum, c).value or "").strip()
 
     _set("product_type", "Graded Card")
     _set("grading_company", grading_company)
@@ -1588,8 +1638,8 @@ gem_ws = get_ws(sheet, GEMRATES_WS_NAME)
 
 ensure_headers_simple(sales_ws, SALES_HISTORY_HEADERS)
 
-wdf_watch = read_ws_df(watch_ws)
-gdf = read_ws_df(gem_ws)
+wdf_watch = load_watchlist_df()
+gdf = load_gemrates_df()
 gem_lookup = load_gemrates_lookup(gdf)
 
 inv_df = load_inventory_df()
@@ -1621,16 +1671,16 @@ with tab_watchlist:
             if st.button("Run Refresh", type="primary", use_container_width=True):
                 try:
                     with st.spinner("Refreshing PriceCharting data..."):
-                        fetch_pricecharting_html.clear()
-                        fetch_pricecharting_sold_sales.clear()
+                        clear_watchlist_market_caches()
 
-                        wdf_watch = read_ws_df(watch_ws)
+                        wdf_watch = load_watchlist_df()
 
                         refresh_watchlist_images_batched(watch_ws, wdf_watch)
-                        wdf_watch = read_ws_df(watch_ws)
 
                         out_df = build_sales_history_rows_from_watchlist(wdf_watch)
                         write_ws_df(sales_ws, out_df, SALES_HISTORY_HEADERS)
+
+                        clear_watchlist_market_caches()
 
                     st.success("Refresh complete.")
                     st.rerun()
@@ -1646,8 +1696,8 @@ with tab_watchlist:
 
     st.divider()
 
-    sdf = read_ws_df(sales_ws)
-    wdf_watch = read_ws_df(watch_ws)
+    sdf = load_sales_history_df()
+    wdf_watch = load_watchlist_df()
     summary_df = build_summary_from_sales_history(sdf, wdf_watch, gem_lookup)
 
     if summary_df is None or summary_df.empty:
