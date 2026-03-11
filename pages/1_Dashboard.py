@@ -93,24 +93,16 @@ def _to_num(s):
     """
     if isinstance(s, pd.Series):
         x = s.copy()
-        # if already numeric, just coerce
         if pd.api.types.is_numeric_dtype(x):
             return pd.to_numeric(x, errors="coerce").fillna(0.0)
 
         x = x.astype(str).str.strip()
-
-        # convert (123.45) => -123.45
         x = x.str.replace(r"^\((.*)\)$", r"-\1", regex=True)
-
-        # remove $ and commas and spaces
         x = x.str.replace(r"[\$,]", "", regex=True)
-
-        # handle blanks / "nan"
         x = x.replace({"": "0", "nan": "0", "None": "0"})
 
         return pd.to_numeric(x, errors="coerce").fillna(0.0)
 
-    # scalar
     try:
         if s is None:
             return 0.0
@@ -159,20 +151,15 @@ def _style_red_green(val):
     return ""
 
 def _base_col(c: str) -> str:
-    # normalize any renamed dup columns like "inventory_id__dup1"
     s = _safe_str(c)
     if "__dup" in s:
         s = s.split("__dup")[0]
     return s
 
-# ✅ FIX: robust normalization so "List Price" == "list_price", "Inventory ID" == "inventory_id", etc.
 def _norm_key(s: str) -> str:
     s = _safe_str(s).strip().lower()
-    # convert common separators to underscore
     s = re.sub(r"[\s\-\/]+", "_", s)
-    # drop any remaining non-word chars (keep underscore)
     s = re.sub(r"[^\w]+", "", s)
-    # collapse multiple underscores
     s = re.sub(r"_+", "_", s).strip("_")
     return s
 
@@ -231,7 +218,6 @@ def _apply_period_filter(df: pd.DataFrame, dt_col: str, year_choice: str, month_
             pass
 
     if month_choice != "All":
-        # month_choice expected like "2026-01"
         try:
             m = pd.to_datetime(month_choice + "-01", errors="coerce")
             if pd.notna(m):
@@ -243,7 +229,6 @@ def _apply_period_filter(df: pd.DataFrame, dt_col: str, year_choice: str, month_
     return out
 
 def _bucket_product(product_type, grading_company, grade, condition, inv_status) -> str:
-    # Avoid AttributeError from ints
     pt = _safe_str(product_type).strip().lower()
     comp = _safe_str(grading_company).strip()
     grd = _safe_str(grade).strip()
@@ -256,7 +241,6 @@ def _bucket_product(product_type, grading_company, grade, condition, inv_status)
     if "sealed" in pt:
         return "Sealed"
 
-    # "Graded Card" product_type or any populated grade/company indicates graded
     if "graded" in pt or comp or grd or ("graded" in cond):
         return "Graded Cards"
 
@@ -280,10 +264,7 @@ def _normalize_card_type(val: str) -> str:
 
 
 # =========================
-# ✅ NEW: Canonicalize reference links so weird SportscardsPro links still work
-# - strips ?q=... and #...
-# - forces https
-# - normalizes sportscardspro host to www.sportscardspro.com
+# Canonicalize reference links
 # =========================
 def _canonicalize_reference_link(url: str) -> str:
     if not url:
@@ -292,7 +273,6 @@ def _canonicalize_reference_link(url: str) -> str:
     if not url:
         return ""
 
-    # Handle scheme-less URLs
     if url.startswith("//"):
         url = "https:" + url
     elif not url.startswith(("http://", "https://")):
@@ -306,26 +286,19 @@ def _canonicalize_reference_link(url: str) -> str:
     netloc = (p.netloc or "").lower()
     path = p.path or ""
 
-    # Normalize known host variants
     if "sportscardspro.com" in netloc:
         netloc = "www.sportscardspro.com"
 
-    # Drop query + fragment, strip trailing slash
     path = path.rstrip("/")
     canonical = urlunparse(("https", netloc, path, "", "", ""))
-
     return canonical
 
 
 # =========================
-# ✅ NEW: HTTP session + throttling/backoff to reduce 429s
+# HTTP session + throttling/backoff
 # =========================
 @st.cache_resource
 def _get_http_session() -> requests.Session:
-    """
-    One shared session per Streamlit process (connection pooling).
-    We handle retries manually (esp. 429 Retry-After), so urllib3 retry is disabled.
-    """
     s = requests.Session()
 
     retry = Retry(
@@ -342,9 +315,8 @@ def _get_http_session() -> requests.Session:
     return s
 
 
-# simple in-process rate limiter per-domain
 _DOMAIN_LAST_HIT = {}
-_MIN_GAP_SECONDS = 1.2   # tune: 1.2–2.5 typically reduces 429s a lot
+_MIN_GAP_SECONDS = 1.2
 _JITTER_SECONDS = 0.4
 
 def _throttle(url: str):
@@ -360,9 +332,6 @@ def _throttle(url: str):
     _DOMAIN_LAST_HIT[host] = time.time()
 
 def _http_get_with_backoff(url: str, headers: dict, timeout: int = 12) -> requests.Response:
-    """
-    Handles 429 with exponential backoff and respects Retry-After if present.
-    """
     sess = _get_http_session()
     max_attempts = 5
     base_sleep = 2.0
@@ -373,11 +342,9 @@ def _http_get_with_backoff(url: str, headers: dict, timeout: int = 12) -> reques
         resp = sess.get(url, headers=headers, timeout=timeout)
         last_resp = resp
 
-        # success
         if resp.status_code < 400:
             return resp
 
-        # rate limited
         if resp.status_code == 429:
             ra = resp.headers.get("Retry-After")
             if ra:
@@ -392,13 +359,11 @@ def _http_get_with_backoff(url: str, headers: dict, timeout: int = 12) -> reques
             time.sleep(min(sleep_s, 60))
             continue
 
-        # transient server errors
         if resp.status_code in (500, 502, 503, 504):
             sleep_s = base_sleep * (2 ** (attempt - 1)) + random.random() * 0.75
             time.sleep(min(sleep_s, 30))
             continue
 
-        # other errors -> stop retrying
         break
 
     return last_resp
@@ -446,11 +411,9 @@ def _fetch_market_prices(link: str) -> dict:
     def _pick_from_map(m: dict, labels) -> float:
         if not m:
             return 0.0
-        # exact match
         for lab in labels:
             if lab in m:
                 return float(m.get(lab, 0.0) or 0.0)
-        # case-insensitive match
         lower_map = {k.lower(): k for k in m.keys()}
         for lab in labels:
             k = lower_map.get(lab.lower())
@@ -472,14 +435,6 @@ def _fetch_market_prices(link: str) -> dict:
         return any(x in t for x in bad)
 
     def _extract_price_map_from_price_cells(soup: BeautifulSoup) -> tuple[dict, set]:
-        """
-        Strategy A:
-        Builds a label->price map by locating all elements with class "price js-price",
-        then finding the closest row label (usually first td/th in the same <tr>).
-
-        Returns:
-          (map, labels_seen)
-        """
         price_map = {}
         labels_seen = set()
 
@@ -510,11 +465,6 @@ def _fetch_market_prices(link: str) -> dict:
         return price_map, labels_seen
 
     def _extract_price_map_generic_table(soup: BeautifulSoup) -> tuple[dict, set]:
-        """
-        Strategy B:
-        Some pages render the price guide without `.price.js-price`.
-        Scan table rows: label in first cell, money in later cells or common price classes.
-        """
         price_map = {}
         labels_seen = set()
 
@@ -546,11 +496,6 @@ def _fetch_market_prices(link: str) -> dict:
         return price_map, labels_seen
 
     def _extract_prices_from_jsonld(soup: BeautifulSoup) -> dict:
-        """
-        Strategy C:
-        If JSON-LD exists, sometimes it includes offers/price.
-        Typically only helps with a raw-ish price.
-        """
         result = {}
         scripts = soup.find_all("script", type="application/ld+json")
         for sc in scripts:
@@ -585,14 +530,12 @@ def _fetch_market_prices(link: str) -> dict:
 
     try:
         headers = {
-            # slightly more realistic UA helps reduce block/429 in practice
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Connection": "keep-alive",
         }
 
-        # ✅ use throttled/backoff GET instead of raw requests.get
         r = _http_get_with_backoff(url, headers=headers, timeout=12)
         if r is None:
             out["_debug"] = "exception"
@@ -611,7 +554,6 @@ def _fetch_market_prices(link: str) -> dict:
 
         soup = BeautifulSoup(r.text, "lxml")
 
-        # Strategy A
         price_map, labels_seen = _extract_price_map_from_price_cells(soup)
 
         raw_val = _pick_from_map(price_map, ["Ungraded", "Raw"])
@@ -623,7 +565,6 @@ def _fetch_market_prices(link: str) -> dict:
             for lab in ["Ungraded", "Raw", "PSA 9", "Grade 9", "PSA 10", "Grade 10"]
         )
 
-        # Strategy B
         if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
             pm2, ls2 = _extract_price_map_generic_table(soup)
             if pm2:
@@ -639,7 +580,6 @@ def _fetch_market_prices(link: str) -> dict:
                 for lab in ["Ungraded", "Raw", "PSA 9", "Grade 9", "PSA 10", "Grade 10"]
             )
 
-        # Strategy C (JSON-LD raw only)
         if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
             j = _extract_prices_from_jsonld(soup)
             if "raw" in j and j["raw"] > 0:
@@ -649,7 +589,6 @@ def _fetch_market_prices(link: str) -> dict:
                 out["psa10"] = 0.0
                 return out
 
-        # Strategy D (final text fallback)
         if raw_val == 0.0 and psa9_val == 0.0 and psa10_val == 0.0:
             text = soup.get_text("\n", strip=True)
 
@@ -732,10 +671,10 @@ def _repull_market_values_to_inventory_sheet():
         "grading_company",
         "grade",
         "condition",
-        "market_price",              # raw/ungraded
-        "market_value",              # grade-selected
+        "market_price",
+        "market_value",
         "market_price_updated_at",
-        "market_price_debug",        # ✅ NEW
+        "market_price_debug",
     ]
 
     changed = False
@@ -764,10 +703,10 @@ def _repull_market_values_to_inventory_sheet():
     if any(x is None for x in [i_ref, i_mp, i_mv, i_mpu, i_dbg]):
         raise RuntimeError("Inventory sheet is missing required market columns after header update.")
 
-    market_price_raw = []     # writes to market_price
-    market_value_sel = []     # writes to market_value
-    market_updated_ats = []   # writes to market_price_updated_at
-    market_debug = []         # writes to market_price_debug
+    market_price_raw = []
+    market_value_sel = []
+    market_updated_ats = []
+    market_debug = []
 
     now_utc = pd.Timestamp.utcnow()
     now_iso = now_utc.isoformat()
@@ -781,13 +720,11 @@ def _repull_market_values_to_inventory_sheet():
         link_canon = _canonicalize_reference_link(link)
         ll = link_canon.lower()
 
-        # Current stored values (used for skip/cooldown logic)
         cur_mp = _to_num(r[i_mp]) if i_mp is not None and i_mp < len(r) else 0.0
         cur_mv = _to_num(r[i_mv]) if i_mv is not None and i_mv < len(r) else 0.0
         cur_mpu = (r[i_mpu] if i_mpu is not None and i_mpu < len(r) else "").strip()
         cur_dbg = (r[i_dbg] if i_dbg is not None and i_dbg < len(r) else "").strip().lower()
 
-        # timestamp age
         mpu_dt = _to_dt(cur_mpu) if cur_mpu else pd.NaT
         age_hours = None
         if pd.notna(mpu_dt):
@@ -796,7 +733,6 @@ def _repull_market_values_to_inventory_sheet():
             except Exception:
                 age_hours = None
 
-        # ✅ Cooldown for recent 429s
         if age_hours is not None and 0 <= age_hours < COOLDOWN_429_HOURS and "http_error_429" in cur_dbg:
             market_price_raw.append([float(cur_mp or 0.0)])
             market_value_sel.append([float(cur_mv or 0.0)])
@@ -804,7 +740,6 @@ def _repull_market_values_to_inventory_sheet():
             market_debug.append(["skipped_recent_429_cooldown"])
             continue
 
-        # ✅ Skip recent if within last 12h AND market_price != 0
         is_recent = False
         if age_hours is not None:
             is_recent = (age_hours >= 0 and age_hours < RECENT_HOURS)
@@ -846,7 +781,6 @@ def _repull_market_values_to_inventory_sheet():
         psa9_val = float(prices.get("psa9", 0.0) or 0.0)
         psa10_val = float(prices.get("psa10", 0.0) or 0.0)
 
-        # Use ONE final market value for both columns
         mv = raw_val
         chosen = "raw"
         if (not is_sealed) and (not is_grading) and is_graded:
@@ -863,7 +797,6 @@ def _repull_market_values_to_inventory_sheet():
                     mv = raw_val
                     chosen = "psa9_missing_fallback_to_raw"
 
-        # Keep market_price and market_value identical
         market_price_raw.append([float(mv or 0.0)])
         market_value_sel.append([float(mv or 0.0)])
         market_updated_ats.append([now_iso])
@@ -901,7 +834,6 @@ def _repull_market_values_to_inventory_sheet():
     return updated
 
 
-
 def _styler_table_header():
     return [
         {"selector": "th", "props": [("background-color", "#0f172a"), ("color", "white"), ("font-weight", "800")]},
@@ -921,8 +853,6 @@ def _style_group_and_total_rows(df: pd.DataFrame, first_col: str):
     return df.style.apply(_row_style, axis=1)
 
 
-
-# ✅ Token to force sheet reloads without clearing ALL caches (keeps _fetch_market_prices cache)
 if "refresh_token" not in st.session_state:
     st.session_state["refresh_token"] = 0
 
@@ -975,8 +905,6 @@ with top_right:
         except Exception as e:
             st.warning(f"Market refresh ran into an issue: {e}. Reloading anyway…")
 
-        # ✅ Do NOT clear global caches (causes re-scrape bursts => 429s)
-        # Instead force re-load of sheets via token.
         st.session_state["refresh_token"] += 1
         st.rerun()
 
@@ -993,16 +921,11 @@ MISC_WS = st.secrets.get("misc_worksheet", "misc")
 # =========================
 # Load all data
 # =========================
-inv = load_sheet_df(INV_WS)
-
-# Keep an unfiltered copy for LISTED lookups (do NOT filter to SOLD)
-txn_all = load_sheet_df(TXN_WS)
-
-# Existing logic below will normalize + filter txn to SOLD for sales reporting
+inv = load_sheet_df(INV_WS, st.session_state["refresh_token"])
+txn_all = load_sheet_df(TXN_WS, st.session_state["refresh_token"])
 txn = txn_all.copy()
-
-grd = load_sheet_df(GRD_WS)
-misc = load_sheet_df(MISC_WS)
+grd = load_sheet_df(GRD_WS, st.session_state["refresh_token"])
+misc = load_sheet_df(MISC_WS, st.session_state["refresh_token"])
 
 
 # =========================
@@ -1020,14 +943,12 @@ if not inv.empty:
     inv_purchase_date_col = _pick_col(inv, "purchase_date", "purchase_date")
     inv_ref_col = _pick_col(inv, "reference_link", "reference_link")
 
-    # Prefer exact lowercase column names when present
     inv_product_type_col = "product_type" if "product_type" in inv.columns else _pick_col(inv, "product_type", "product_type")
     inv_card_type_col = "card_type" if "card_type" in inv.columns else _pick_col(inv, "card_type", "card_type")
     inv_grade_col = _pick_col(inv, "grade", "grade")
     inv_company_col = _pick_col(inv, "grading_company", "grading_company")
     inv_condition_col = _pick_col(inv, "condition", "condition")
 
-    # ✅ NEW: Purchased From (for filtering)
     inv_purchased_from_col = (
         _pick_col(inv, "purchased_from", None)
         or _pick_col(inv, "purchase_from", None)
@@ -1068,7 +989,7 @@ else:
     inv = pd.DataFrame(columns=[
         inv_id_col, inv_status_col, inv_total_col, inv_purchase_date_col,
         inv_product_type_col, inv_card_type_col, inv_grade_col, inv_company_col, inv_condition_col,
-        "__purchase_dt", "__purchase_dt", "__market_price"
+        "__purchase_dt", "__market_price"
     ])
 
 
@@ -1088,7 +1009,8 @@ if not txn.empty:
     tx_fees_total_col = _pick_col(txn, "fees_total", None)
     tx_fees_col = _pick_col(txn, "fees", None) or _pick_col(txn, "platform_fees", None) or _pick_col(txn, "fee", None)
 
-    tx_card_type_col = _pick_col(txn, "card_type", None)
+    tx_card_type_col = "card_type" if "card_type" in txn.columns else _pick_col(txn, "card_type", None)
+    tx_product_type_col = "Product Type" if "Product Type" in txn.columns else _pick_col(txn, "product_type", None)
 
     if tx_date_col is None:
         txn["__sold_dt"] = pd.NaT
@@ -1112,7 +1034,6 @@ if not txn.empty:
     else:
         txn["__fees"] = 0.0
 
-    # SOLD-only alignment
     tx_status_col = _pick_col(txn, "status", None) or _pick_col(txn, "tx_status", None)
     tx_net_proceeds_col = _pick_col(txn, "net_proceeds", None) or _pick_col(txn, "net", None)
     tx_ship_charged_col = _pick_col(txn, "shipping_charged", None) or _pick_col(txn, "shipping", None)
@@ -1121,44 +1042,47 @@ if not txn.empty:
         txn["__status"] = txn[tx_status_col].astype(str).str.upper().str.strip()
         txn = txn[txn["__status"].eq("SOLD")].copy()
 
-    #Start
-    # Always capture shipping (used in tables even if net_proceeds exists)
     if tx_ship_charged_col and tx_ship_charged_col in txn.columns:
         txn["__ship_charged"] = _to_num(txn[tx_ship_charged_col])
     else:
         txn["__ship_charged"] = 0.0
 
-    # ✅ NEW: pull these directly from Transactions sheet columns if they exist
     tx_total_fees_col = (
         _pick_col(txn, "total_fees", None)
         or _pick_col(txn, "fees_total", None)
         or _pick_col(txn, "total_fee", None)
     )
     tx_profit_col = _pick_col(txn, "profit", None)
+    tx_all_in_cost_col = (
+        "All In Cost" if "All In Cost" in txn.columns else
+        _pick_col(txn, "all_in_cost", None)
+        or _pick_col(txn, "all_in", None)
+        or _pick_col(txn, "cogs", None)
+        or _pick_col(txn, "cost_of_goods", None)
+    )
 
-    # Dollar sales (gross item price)
     txn["__dollar_sales"] = _to_num(txn["__sold_price"])
 
-    # ✅ Total Fees = the Total Fees column (if present). Otherwise fallback to old logic.
     if tx_total_fees_col and tx_total_fees_col in txn.columns:
         txn["__total_fees"] = _to_num(txn[tx_total_fees_col])
     else:
         txn["__total_fees"] = (txn["__fees"] + txn["__ship_charged"]).fillna(0.0)
 
-    # ✅ Proceeds = the Net Proceeds column (if present). Otherwise fallback.
     if tx_net_proceeds_col and tx_net_proceeds_col in txn.columns:
         txn["__net"] = _to_num(txn[tx_net_proceeds_col])
     else:
         txn["__net"] = (txn["__dollar_sales"] - txn["__total_fees"]).fillna(0.0)
 
-    # ✅ Profit = the Profit column (if present). Otherwise leave NaN (we’ll fallback later where needed).
     if tx_profit_col and tx_profit_col in txn.columns:
         txn["__profit"] = _to_num(txn[tx_profit_col])
     else:
         txn["__profit"] = np.nan
-    #End
 
-    # ✅ FIX: fallback “sold rows only” guard even if status col was missing upstream
+    if tx_all_in_cost_col and tx_all_in_cost_col in txn.columns:
+        txn["__all_in_cost"] = _to_num(txn[tx_all_in_cost_col])
+    else:
+        txn["__all_in_cost"] = np.nan
+
     txn = txn[~(txn["__sold_dt"].isna() & (txn["__sold_price"] <= 0) & (txn["__net"] <= 0))].copy()
 
     txn["__sold_month"] = _month_start(txn["__sold_dt"])
@@ -1167,6 +1091,11 @@ if not txn.empty:
         txn["__txn_card_type"] = txn[tx_card_type_col].apply(_normalize_card_type)
     else:
         txn["__txn_card_type"] = ""
+
+    if tx_product_type_col and tx_product_type_col in txn.columns:
+        txn["__txn_product_type"] = txn[tx_product_type_col].astype(str).fillna("")
+    else:
+        txn["__txn_product_type"] = ""
 
 else:
     tx_date_col = None
@@ -1181,14 +1110,15 @@ else:
         "__total_fees",
         "__dollar_sales",
         "__net",
+        "__profit",
+        "__all_in_cost",
         "__txn_card_type",
+        "__txn_product_type",
     ])
-
 
 
 # =========================
 # LIST PRICE LOOKUP (from txn_all)
-# - Pull most recent LISTED transaction per inventory_id
 # =========================
 list_price_by_inv_id = {}
 
@@ -1332,7 +1262,7 @@ else:
 
 
 # =========================
-# Build Year/Month filter options (based on any activity)
+# Build Year/Month filter options
 # =========================
 def _build_year_month_options():
     months = []
@@ -1402,7 +1332,7 @@ with tab_bs:
         purchased_from_choice = st.multiselect(
             "Purchased From",
             options=purchased_from_opts,
-            default=purchased_from_opts,   # ✅ default = all
+            default=purchased_from_opts,
         )
 
     inv_f = _apply_period_filter(inv, "__purchase_dt", year_choice, month_choice) if not inv.empty else inv
@@ -1410,13 +1340,10 @@ with tab_bs:
     grd_f = _apply_period_filter(grd, "__grading_dt", year_choice, month_choice) if not grd.empty else grd
     misc_f = _apply_period_filter(misc, "__dt", year_choice, month_choice) if not misc.empty else misc
 
-    # ✅ NEW: apply Purchased From filter (inventory + sales)
     if purchased_from_choice and (not inv.empty) and (inv_purchased_from_col in inv.columns):
-        # Filter inventory lines (purchases in period)
         if not inv_f.empty and inv_purchased_from_col in inv_f.columns:
             inv_f = inv_f[inv_f[inv_purchased_from_col].astype(str).str.strip().isin(purchased_from_choice)].copy()
 
-        # Filter sales lines (sold in period) by inventory_id -> purchased_from
         allowed_ids = set(
             inv.loc[
                 inv[inv_purchased_from_col].astype(str).str.strip().isin(purchased_from_choice),
@@ -1473,11 +1400,14 @@ with tab_bs:
         return _normalize_card_type(rec.get(inv_card_type_col, ""))
 
     def _tx_card_type_rowaware(row) -> str:
-        try:
-            if "__txn_card_type" in row and _safe_str(row["__txn_card_type"]).strip():
-                return _normalize_card_type(row["__txn_card_type"])
-        except Exception:
-            pass
+        row_ct = _normalize_card_type(row.get("__txn_card_type", ""))
+        if row_ct in {"Sports", "Pokemon"}:
+            return row_ct
+
+        raw_ct = _normalize_card_type(row.get("card_type", ""))
+        if raw_ct in {"Sports", "Pokemon"}:
+            return raw_ct
+
         return _tx_card_type_from_inv(row.get("__inventory_id", ""))
 
     def _tx_product_bucket(inv_id: str) -> str:
@@ -1491,6 +1421,16 @@ with tab_bs:
             rec.get(inv_condition_col, ""),
             rec.get(inv_status_col, ""),
         )
+
+    def _tx_product_bucket_rowaware(row) -> str:
+        tx_pt = _safe_str(row.get("__txn_product_type", "")).strip().lower()
+        if tx_pt:
+            if "sealed" in tx_pt:
+                return "Sealed"
+            if "graded" in tx_pt:
+                return "Graded Cards"
+            return "Cards"
+        return _tx_product_bucket(row.get("__inventory_id", ""))
 
     def _period_end_dt(year_choice: str, month_choice: str) -> pd.Timestamp:
         today = pd.Timestamp(date.today())
@@ -1514,14 +1454,12 @@ with tab_bs:
         inv_holdings[inv_id_col] = inv_holdings[inv_id_col].apply(lambda x: _safe_str(x).strip())
         inv_holdings["__status_upper"] = inv_holdings[inv_status_col].astype(str).str.upper().str.strip()
 
-        # ✅ FIX: use current inventory_status for holdings instead of transaction-derived sold logic
         inv_holdings = inv_holdings[
             inv_holdings["__purchase_dt"].notna()
             & (inv_holdings["__purchase_dt"] <= asof_cutoff)
             & (inv_holdings["__status_upper"].isin(["ACTIVE", "LISTED", "GRADING"]))
         ].copy()
 
-        # ✅ Purchased From filter applies to holdings/listings too
         if purchased_from_choice and inv_purchased_from_col in inv_holdings.columns:
             inv_holdings = inv_holdings[
                 inv_holdings[inv_purchased_from_col].astype(str).str.strip().isin(purchased_from_choice)
@@ -1562,7 +1500,6 @@ with tab_bs:
             mask_grading = inv_asof["__status_upper"] == "GRADING"
             inv_asof.loc[mask_grading, "__cost"] = inv_asof.loc[mask_grading, "__cost"] + inv_asof.loc[mask_grading, "__grading_cost_inflight"]
 
-            # ✅ CHANGED: use market_value column directly for these table totals
             inv_asof["__mv"] = 0.0
             market_value_col_assets = _pick_col(inv_asof, "market_value", None)
             if market_value_col_assets and market_value_col_assets in inv_asof.columns:
@@ -1660,7 +1597,6 @@ with tab_bs:
                 inv_listed["__card_type"] = inv_listed[inv_card_type_col].apply(_normalize_card_type)
                 inv_listed = inv_listed[inv_listed["__card_type"].isin(["Sports", "Pokemon"])].copy()
 
-                # ✅ CHANGED: use market_value column directly for these table totals
                 inv_listed["__mv"] = 0.0
                 market_value_col_listed = _pick_col(inv_listed, "market_value", None)
                 if market_value_col_listed and market_value_col_listed in inv_listed.columns:
@@ -1669,7 +1605,6 @@ with tab_bs:
                 inv_listed["__inv_id_key"] = inv_listed[inv_id_col].apply(lambda x: _safe_str(x).strip())
                 inv_listed["__list_price"] = inv_listed["__inv_id_key"].map(list_price_by_inv_id).fillna(0.0)
 
-                # Cost of goods = inventory total + any unsynced grading costs tied to that inventory_id
                 inv_listed["__grading_cost_unsynced"] = inv_listed["__inv_id_key"].map(grading_cost_by_inv_id).fillna(0.0)
                 inv_listed["__cogs"] = _to_num(inv_listed[inv_total_col]) + _to_num(inv_listed["__grading_cost_unsynced"])
 
@@ -1708,7 +1643,9 @@ with tab_bs:
         )
         st.dataframe(sty_listed, use_container_width=True, hide_index=True)
 
-        # BOTTOM TABLE: Sales (in period)
+        # -------------------------
+        # Sales
+        # -------------------------
         st.markdown("### Sales")
         if txn_f.empty:
             st.info("No sales in selected period.")
@@ -1722,7 +1659,8 @@ with tab_bs:
         else:
             tx = txn_f.copy()
             tx["__card_type"] = tx.apply(_tx_card_type_rowaware, axis=1)
-            tx["__bucket"] = tx["__inventory_id"].map(_tx_product_bucket).fillna("Cards")
+            tx = tx[tx["__card_type"].isin(["Sports", "Pokemon"])].copy()
+            tx["__bucket"] = tx.apply(_tx_product_bucket_rowaware, axis=1)
 
             if "__dollar_sales" not in tx.columns:
                 tx["__dollar_sales"] = _to_num(tx.get("__sold_price", 0.0))
@@ -1730,41 +1668,6 @@ with tab_bs:
                 tx["__total_fees"] = _to_num(tx.get("__fees", 0.0)) + _to_num(tx.get("__ship_charged", 0.0))
             if "__net" not in tx.columns:
                 tx["__net"] = (tx["__dollar_sales"] - tx["__total_fees"]).fillna(0.0)
-
-            def _pick_raw_col(df: pd.DataFrame, name: str):
-                target = _norm_key(name)
-                for c in df.columns:
-                    sc = str(c)
-                    if sc.startswith("__"):
-                        continue
-                    if _norm_key(_base_col(sc)) == target:
-                        return c
-                return None
-
-            raw_total_fees_col = (
-                _pick_raw_col(tx, "total_fees")
-                or _pick_raw_col(tx, "fees_total")
-                or _pick_raw_col(tx, "total_fee")
-            )
-            raw_net_proceeds_col = (
-                _pick_raw_col(tx, "net_proceeds")
-                or _pick_raw_col(tx, "net_proceed")
-                or _pick_raw_col(tx, "proceeds")
-            )
-            raw_profit_col = _pick_raw_col(tx, "profit")
-
-            raw_all_in_cost_col = (
-                _pick_raw_col(tx, "all_in_cost")
-                or _pick_raw_col(tx, "all_in")
-                or _pick_raw_col(tx, "cogs")
-                or _pick_raw_col(tx, "cost_of_goods")
-            )
-
-            if raw_total_fees_col:
-                tx["__total_fees"] = _to_num(tx[raw_total_fees_col]).fillna(0.0)
-
-            if raw_net_proceeds_col:
-                tx["__net"] = _to_num(tx[raw_net_proceeds_col]).fillna(0.0)
 
             def _cogs_for_inv_id(inv_id: str) -> float:
                 k = _safe_str(inv_id).strip()
@@ -1775,13 +1678,22 @@ with tab_bs:
                 add = float(grading_cost_by_inv_id.get(k, 0.0) or 0.0)
                 return float(base + add)
 
-            if raw_all_in_cost_col:
-                tx["__cogs"] = _to_num(tx[raw_all_in_cost_col]).fillna(0.0)
+            if "__all_in_cost" in tx.columns:
+                tx["__cogs"] = _to_num(tx["__all_in_cost"])
+                tx["__cogs"] = np.where(
+                    tx["__cogs"] > 0,
+                    tx["__cogs"],
+                    tx["__inventory_id"].apply(_cogs_for_inv_id)
+                )
             else:
                 tx["__cogs"] = tx["__inventory_id"].apply(_cogs_for_inv_id)
 
-            if raw_profit_col:
-                tx["__profit"] = _to_num(tx[raw_profit_col]).fillna(0.0)
+            if "__profit" in tx.columns:
+                tx["__profit"] = np.where(
+                    pd.notna(tx["__profit"]),
+                    _to_num(tx["__profit"]),
+                    (tx["__net"] - tx["__cogs"]).fillna(0.0)
+                )
             else:
                 tx["__profit"] = (tx["__net"] - tx["__cogs"]).fillna(0.0)
 
