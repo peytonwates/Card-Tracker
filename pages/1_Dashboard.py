@@ -264,8 +264,8 @@ def _bucket_product(product_type, grading_company, grade, condition, inv_status)
 
 def _normalize_card_type(val: str) -> str:
     """
-    User requirement: ONLY Pokemon or Sports. Never show 'Other'.
-    Default any unknown/blank to Pokemon.
+    User requirement: ONLY Pokemon or Sports.
+    Unknown / blank values should not default to Pokemon.
     """
     s = _safe_str(val).strip().lower()
     if s == "sports":
@@ -276,7 +276,7 @@ def _normalize_card_type(val: str) -> str:
         return "Sports"
     if "pok" in s or "pokemon" in s:
         return "Pokemon"
-    return "Pokemon"
+    return ""
 
 
 # =========================
@@ -1020,8 +1020,9 @@ if not inv.empty:
     inv_purchase_date_col = _pick_col(inv, "purchase_date", "purchase_date")
     inv_ref_col = _pick_col(inv, "reference_link", "reference_link")
 
-    inv_product_type_col = _pick_col(inv, "product_type", "product_type")
-    inv_card_type_col = _pick_col(inv, "card_type", "card_type")
+    # Prefer exact lowercase column names when present
+    inv_product_type_col = "product_type" if "product_type" in inv.columns else _pick_col(inv, "product_type", "product_type")
+    inv_card_type_col = "card_type" if "card_type" in inv.columns else _pick_col(inv, "card_type", "card_type")
     inv_grade_col = _pick_col(inv, "grade", "grade")
     inv_company_col = _pick_col(inv, "grading_company", "grading_company")
     inv_condition_col = _pick_col(inv, "condition", "condition")
@@ -1034,7 +1035,6 @@ if not inv.empty:
         or "purchased_from"
     )
 
-
     inv_market_col = _pick_col(inv, "market_value", None) or _pick_col(inv, "market_price", None)
 
     for needed in [inv_id_col, inv_status_col, inv_total_col, inv_purchase_date_col, inv_ref_col]:
@@ -1044,7 +1044,6 @@ if not inv.empty:
     for needed in [inv_product_type_col, inv_card_type_col, inv_grade_col, inv_company_col, inv_condition_col, inv_purchased_from_col]:
         if needed not in inv.columns:
             inv[needed] = ""
-
 
     inv[inv_status_col] = inv[inv_status_col].replace("", "ACTIVE").fillna("ACTIVE").astype(str)
     inv[inv_total_col] = _to_num(inv[inv_total_col])
@@ -1069,7 +1068,7 @@ else:
     inv = pd.DataFrame(columns=[
         inv_id_col, inv_status_col, inv_total_col, inv_purchase_date_col,
         inv_product_type_col, inv_card_type_col, inv_grade_col, inv_company_col, inv_condition_col,
-        "__purchase_dt","__purchase_dt", "__market_price"
+        "__purchase_dt", "__purchase_dt", "__market_price"
     ])
 
 
@@ -1121,6 +1120,7 @@ if not txn.empty:
     if tx_status_col and tx_status_col in txn.columns:
         txn["__status"] = txn[tx_status_col].astype(str).str.upper().str.strip()
         txn = txn[txn["__status"].eq("SOLD")].copy()
+
     #Start
     # Always capture shipping (used in tables even if net_proceeds exists)
     if tx_ship_charged_col and tx_ship_charged_col in txn.columns:
@@ -1157,6 +1157,7 @@ if not txn.empty:
     else:
         txn["__profit"] = np.nan
     #End
+
     # ✅ FIX: fallback “sold rows only” guard even if status col was missing upstream
     txn = txn[~(txn["__sold_dt"].isna() & (txn["__sold_price"] <= 0) & (txn["__net"] <= 0))].copy()
 
@@ -1468,7 +1469,7 @@ with tab_bs:
     def _tx_card_type_from_inv(inv_id: str) -> str:
         rec = inv_by_id.get(_safe_str(inv_id).strip())
         if rec is None:
-            return "Pokemon"
+            return ""
         return _normalize_card_type(rec.get(inv_card_type_col, ""))
 
     def _tx_card_type_rowaware(row) -> str:
@@ -1505,28 +1506,22 @@ with tab_bs:
                 pass
         return today + pd.Timedelta(hours=23, minutes=59, seconds=59)
 
-    sold_dt_by_id = {}
-    if not txn.empty and "__sold_dt" in txn.columns and "__inventory_id" in txn.columns:
-        tmp = txn[["__inventory_id", "__sold_dt"]].copy().dropna(subset=["__sold_dt"])
-        if not tmp.empty:
-            sold_dt_by_id = tmp.groupby("__inventory_id")["__sold_dt"].min().to_dict()
-
     asof_cutoff = _period_end_dt(year_choice, month_choice)
 
     inv_holdings = pd.DataFrame()
     if not inv.empty and "__purchase_dt" in inv.columns:
         inv_holdings = inv.copy()
         inv_holdings[inv_id_col] = inv_holdings[inv_id_col].apply(lambda x: _safe_str(x).strip())
-        inv_holdings["__sold_dt"] = inv_holdings[inv_id_col].map(sold_dt_by_id)
-        inv_holdings["__sold_dt"] = _to_dt(inv_holdings["__sold_dt"])
+        inv_holdings["__status_upper"] = inv_holdings[inv_status_col].astype(str).str.upper().str.strip()
 
+        # ✅ FIX: use current inventory_status for holdings instead of transaction-derived sold logic
         inv_holdings = inv_holdings[
             inv_holdings["__purchase_dt"].notna()
             & (inv_holdings["__purchase_dt"] <= asof_cutoff)
-            & (inv_holdings["__sold_dt"].isna() | (inv_holdings["__sold_dt"] > asof_cutoff))
+            & (inv_holdings["__status_upper"].isin(["ACTIVE", "LISTED", "GRADING"]))
         ].copy()
 
-        # ✅ NEW: Purchased From filter applies to holdings/listings too
+        # ✅ Purchased From filter applies to holdings/listings too
         if purchased_from_choice and inv_purchased_from_col in inv_holdings.columns:
             inv_holdings = inv_holdings[
                 inv_holdings[inv_purchased_from_col].astype(str).str.strip().isin(purchased_from_choice)
@@ -1546,6 +1541,8 @@ with tab_bs:
         else:
             inv_asof = inv_holdings.copy()
             inv_asof["__card_type"] = inv_asof[inv_card_type_col].apply(_normalize_card_type)
+            inv_asof = inv_asof[inv_asof["__card_type"].isin(["Sports", "Pokemon"])].copy()
+
             inv_asof["__bucket"] = inv_asof.apply(
                 lambda r: _bucket_product(
                     r.get(inv_product_type_col, ""),
@@ -1661,6 +1658,7 @@ with tab_bs:
                 }])
             else:
                 inv_listed["__card_type"] = inv_listed[inv_card_type_col].apply(_normalize_card_type)
+                inv_listed = inv_listed[inv_listed["__card_type"].isin(["Sports", "Pokemon"])].copy()
 
                 # ✅ CHANGED: use market_value column directly for these table totals
                 inv_listed["__mv"] = 0.0
