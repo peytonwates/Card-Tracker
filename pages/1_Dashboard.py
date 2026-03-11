@@ -846,10 +846,7 @@ def _repull_market_values_to_inventory_sheet():
         psa9_val = float(prices.get("psa9", 0.0) or 0.0)
         psa10_val = float(prices.get("psa10", 0.0) or 0.0)
 
-        # market_price should always be raw/ungraded
-        market_price_raw.append([raw_val])
-
-        # market_value is chosen based on inventory grade when applicable
+        # Use ONE final market value for both columns
         mv = raw_val
         chosen = "raw"
         if (not is_sealed) and (not is_grading) and is_graded:
@@ -866,6 +863,8 @@ def _repull_market_values_to_inventory_sheet():
                     mv = raw_val
                     chosen = "psa9_missing_fallback_to_raw"
 
+        # Keep market_price and market_value identical
+        market_price_raw.append([float(mv or 0.0)])
         market_value_sel.append([float(mv or 0.0)])
         market_updated_ats.append([now_iso])
 
