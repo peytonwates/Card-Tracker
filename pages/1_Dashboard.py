@@ -1907,6 +1907,8 @@ with tab_forecast:
     grd_f2 = _apply_period_filter(grd, "__grading_dt", year_choice_2, month_choice_2) if not grd.empty else grd
     misc_f2 = _apply_period_filter(misc, "__dt", year_choice_2, month_choice_2) if not misc.empty else misc
 
+    today_norm_2 = pd.Timestamp.today().normalize()
+
     # -------------------------
     # Apply dimension filters (Purchased From, Product Type, Card Type)
     # - Inventory is filtered directly
@@ -1961,8 +1963,14 @@ with tab_forecast:
         # Apply date filter for "expenses" view from grading_dt
         grd_f2 = _apply_period_filter(gtmp, "__grading_dt", year_choice_2, month_choice_2) if "__grading_dt" in gtmp.columns else gtmp
 
-        # Open grading for forecast (future months) -> do NOT apply month filter by grading_dt; use est_return_dt later
+        # Open grading for forecast (future/current-month returns still pending)
+        # IMPORTANT: use actual estimated_return_date >= today so current-month returns still show up
         open_grading_2 = gtmp[gtmp["__status"].isin(["SUBMITTED", "IN_GRADING", "SENT", "IN_TRANSIT"])].copy() if "__status" in gtmp.columns else pd.DataFrame()
+        if not open_grading_2.empty and "__est_return_dt" in open_grading_2.columns:
+            open_grading_2 = open_grading_2[
+                open_grading_2["__est_return_dt"].notna()
+                & (open_grading_2["__est_return_dt"] >= today_norm_2)
+            ].copy()
     else:
         open_grading_2 = pd.DataFrame()
 
@@ -2187,12 +2195,13 @@ with tab_forecast:
     # Chart 2: Net Profit Trend (CUMULATIVE actual through current month + dotted upside/downside)
     #   - cumulative = cumulative(Sales - Expenses) up to current month
     #   - dotted forecasts = cumulative + cumulative(market value of open grading by est return month)
+    #   - IMPORTANT: include current-month grading returns if estimated_return_date >= today
     # -------------------------
     with top_r:
         st.markdown("### Net Profit Trend")
 
         current_month = pd.Timestamp(date.today().replace(day=1))
-        next_month = current_month + pd.offsets.MonthBegin(1)
+        today_norm = pd.Timestamp.today().normalize()
 
         # --- Reuse monthly sales/expenses logic for cumulative net
         sales_m2 = pd.DataFrame(columns=["month", "sales"])
@@ -2236,6 +2245,14 @@ with tab_forecast:
 
         if not open_grading_2.empty and "__est_return_month" in open_grading_2.columns:
             og = open_grading_2.dropna(subset=["__est_return_month"]).copy()
+
+            # Keep only submissions that are still pending return as of today
+            if "__est_return_dt" in og.columns:
+                og = og[
+                    og["__est_return_dt"].notna()
+                    & (og["__est_return_dt"] >= today_norm)
+                ].copy()
+
             og["__mv_up"] = _to_num(og.get("__psa10", 0.0)).fillna(0.0)  # market value upside
             og["__mv_dn"] = _to_num(og.get("__psa9", 0.0)).fillna(0.0)   # market value downside
 
@@ -2284,8 +2301,9 @@ with tab_forecast:
         cum_at_current = float(trend.loc[trend["month"] == current_month, "cum_actual"].iloc[0]) if (trend["month"] == current_month).any() else float(trend["cum_actual"].iloc[-1])
 
         # Forecast cumulative (market value adds on return months)
-        trend["mv_up_piece"] = np.where(trend["month"] >= next_month, trend["mv_up"], 0.0)
-        trend["mv_dn_piece"] = np.where(trend["month"] >= next_month, trend["mv_dn"], 0.0)
+        # IMPORTANT: include CURRENT MONTH if estimated return date is still ahead of today
+        trend["mv_up_piece"] = np.where(trend["month"] >= current_month, trend["mv_up"], 0.0)
+        trend["mv_dn_piece"] = np.where(trend["month"] >= current_month, trend["mv_dn"], 0.0)
 
         trend["cum_up"] = cum_at_current + trend["mv_up_piece"].cumsum()
         trend["cum_dn"] = cum_at_current + trend["mv_dn_piece"].cumsum()
@@ -2372,7 +2390,8 @@ with tab_forecast:
                 ],
             )
 
-            pts_only = pts[pts["month"] >= next_month].copy()
+            # INCLUDE current month point/label too, so current-month return bumps are visible
+            pts_only = pts[pts["month"] >= current_month].copy()
 
             pts_layer = alt.Chart(pts_only).mark_point(size=55, filled=True).encode(
                 x="month:T",
@@ -2475,7 +2494,6 @@ with tab_forecast:
                     delta=f"{dwell_delta_val:+.1f} vs target",
                     delta_color="inverse",  # ✅ negative is green, positive is red
                 )
-
 
             # Pokemon gradable rate = # sent in / # purchased (Pokemon cards only) target 50% (higher is better)
             pokemon_purchased = 0
@@ -2596,6 +2614,3 @@ with tab_forecast:
                 st.altair_chart(chart_exp + exp_labels, use_container_width=True)
             else:
                 st.info("No expenses found for the selected filters.")
-
-
-
