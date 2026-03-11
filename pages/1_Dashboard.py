@@ -1035,7 +1035,7 @@ if not inv.empty:
     )
 
 
-    inv_market_col = _pick_col(inv, "market_price", None) or _pick_col(inv, "market_value", None)
+    inv_market_col = _pick_col(inv, "market_value", None) or _pick_col(inv, "market_price", None)
 
     for needed in [inv_id_col, inv_status_col, inv_total_col, inv_purchase_date_col, inv_ref_col]:
         if needed not in inv.columns:
@@ -1404,13 +1404,12 @@ with tab_bs:
             default=purchased_from_opts,   # ✅ default = all
         )
 
-
     inv_f = _apply_period_filter(inv, "__purchase_dt", year_choice, month_choice) if not inv.empty else inv
     txn_f = _apply_period_filter(txn, "__sold_dt", year_choice, month_choice) if not txn.empty else txn
     grd_f = _apply_period_filter(grd, "__grading_dt", year_choice, month_choice) if not grd.empty else grd
     misc_f = _apply_period_filter(misc, "__dt", year_choice, month_choice) if not misc.empty else misc
 
-        # ✅ NEW: apply Purchased From filter (inventory + sales)
+    # ✅ NEW: apply Purchased From filter (inventory + sales)
     if purchased_from_choice and (not inv.empty) and (inv_purchased_from_col in inv.columns):
         # Filter inventory lines (purchases in period)
         if not inv_f.empty and inv_purchased_from_col in inv_f.columns:
@@ -1426,7 +1425,6 @@ with tab_bs:
 
         if not txn_f.empty and "__inventory_id" in txn_f.columns:
             txn_f = txn_f[txn_f["__inventory_id"].astype(str).str.strip().isin(allowed_ids)].copy()
-
 
     inv_by_id = {}
     if not inv.empty:
@@ -1528,13 +1526,11 @@ with tab_bs:
             & (inv_holdings["__sold_dt"].isna() | (inv_holdings["__sold_dt"] > asof_cutoff))
         ].copy()
 
-
-                # ✅ NEW: Purchased From filter applies to holdings/listings too
+        # ✅ NEW: Purchased From filter applies to holdings/listings too
         if purchased_from_choice and inv_purchased_from_col in inv_holdings.columns:
             inv_holdings = inv_holdings[
                 inv_holdings[inv_purchased_from_col].astype(str).str.strip().isin(purchased_from_choice)
             ].copy()
-
 
     # -------------------------
     # ASSETS
@@ -1569,9 +1565,11 @@ with tab_bs:
             mask_grading = inv_asof["__status_upper"] == "GRADING"
             inv_asof.loc[mask_grading, "__cost"] = inv_asof.loc[mask_grading, "__cost"] + inv_asof.loc[mask_grading, "__grading_cost_inflight"]
 
+            # ✅ CHANGED: use market_value column directly for these table totals
             inv_asof["__mv"] = 0.0
-            if "__market_price" in inv_asof.columns:
-                inv_asof["__mv"] = _to_num(inv_asof["__market_price"])
+            market_value_col_assets = _pick_col(inv_asof, "market_value", None)
+            if market_value_col_assets and market_value_col_assets in inv_asof.columns:
+                inv_asof["__mv"] = _to_num(inv_asof[market_value_col_assets])
 
             rows = []
             for ct in ["Sports", "Pokemon"]:
@@ -1641,14 +1639,11 @@ with tab_bs:
         st.dataframe(sty2, use_container_width=True, hide_index=True)
 
     # -------------------------
-    # -------------------------
     # SALES (right side)
     # -------------------------
     with right:
         st.markdown("### Listings")
 
-        # TOP TABLE: Listed Items overview
-        # TOP TABLE: Listed Items overview
         if inv_holdings.empty:
             listed_df = pd.DataFrame(columns=["Listed Items", "# of items", "Cost of Goods", "List Price Total", "Market Value"])
         else:
@@ -1666,7 +1661,12 @@ with tab_bs:
                 }])
             else:
                 inv_listed["__card_type"] = inv_listed[inv_card_type_col].apply(_normalize_card_type)
-                inv_listed["__mv"] = _to_num(inv_listed.get("__market_price", 0.0))
+
+                # ✅ CHANGED: use market_value column directly for these table totals
+                inv_listed["__mv"] = 0.0
+                market_value_col_listed = _pick_col(inv_listed, "market_value", None)
+                if market_value_col_listed and market_value_col_listed in inv_listed.columns:
+                    inv_listed["__mv"] = _to_num(inv_listed[market_value_col_listed])
 
                 inv_listed["__inv_id_key"] = inv_listed[inv_id_col].apply(lambda x: _safe_str(x).strip())
                 inv_listed["__list_price"] = inv_listed["__inv_id_key"].map(list_price_by_inv_id).fillna(0.0)
@@ -1726,7 +1726,6 @@ with tab_bs:
             tx["__card_type"] = tx.apply(_tx_card_type_rowaware, axis=1)
             tx["__bucket"] = tx["__inventory_id"].map(_tx_product_bucket).fillna("Cards")
 
-            # Ensure these exist (older cached frames, etc.)
             if "__dollar_sales" not in tx.columns:
                 tx["__dollar_sales"] = _to_num(tx.get("__sold_price", 0.0))
             if "__total_fees" not in tx.columns:
@@ -1734,7 +1733,6 @@ with tab_bs:
             if "__net" not in tx.columns:
                 tx["__net"] = (tx["__dollar_sales"] - tx["__total_fees"]).fillna(0.0)
 
-            # ✅ Use raw Transactions columns if present (Total Fees / Net Proceeds / Profit / All In Cost)
             def _pick_raw_col(df: pd.DataFrame, name: str):
                 target = _norm_key(name)
                 for c in df.columns:
@@ -1757,7 +1755,6 @@ with tab_bs:
             )
             raw_profit_col = _pick_raw_col(tx, "profit")
 
-            # ✅ THIS is the COGS fix you want
             raw_all_in_cost_col = (
                 _pick_raw_col(tx, "all_in_cost")
                 or _pick_raw_col(tx, "all_in")
@@ -1771,9 +1768,6 @@ with tab_bs:
             if raw_net_proceeds_col:
                 tx["__net"] = _to_num(tx[raw_net_proceeds_col]).fillna(0.0)
 
-            # COGS per sold line:
-            # ✅ prefer Transactions "All In Cost"
-            # fallback = inventory total + unsynced grading cost
             def _cogs_for_inv_id(inv_id: str) -> float:
                 k = _safe_str(inv_id).strip()
                 rec = inv_by_id.get(k)
@@ -1788,7 +1782,6 @@ with tab_bs:
             else:
                 tx["__cogs"] = tx["__inventory_id"].apply(_cogs_for_inv_id)
 
-            # Profit = Profit column if present, otherwise fallback
             if raw_profit_col:
                 tx["__profit"] = _to_num(tx[raw_profit_col]).fillna(0.0)
             else:
