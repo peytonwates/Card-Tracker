@@ -71,6 +71,7 @@ SPORT_TOKENS = {
 }
 
 # Columns stored in Google Sheets (internal names)
+# Columns stored in Google Sheets (internal names)
 DEFAULT_COLUMNS = [
     "inventory_id",
     "image_url",
@@ -92,7 +93,9 @@ DEFAULT_COLUMNS = [
     "purchase_price",
     "shipping",
     "tax",
-    "total_price",
+    "total_price",             # purchase + shipping + tax
+    "grading_fee",             # added
+    "total_cost",              # total_price + grading_fee
     "condition",               # raw card condition; sealed="Sealed"; graded="Graded"
     "notes",
     "created_at",
@@ -104,8 +107,16 @@ DEFAULT_COLUMNS = [
     "market_price_updated_at",
 ]
 
-
-NUMERIC_COLS = ["purchase_price", "shipping", "tax", "total_price", "market_price", "market_value"]
+NUMERIC_COLS = [
+    "purchase_price",
+    "shipping",
+    "tax",
+    "total_price",
+    "grading_fee",
+    "total_cost",
+    "market_price",
+    "market_value",
+]
 
 
 # Support both header styles if sheet was edited manually
@@ -798,6 +809,9 @@ def _money(x) -> float:
 def _compute_total(purchase_price, shipping, tax):
     return round(_money(purchase_price) + _money(shipping) + _money(tax), 2)
 
+def _compute_total_cost(total_price, grading_fee):
+    return round(_money(total_price) + _money(grading_fee), 2)
+
 def _safe_money_display(x):
     if pd.isna(x) or x is None or x == "":
         return ""
@@ -865,9 +879,27 @@ def sheets_load_inventory() -> pd.DataFrame:
     df = df[[c for c in DEFAULT_COLUMNS if c in df.columns]].copy()
 
     # numeric cleanup
+    # numeric cleanup
     for c in NUMERIC_COLS:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+    # keep total_price and total_cost consistent
+    if set(["purchase_price", "shipping", "tax"]).issubset(df.columns):
+        df["total_price"] = (
+            pd.to_numeric(df["purchase_price"], errors="coerce").fillna(0.0)
+            + pd.to_numeric(df["shipping"], errors="coerce").fillna(0.0)
+            + pd.to_numeric(df["tax"], errors="coerce").fillna(0.0)
+        ).round(2)
+
+    if "grading_fee" not in df.columns:
+        df["grading_fee"] = 0.0
+    df["grading_fee"] = pd.to_numeric(df["grading_fee"], errors="coerce").fillna(0.0)
+
+    df["total_cost"] = (
+        pd.to_numeric(df["total_price"], errors="coerce").fillna(0.0)
+        + pd.to_numeric(df["grading_fee"], errors="coerce").fillna(0.0)
+    ).round(2)
 
     # normalize defaults
     df["inventory_id"] = df["inventory_id"].astype(str)
@@ -1180,6 +1212,8 @@ with tab_new:
                         "shipping": float(shipping),
                         "tax": float(tax),
                         "total_price": float(total_price),
+                        "grading_fee": 0.0,
+                        "total_cost": float(_compute_total_cost(total_price, 0.0)),
                         "condition": "Sealed" if product_type == "Sealed" else ("Graded" if product_type == "Graded Card" else condition),
                         "notes": notes.strip() if notes else "",
                         "created_at": pd.Timestamp.utcnow().isoformat(),
@@ -1284,18 +1318,33 @@ with tab_list:
 
         st.caption(f"Showing {len(filtered):,} of {len(df_all):,} items")
 
-        # ---- compute Est Profit (market_price - total_price) ----
-        # ensure numeric (defensive)
-        for c in ["purchase_price", "shipping", "tax", "total_price", "market_price", "market_value"]:
+        # ---- compute Total Cost + Est Profit ----
+        for c in [
+            "purchase_price",
+            "shipping",
+            "tax",
+            "total_price",
+            "grading_fee",
+            "total_cost",
+            "market_price",
+            "market_value",
+        ]:
             if c in filtered.columns:
                 filtered[c] = pd.to_numeric(filtered[c], errors="coerce").fillna(0.0)
 
         if "total_price" not in filtered.columns:
             filtered["total_price"] = 0.0
+        if "grading_fee" not in filtered.columns:
+            filtered["grading_fee"] = 0.0
         if "market_price" not in filtered.columns:
             filtered["market_price"] = 0.0
 
-        filtered["est_profit"] = (filtered["market_price"] - filtered["total_price"]).round(2)
+        filtered["total_cost"] = (
+            pd.to_numeric(filtered["total_price"], errors="coerce").fillna(0.0)
+            + pd.to_numeric(filtered["grading_fee"], errors="coerce").fillna(0.0)
+        ).round(2)
+
+        filtered["est_profit"] = (filtered["market_price"] - filtered["total_cost"]).round(2)
 
         # enforce condition invariants for display
         filtered = filtered.copy()
@@ -1309,6 +1358,8 @@ with tab_list:
             "purchase_price",
             "shipping",
             "tax",
+            "grading_fee",
+            "total_cost",
             "condition",
             "inventory_status",
             "market_price",
@@ -1322,11 +1373,9 @@ with tab_list:
         display.insert(0, "delete", False)
 
         # ---- Make rows/images larger (CSS) ----
-        # Note: Streamlit table internals can change; this is best-effort but works in most recent builds.
         st.markdown(
             """
             <style>
-              /* Increase row height + image size inside Streamlit Data Editor */
               div[data-testid="stDataFrame"] img {
                 height: 70px !important;
                 object-fit: contain !important;
@@ -1347,7 +1396,7 @@ with tab_list:
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
-            height=720,  # bigger viewport so rows feel larger
+            height=720,
             column_config={
                 "delete": st.column_config.CheckboxColumn("Delete", help="Check to delete this row"),
                 "inventory_id": st.column_config.TextColumn("Inventory ID", disabled=True),
@@ -1355,19 +1404,20 @@ with tab_list:
                 "purchase_price": st.column_config.NumberColumn("Purchase Price", format="$%.2f"),
                 "shipping": st.column_config.NumberColumn("Shipping", format="$%.2f"),
                 "tax": st.column_config.NumberColumn("Tax", format="$%.2f"),
+                "grading_fee": st.column_config.NumberColumn("Grading Fee", format="$%.2f"),
+                "total_cost": st.column_config.NumberColumn("Total Cost", format="$%.2f", disabled=True),
                 "condition": st.column_config.TextColumn("Condition"),
                 "inventory_status": st.column_config.TextColumn("Status"),
                 "market_price": st.column_config.NumberColumn("Market Price", format="$%.2f"),
                 "est_profit": st.column_config.NumberColumn("Est Profit", format="$%.2f", disabled=True),
             },
-            disabled=["est_profit"],  # keep computed
+            disabled=["total_cost", "est_profit"],
         )
 
         # ---- Profit/Loss highlighted view (read-only, styled) ----
-        # We show this right below so you still get the green/red rows you asked for.
         view = edited.drop(columns=["delete"], errors="ignore").copy()
-        # re-coerce
-        for c in ["purchase_price", "shipping", "tax", "market_price", "est_profit"]:
+
+        for c in ["purchase_price", "shipping", "tax", "grading_fee", "total_cost", "market_price", "est_profit"]:
             if c in view.columns:
                 view[c] = pd.to_numeric(view[c], errors="coerce").fillna(0.0)
 
@@ -1392,6 +1442,8 @@ with tab_list:
                 "purchase_price": st.column_config.NumberColumn("Purchase Price", format="$%.2f"),
                 "shipping": st.column_config.NumberColumn("Shipping", format="$%.2f"),
                 "tax": st.column_config.NumberColumn("Tax", format="$%.2f"),
+                "grading_fee": st.column_config.NumberColumn("Grading Fee", format="$%.2f"),
+                "total_cost": st.column_config.NumberColumn("Total Cost", format="$%.2f"),
                 "market_price": st.column_config.NumberColumn("Market Price", format="$%.2f"),
                 "est_profit": st.column_config.NumberColumn("Est Profit", format="$%.2f"),
             },
@@ -1419,7 +1471,7 @@ with tab_list:
             edited_core = edited.drop(columns=["delete"], errors="ignore").copy()
 
             # numeric cleanup on edited columns
-            for c in ["purchase_price", "shipping", "tax", "market_price"]:
+            for c in ["purchase_price", "shipping", "tax", "grading_fee", "market_price"]:
                 if c in edited_core.columns:
                     edited_core[c] = pd.to_numeric(edited_core[c], errors="coerce").fillna(0.0)
 
@@ -1430,25 +1482,44 @@ with tab_list:
             edited_core["inventory_id"] = edited_core["inventory_id"].astype(str)
 
             # columns user is allowed to change in this compact view
-            updatable_cols = ["purchase_price", "shipping", "tax", "condition", "inventory_status", "market_price"]
+            updatable_cols = [
+                "purchase_price",
+                "shipping",
+                "tax",
+                "grading_fee",
+                "condition",
+                "inventory_status",
+                "market_price",
+            ]
             updatable_cols = [c for c in updatable_cols if c in edited_core.columns and c in updated_full.columns]
 
             # update row-by-row by inventory_id
             edit_map = edited_core.set_index("inventory_id")[updatable_cols]
             updated_full = updated_full.set_index("inventory_id")
+
             # Only apply to ids present in edit_map (i.e., currently filtered rows)
+            valid_ids = edit_map.index.intersection(updated_full.index)
             for col in updatable_cols:
-                updated_full.loc[edit_map.index, col] = edit_map[col]
+                updated_full.loc[valid_ids, col] = edit_map.loc[valid_ids, col]
 
             updated_full = updated_full.reset_index()
 
-            # recompute total_price if possible
+            # recompute total_price and total_cost
             if set(["purchase_price", "shipping", "tax"]).issubset(updated_full.columns):
                 updated_full["total_price"] = (
                     pd.to_numeric(updated_full["purchase_price"], errors="coerce").fillna(0.0)
                     + pd.to_numeric(updated_full["shipping"], errors="coerce").fillna(0.0)
                     + pd.to_numeric(updated_full["tax"], errors="coerce").fillna(0.0)
                 ).round(2)
+
+            if "grading_fee" not in updated_full.columns:
+                updated_full["grading_fee"] = 0.0
+            updated_full["grading_fee"] = pd.to_numeric(updated_full["grading_fee"], errors="coerce").fillna(0.0)
+
+            updated_full["total_cost"] = (
+                pd.to_numeric(updated_full["total_price"], errors="coerce").fillna(0.0)
+                + pd.to_numeric(updated_full["grading_fee"], errors="coerce").fillna(0.0)
+            ).round(2)
 
             # keep market_value synced (your existing rule)
             if "market_price" in updated_full.columns and "market_value" in updated_full.columns:
@@ -1460,7 +1531,10 @@ with tab_list:
             updated_full.loc[updated_full["product_type"] == "Graded Card", "condition"] = "Graded"
 
             # clear fields based on product_type rules (kept from your existing logic)
-            updated_full.loc[updated_full["product_type"] == "Sealed", ["variant", "card_subtype", "card_number", "grading_company", "grade"]] = ""
+            updated_full.loc[
+                updated_full["product_type"] == "Sealed",
+                ["variant", "card_subtype", "card_number", "grading_company", "grade"]
+            ] = ""
             updated_full.loc[updated_full["product_type"] == "Graded Card", "sealed_product_type"] = ""
             updated_full.loc[updated_full["product_type"] == "Card", ["sealed_product_type", "grading_company", "grade"]] = ""
 
@@ -1474,7 +1548,6 @@ with tab_list:
             refresh_inventory_from_sheets()
             if not delete_ids:
                 st.success("Changes saved.")
-
 
 # ---------------------------
 # TAB 3: Inventory Summary
