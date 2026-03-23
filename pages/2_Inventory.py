@@ -192,38 +192,42 @@ def get_worksheet():
 
 def get_grading_worksheet():
     """
-    Finds the grading worksheet. First uses secrets['grading_worksheet'] if present,
-    otherwise tries common worksheet names.
+    Finds the grading worksheet.
+    First uses secrets['grading_worksheet'] if present.
+    Otherwise tries common names, then any worksheet whose title contains 'grading'.
     """
     client = get_gspread_client()
     spreadsheet_id = st.secrets["spreadsheet_id"]
     sh = client.open_by_key(spreadsheet_id)
 
-    candidates = []
     configured_name = str(st.secrets.get("grading_worksheet", "")).strip()
     if configured_name:
-        candidates.append(configured_name)
+        try:
+            return sh.worksheet(configured_name)
+        except Exception:
+            pass
 
-    candidates.extend([
+    candidate_names = [
         "grading",
         "Grading",
         "grading watch list",
         "Grading Watch List",
         "grading_watchlist",
         "Grading Watchlist",
-    ])
+    ]
 
-    seen = set()
-    for name in candidates:
-        if not name or name in seen:
-            continue
-        seen.add(name)
+    for name in candidate_names:
         try:
             return sh.worksheet(name)
-        except gspread.WorksheetNotFound:
-            continue
         except Exception:
             continue
+
+    try:
+        for ws in sh.worksheets():
+            if "grading" in ws.title.strip().lower():
+                return ws
+    except Exception:
+        pass
 
     return None
 
@@ -267,10 +271,53 @@ def _find_matching_column(columns, aliases):
     return None
 
 
+# =========================================================
+# MONEY / COERCION HELPERS
+# =========================================================
+
+def _money(x) -> float:
+    try:
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return 0.0
+        s = str(x).strip()
+        if s == "":
+            return 0.0
+
+        # remove currency symbols / commas / stray text
+        s = re.sub(r"[^0-9.\-]", "", s)
+
+        if s in {"", ".", "-", "-."}:
+            return 0.0
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def _coerce_money_series(series: pd.Series) -> pd.Series:
+    return series.apply(_money).astype(float)
+
+
+def _compute_total(purchase_price, shipping, tax):
+    return round(_money(purchase_price) + _money(shipping) + _money(tax), 2)
+
+
+def _compute_total_cost(total_price, grading_fee):
+    return round(_money(total_price) + _money(grading_fee), 2)
+
+
+def _safe_money_display(x):
+    if pd.isna(x) or x is None or x == "":
+        return ""
+    try:
+        return f"${_money(x):,.2f}"
+    except Exception:
+        return str(x)
+
+
 @st.cache_data(show_spinner=False, ttl=60 * 5)
 def load_grading_fee_map() -> dict:
     """
-    Reads the grading worksheet and builds:
+    Reads grading worksheet and returns:
       inventory_id -> grading_fee_initial
     """
     ws = get_grading_worksheet()
@@ -300,13 +347,13 @@ def load_grading_fee_map() -> dict:
 
     gdf = gdf[[inv_col, fee_col]].copy()
     gdf[inv_col] = gdf[inv_col].astype(str).str.strip()
-    gdf[fee_col] = pd.to_numeric(gdf[fee_col], errors="coerce").fillna(0.0)
-    gdf = gdf[gdf[inv_col] != ""]
+    gdf[fee_col] = _coerce_money_series(gdf[fee_col])
 
+    gdf = gdf[gdf[inv_col] != ""]
     if gdf.empty:
         return {}
 
-    # If duplicates exist, keep the last row in the grading tab
+    # if duplicates exist, keep the last grading row
     gdf = gdf.drop_duplicates(subset=[inv_col], keep="last")
 
     return {str(r[inv_col]): float(r[fee_col]) for _, r in gdf.iterrows()}
@@ -327,18 +374,18 @@ def _apply_grading_fees_from_grading_sheet(df: pd.DataFrame) -> pd.DataFrame:
     df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
 
     existing_fees = (
-        pd.to_numeric(df["grading_fee"], errors="coerce").fillna(0.0)
+        _coerce_money_series(df["grading_fee"])
         if "grading_fee" in df.columns
         else pd.Series(0.0, index=df.index)
     )
 
     grading_fee_map = load_grading_fee_map()
+
     if grading_fee_map:
-        mapped_fees = pd.to_numeric(
-            df["inventory_id"].map(grading_fee_map),
-            errors="coerce",
-        )
-        df["grading_fee"] = mapped_fees.fillna(existing_fees).round(2)
+        mapped_fees = df["inventory_id"].map(grading_fee_map)
+        mapped_fees = pd.Series(mapped_fees, index=df.index)
+        mapped_fees = _coerce_money_series(mapped_fees)
+        df["grading_fee"] = mapped_fees.where(mapped_fees > 0, existing_fees).round(2)
     else:
         df["grading_fee"] = existing_fees.round(2)
 
@@ -873,6 +920,7 @@ def fetch_details_and_image(url: str):
 # =========================================================
 # DATA HELPERS
 # =========================================================
+
 @st.cache_data(ttl=60 * 60 * 12)
 def fetch_pricecharting_prices(reference_link: str) -> dict:
     out = {"raw": 0.0, "psa9": 0.0, "psa10": 0.0}
@@ -919,32 +967,6 @@ def compute_market_price_for_row(reference_link: str, product_type: str, grade: 
             mv = float(prices.get("psa9", mv) or mv)
 
     return float(mv or 0.0)
-
-
-def _money(x) -> float:
-    try:
-        if x is None or x == "":
-            return 0.0
-        return float(x)
-    except Exception:
-        return 0.0
-
-
-def _compute_total(purchase_price, shipping, tax):
-    return round(_money(purchase_price) + _money(shipping) + _money(tax), 2)
-
-
-def _compute_total_cost(total_price, grading_fee):
-    return round(_money(total_price) + _money(grading_fee), 2)
-
-
-def _safe_money_display(x):
-    if pd.isna(x) or x is None or x == "":
-        return ""
-    try:
-        return f"${float(x):,.2f}"
-    except Exception:
-        return str(x)
 
 
 # =========================================================
@@ -1005,42 +1027,42 @@ def sheets_load_inventory() -> pd.DataFrame:
     # enforce ordering
     df = df[[c for c in DEFAULT_COLUMNS if c in df.columns]].copy()
 
-    # normalize ids early
+    # normalize id first
     df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
 
-    # numeric cleanup
+    # numeric cleanup using money-safe parser
     for c in NUMERIC_COLS:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+            df[c] = _coerce_money_series(df[c])
 
-    # compute total_price from purchase/shipping/tax
+    # recompute total_price from purchase + shipping + tax
     if set(["purchase_price", "shipping", "tax"]).issubset(df.columns):
         df["total_price"] = (
-            pd.to_numeric(df["purchase_price"], errors="coerce").fillna(0.0)
-            + pd.to_numeric(df["shipping"], errors="coerce").fillna(0.0)
-            + pd.to_numeric(df["tax"], errors="coerce").fillna(0.0)
+            _coerce_money_series(df["purchase_price"])
+            + _coerce_money_series(df["shipping"])
+            + _coerce_money_series(df["tax"])
         ).round(2)
 
-    # pull grading fees from grading worksheet by inventory_id
+    # overwrite grading_fee from grading worksheet when found
     df = _apply_grading_fees_from_grading_sheet(df)
 
-    # compute total_cost
+    # recompute total_cost
     df["total_cost"] = (
-        pd.to_numeric(df["total_price"], errors="coerce").fillna(0.0)
-        + pd.to_numeric(df["grading_fee"], errors="coerce").fillna(0.0)
+        _coerce_money_series(df["total_price"])
+        + _coerce_money_series(df["grading_fee"])
     ).round(2)
 
     # normalize defaults
     df["product_type"] = df["product_type"].replace("", "Card").fillna("Card")
     df["inventory_status"] = df["inventory_status"].replace("", STATUS_ACTIVE).fillna(STATUS_ACTIVE)
 
-    # normalize card_type to ONLY Pokemon / Sports
+    # normalize card_type
     df["card_type"] = df["card_type"].astype(str).str.strip()
     df.loc[df["card_type"].str.lower().eq("sports"), "card_type"] = "Sports"
     df.loc[df["card_type"].str.lower().eq("pokemon"), "card_type"] = "Pokemon"
     df.loc[~df["card_type"].isin(["Pokemon", "Sports"]), "card_type"] = "Pokemon"
 
-    # enforce condition invariants
+    # condition rules
     df["condition"] = df["condition"].astype(str)
     df.loc[df["product_type"] == "Sealed", "condition"] = "Sealed"
     df.loc[df["product_type"] == "Graded Card", "condition"] = "Graded"
@@ -1460,7 +1482,7 @@ with tab_list:
             "market_value",
         ]:
             if c in filtered.columns:
-                filtered[c] = pd.to_numeric(filtered[c], errors="coerce").fillna(0.0)
+                filtered[c] = _coerce_money_series(filtered[c])
 
         if "total_price" not in filtered.columns:
             filtered["total_price"] = 0.0
@@ -1470,11 +1492,14 @@ with tab_list:
             filtered["market_price"] = 0.0
 
         filtered["total_cost"] = (
-            pd.to_numeric(filtered["total_price"], errors="coerce").fillna(0.0)
-            + pd.to_numeric(filtered["grading_fee"], errors="coerce").fillna(0.0)
+            _coerce_money_series(filtered["total_price"])
+            + _coerce_money_series(filtered["grading_fee"])
         ).round(2)
 
-        filtered["est_profit"] = (filtered["market_price"] - filtered["total_cost"]).round(2)
+        filtered["est_profit"] = (
+            _coerce_money_series(filtered["market_price"])
+            - _coerce_money_series(filtered["total_cost"])
+        ).round(2)
 
         # enforce condition invariants for display
         filtered = filtered.copy()
@@ -1548,7 +1573,7 @@ with tab_list:
 
         for c in ["purchase_price", "shipping", "tax", "grading_fee", "total_cost", "market_price", "est_profit"]:
             if c in view.columns:
-                view[c] = pd.to_numeric(view[c], errors="coerce").fillna(0.0)
+                view[c] = _coerce_money_series(view[c])
 
         def _row_color(r):
             try:
@@ -1600,7 +1625,7 @@ with tab_list:
             # numeric cleanup on editable columns only
             for c in ["purchase_price", "shipping", "tax", "market_price"]:
                 if c in edited_core.columns:
-                    edited_core[c] = pd.to_numeric(edited_core[c], errors="coerce").fillna(0.0)
+                    edited_core[c] = _coerce_money_series(edited_core[c])
 
             updated_full = df_all.copy()
             updated_full["inventory_id"] = updated_full["inventory_id"].astype(str)
@@ -1633,18 +1658,18 @@ with tab_list:
             # recompute totals
             if set(["purchase_price", "shipping", "tax"]).issubset(updated_full.columns):
                 updated_full["total_price"] = (
-                    pd.to_numeric(updated_full["purchase_price"], errors="coerce").fillna(0.0)
-                    + pd.to_numeric(updated_full["shipping"], errors="coerce").fillna(0.0)
-                    + pd.to_numeric(updated_full["tax"], errors="coerce").fillna(0.0)
+                    _coerce_money_series(updated_full["purchase_price"])
+                    + _coerce_money_series(updated_full["shipping"])
+                    + _coerce_money_series(updated_full["tax"])
                 ).round(2)
 
             if "grading_fee" not in updated_full.columns:
                 updated_full["grading_fee"] = 0.0
-            updated_full["grading_fee"] = pd.to_numeric(updated_full["grading_fee"], errors="coerce").fillna(0.0)
+            updated_full["grading_fee"] = _coerce_money_series(updated_full["grading_fee"])
 
             updated_full["total_cost"] = (
-                pd.to_numeric(updated_full["total_price"], errors="coerce").fillna(0.0)
-                + pd.to_numeric(updated_full["grading_fee"], errors="coerce").fillna(0.0)
+                _coerce_money_series(updated_full["total_price"])
+                + _coerce_money_series(updated_full["grading_fee"])
             ).round(2)
 
             if "market_price" in updated_full.columns and "market_value" in updated_full.columns:
