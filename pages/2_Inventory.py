@@ -1559,8 +1559,10 @@ with tab_summary:
     if df.empty:
         st.info("No inventory yet. Add items in the New Inventory tab.")
     else:
+        invested_col = "total_cost" if "total_cost" in df.columns else "total_price"
+
         total_items = len(df)
-        total_invested = df["total_price"].fillna(0).sum()
+        total_invested = df[invested_col].fillna(0).sum()
         total_market = df["market_price"].fillna(0).sum() if "market_price" in df.columns else 0.0
 
         k1, k2, k3, k4 = st.columns(4)
@@ -1573,7 +1575,7 @@ with tab_summary:
         st.markdown("### Breakdown by Product Type")
         p_summary = (
             df.groupby("product_type", dropna=False)
-            .agg(items=("inventory_id", "count"), invested=("total_price", "sum"), market=("market_price", "sum"))
+            .agg(items=("inventory_id", "count"), invested=(invested_col, "sum"), market=("market_price", "sum"))
             .reset_index()
             .sort_values("invested", ascending=False)
         )
@@ -1583,7 +1585,7 @@ with tab_summary:
         st.markdown("### Breakdown by Status")
         s_summary = (
             df.groupby("inventory_status", dropna=False)
-            .agg(items=("inventory_id", "count"), invested=("total_price", "sum"), market=("market_price", "sum"))
+            .agg(items=("inventory_id", "count"), invested=(invested_col, "sum"), market=("market_price", "sum"))
             .reset_index()
             .sort_values("items", ascending=False)
         )
@@ -1593,7 +1595,7 @@ with tab_summary:
         st.markdown("### Top Sets by Invested")
         set_summary = (
             df.groupby(["product_type", "card_type", "brand_or_league", "set_name"], dropna=False)
-            .agg(items=("inventory_id", "count"), invested=("total_price", "sum"), market=("market_price", "sum"))
+            .agg(items=("inventory_id", "count"), invested=(invested_col, "sum"), market=("market_price", "sum"))
             .reset_index()
             .sort_values("invested", ascending=False)
         )
