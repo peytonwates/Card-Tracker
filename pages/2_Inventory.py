@@ -16,7 +16,6 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
-
 st.set_page_config(page_title="Inventory", layout="wide")
 
 
@@ -71,13 +70,12 @@ SPORT_TOKENS = {
 }
 
 # Columns stored in Google Sheets (internal names)
-# Columns stored in Google Sheets (internal names)
 DEFAULT_COLUMNS = [
     "inventory_id",
     "image_url",
     "product_type",            # Card / Sealed / Graded Card
     "sealed_product_type",     # only for sealed
-    "card_type",               # Pokemon / Sports / Other
+    "card_type",               # Pokemon / Sports
     "brand_or_league",         # Pokemon TCG / Football / etc.
     "set_name",
     "year",
@@ -94,16 +92,16 @@ DEFAULT_COLUMNS = [
     "shipping",
     "tax",
     "total_price",             # purchase + shipping + tax
-    "grading_fee",             # added
+    "grading_fee",             # sourced from grading sheet when available
     "total_cost",              # total_price + grading_fee
     "condition",               # raw card condition; sealed="Sealed"; graded="Graded"
     "notes",
     "created_at",
     "inventory_status",
     "listed_transaction_id",
-    # ---- cached market pricing (populated elsewhere, e.g. Transactions refresh) ----
+    # ---- cached market pricing ----
     "market_price",
-    "market_value",                # alias / compatibility with dashboard
+    "market_value",            # alias / compatibility with dashboard
     "market_price_updated_at",
 ]
 
@@ -118,18 +116,19 @@ NUMERIC_COLS = [
     "market_value",
 ]
 
-
 # Support both header styles if sheet was edited manually
 HEADER_ALIASES = {
     "product_type": ["product_type", "Product Type"],
     "sealed_product_type": ["sealed_product_type", "Sealed Product Type"],
 }
 
+
 def sheet_header_to_internal(header: str) -> str:
     for internal, aliases in HEADER_ALIASES.items():
         if header in aliases:
             return internal
     return header
+
 
 def internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
     aliases = HEADER_ALIASES.get(internal, [internal])
@@ -141,6 +140,7 @@ def internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
     if internal == "sealed_product_type":
         return "Sealed Product Type"
     return internal
+
 
 # =========================================================
 # GOOGLE SHEETS CLIENT
@@ -181,12 +181,52 @@ def get_gspread_client():
 
     raise KeyError('Missing secrets: add "gcp_service_account" (Cloud) or "service_account_json_path" (local).')
 
+
 def get_worksheet():
     client = get_gspread_client()
     spreadsheet_id = st.secrets["spreadsheet_id"]
     worksheet_name = st.secrets.get("inventory_worksheet", "inventory")
     sh = client.open_by_key(spreadsheet_id)
     return sh.worksheet(worksheet_name)
+
+
+def get_grading_worksheet():
+    """
+    Finds the grading worksheet. First uses secrets['grading_worksheet'] if present,
+    otherwise tries common worksheet names.
+    """
+    client = get_gspread_client()
+    spreadsheet_id = st.secrets["spreadsheet_id"]
+    sh = client.open_by_key(spreadsheet_id)
+
+    candidates = []
+    configured_name = str(st.secrets.get("grading_worksheet", "")).strip()
+    if configured_name:
+        candidates.append(configured_name)
+
+    candidates.extend([
+        "grading",
+        "Grading",
+        "grading watch list",
+        "Grading Watch List",
+        "grading_watchlist",
+        "Grading Watchlist",
+    ])
+
+    seen = set()
+    for name in candidates:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        try:
+            return sh.worksheet(name)
+        except gspread.WorksheetNotFound:
+            continue
+        except Exception:
+            continue
+
+    return None
+
 
 def ensure_headers(ws):
     first_row = ws.row_values(1)
@@ -214,6 +254,97 @@ def ensure_headers(ws):
 
     return existing
 
+
+def _normalize_header_name(x: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(x).strip().lower())
+
+
+def _find_matching_column(columns, aliases):
+    wanted = {_normalize_header_name(a) for a in aliases}
+    for col in columns:
+        if _normalize_header_name(col) in wanted:
+            return col
+    return None
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 5)
+def load_grading_fee_map() -> dict:
+    """
+    Reads the grading worksheet and builds:
+      inventory_id -> grading_fee_initial
+    """
+    ws = get_grading_worksheet()
+    if ws is None:
+        return {}
+
+    try:
+        records = ws.get_all_records()
+    except Exception:
+        return {}
+
+    gdf = pd.DataFrame(records)
+    if gdf.empty:
+        return {}
+
+    inv_col = _find_matching_column(
+        gdf.columns,
+        ["inventory_id", "Inventory ID", "inventory id"],
+    )
+    fee_col = _find_matching_column(
+        gdf.columns,
+        ["grading_fee_initial", "Grading Fee Initial", "grading fee initial"],
+    )
+
+    if not inv_col or not fee_col:
+        return {}
+
+    gdf = gdf[[inv_col, fee_col]].copy()
+    gdf[inv_col] = gdf[inv_col].astype(str).str.strip()
+    gdf[fee_col] = pd.to_numeric(gdf[fee_col], errors="coerce").fillna(0.0)
+    gdf = gdf[gdf[inv_col] != ""]
+
+    if gdf.empty:
+        return {}
+
+    # If duplicates exist, keep the last row in the grading tab
+    gdf = gdf.drop_duplicates(subset=[inv_col], keep="last")
+
+    return {str(r[inv_col]): float(r[fee_col]) for _, r in gdf.iterrows()}
+
+
+def _apply_grading_fees_from_grading_sheet(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        if "grading_fee" not in df.columns:
+            df["grading_fee"] = 0.0
+        return df
+
+    if "inventory_id" not in df.columns:
+        if "grading_fee" not in df.columns:
+            df["grading_fee"] = 0.0
+        return df
+
+    df = df.copy()
+    df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
+
+    existing_fees = (
+        pd.to_numeric(df["grading_fee"], errors="coerce").fillna(0.0)
+        if "grading_fee" in df.columns
+        else pd.Series(0.0, index=df.index)
+    )
+
+    grading_fee_map = load_grading_fee_map()
+    if grading_fee_map:
+        mapped_fees = pd.to_numeric(
+            df["inventory_id"].map(grading_fee_map),
+            errors="coerce",
+        )
+        df["grading_fee"] = mapped_fees.fillna(existing_fees).round(2)
+    else:
+        df["grading_fee"] = existing_fees.round(2)
+
+    return df
+
+
 # =========================================================
 # HTTP / PRICING SCRAPE HELPERS
 # =========================================================
@@ -224,6 +355,7 @@ def _bs_parser():
         return "lxml"
     except Exception:
         return "html.parser"
+
 
 @st.cache_resource
 def get_http_session():
@@ -237,6 +369,7 @@ def get_http_session():
         "Accept-Language": "en-US,en;q=0.9",
     })
     return s
+
 
 def http_get_with_backoff(url: str, *, timeout=20, max_tries=5):
     sess = get_http_session()
@@ -285,6 +418,7 @@ def http_get_with_backoff(url: str, *, timeout=20, max_tries=5):
 
     raise requests.HTTPError(f"HTTPError: retries exhausted for {url}")
 
+
 @st.cache_data(show_spinner=False, ttl=60 * 15)
 def fetch_pricecharting_html(reference_link: str) -> str:
     link = (reference_link or "").strip()
@@ -297,11 +431,13 @@ def fetch_pricecharting_html(reference_link: str) -> str:
     except Exception:
         return ""
 
+
 def _get_pricecharting_soup(reference_link: str):
     html = fetch_pricecharting_html(reference_link)
     if not html:
         return None
     return BeautifulSoup(html, _bs_parser())
+
 
 def _parse_any_date(text: str):
     if not text:
@@ -313,6 +449,7 @@ def _parse_any_date(text: str):
         return None
     return d.date()
 
+
 def _price_from_cell_text(text: str) -> float:
     if not text:
         return 0.0
@@ -323,6 +460,7 @@ def _price_from_cell_text(text: str) -> float:
         return float(m.group(1).replace(",", ""))
     except Exception:
         return 0.0
+
 
 def _find_manual_only_sales_table(soup: BeautifulSoup):
     tables = soup.select("div.completed-auctions-manual-only table")
@@ -338,6 +476,7 @@ def _find_manual_only_sales_table(soup: BeautifulSoup):
             return t
     return tables[0]
 
+
 def _find_graded_sales_table(soup: BeautifulSoup):
     tables = soup.select("div.completed-auctions-graded table")
     if not tables:
@@ -351,6 +490,7 @@ def _find_graded_sales_table(soup: BeautifulSoup):
         if looks_like_sales_table(t):
             return t
     return tables[0]
+
 
 def _iter_sales_from_table(table):
     if table is None:
@@ -405,6 +545,7 @@ def _iter_sales_from_table(table):
 
     return sales
 
+
 def _title_matches_exact_grade(title: str, grading_company: str, grade: str) -> bool:
     t = re.sub(r"\s+", " ", (title or "").upper()).strip()
     company = re.sub(r"\s+", " ", (grading_company or "").upper()).strip()
@@ -430,6 +571,7 @@ def _title_matches_exact_grade(title: str, grading_company: str, grade: str) -> 
         )
 
     return False
+
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
 def fetch_pricecharting_exact_grade_value(reference_link: str, grading_company: str, grade: str, n_sales: int = 5) -> float:
@@ -460,6 +602,7 @@ def fetch_pricecharting_exact_grade_value(reference_link: str, grading_company: 
 
     return round(sum(x["price"] for x in out) / len(out), 2)
 
+
 # =========================================================
 # SCRAPING (DETAILS + IMAGE)
 # =========================================================
@@ -475,6 +618,7 @@ def _find_best_title(soup: BeautifulSoup) -> str:
         return soup.title.string.strip()
     return ""
 
+
 def _find_best_image(soup: BeautifulSoup) -> str:
     """
     Prefer PriceCharting's real card/product photos (storage.googleapis.com)
@@ -483,7 +627,6 @@ def _find_best_image(soup: BeautifulSoup) -> str:
     if soup is None:
         return ""
 
-    # 1) If og/twitter image is already a real hosted photo, use it.
     for meta in [
         soup.find("meta", property="og:image"),
         soup.find("meta", attrs={"name": "twitter:image"}),
@@ -492,12 +635,9 @@ def _find_best_image(soup: BeautifulSoup) -> str:
             url = meta["content"].strip()
             if "storage.googleapis.com/images.pricecharting.com" in url:
                 return url
-            # If it's the set icon, ignore it
             if "/images/pokemon-sets/" not in url:
                 return url
 
-    # 2) Prefer any storage.googleapis.com PriceCharting image anywhere on the page
-    #    (often appears under "More Photos" links or sometimes in <img src>).
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
         if "storage.googleapis.com/images.pricecharting.com" in href:
@@ -508,7 +648,6 @@ def _find_best_image(soup: BeautifulSoup) -> str:
         if "storage.googleapis.com/images.pricecharting.com" in src:
             return src
 
-    # 3) Otherwise, choose the first non-set-icon <img>
     for img in soup.find_all("img", src=True):
         src = (img.get("src") or "").strip()
         if not src:
@@ -520,13 +659,7 @@ def _find_best_image(soup: BeautifulSoup) -> str:
     return ""
 
 
-
 def _find_pricecharting_main_image(soup: BeautifulSoup) -> str:
-    """
-    PriceCharting often shows the real product/card image under:
-    'More Photos' -> 'Main Image' as a storage.googleapis.com link.
-    We prefer that over set icons like /images/pokemon-sets/....
-    """
     if soup is None:
         return ""
 
@@ -537,16 +670,13 @@ def _find_pricecharting_main_image(soup: BeautifulSoup) -> str:
         if not href:
             continue
 
-        # normalize protocol-relative
         if href.startswith("//"):
             href = "https:" + href
 
-        # only care about the real hosted photos
         if "storage.googleapis.com" in href and "images.pricecharting.com" in href:
             label = ""
             if a.parent:
                 label = " ".join(a.parent.stripped_strings)
-            # Prefer the one explicitly labeled "Main Image"
             if "main image" in (label or "").lower():
                 return href
             candidates.append(href)
@@ -556,6 +686,7 @@ def _find_pricecharting_main_image(soup: BeautifulSoup) -> str:
 
 def _title_case_from_slug(slug: str) -> str:
     return " ".join([w for w in slug.replace("-", " ").split() if w]).title()
+
 
 def _parse_set_slug_generic(set_slug: str):
     tokens = [t for t in set_slug.split("-") if t]
@@ -583,10 +714,12 @@ def _parse_set_slug_generic(set_slug: str):
 
     return {"card_type": "", "brand_or_league": "", "year": year, "set_name": _title_case_from_slug(set_slug)}
 
+
 def _looks_like_single_card_slug(card_slug: str) -> bool:
     if not card_slug:
         return False
     return bool(re.search(r"-(\d+[A-Za-z0-9]*)$", card_slug))
+
 
 def _parse_pricecharting_title(title: str):
     if not title:
@@ -610,6 +743,7 @@ def _parse_pricecharting_title(title: str):
 
     return {"card_name": name_part, "card_number": num, "variant": variant}
 
+
 SEALED_TYPE_KEYWORDS = {
     "elite-trainer-box": "Elite Trainer Box",
     "etb": "Elite Trainer Box",
@@ -621,6 +755,7 @@ SEALED_TYPE_KEYWORDS = {
     "collection-box": "Collection Box",
     "premium-collection": "Premium Collection Box",
 }
+
 
 def _infer_sealed_type_from_slug_or_title(slug: str, title: str) -> str:
     t = ((slug or "") + " " + (title or "")).lower()
@@ -642,6 +777,7 @@ def _infer_sealed_type_from_slug_or_title(slug: str, title: str) -> str:
     if "blister" in t:
         return "Blister Pack"
     return ""
+
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def fetch_details_and_image(url: str):
@@ -678,18 +814,13 @@ def fetch_details_and_image(url: str):
         soup = BeautifulSoup(r.text, "lxml")
         page_title = _find_best_title(soup)
 
-        # Prefer PriceCharting's "Main Image" (storage.googleapis.com) when available
         if "pricecharting.com" in host:
             image_url = _find_pricecharting_main_image(soup) or _find_best_image(soup)
         else:
             image_url = _find_best_image(soup)
 
-        # Normalize relative/protocol-relative URLs for ALL sites (including PriceCharting)
         if image_url:
             image_url = urljoin(url, image_url)
-
-
-
 
     except Exception:
         soup = None
@@ -738,6 +869,7 @@ def fetch_details_and_image(url: str):
 
     return result
 
+
 # =========================================================
 # DATA HELPERS
 # =========================================================
@@ -763,21 +895,13 @@ def fetch_pricecharting_prices(reference_link: str) -> dict:
     except Exception:
         return out
 
+
 def compute_market_price_for_row(reference_link: str, product_type: str, grade: str, grading_company: str = "") -> float:
-    """
-    Rules:
-      - Sealed: keep using raw slot
-      - Card (raw): keep using raw slot
-      - Graded Card: use recent exact-grade sold sales average when available
-        (same sold-sales scraping approach as grading watchlist),
-        then fall back to page PSA9/PSA10 slots, then raw.
-    """
     prices = fetch_pricecharting_prices(reference_link or "")
     pt = (product_type or "").strip().lower()
     g = (grade or "").strip()
     gc = (grading_company or "").strip()
 
-    # default raw
     mv = float(prices.get("raw", 0.0) or 0.0)
 
     if "graded" in pt:
@@ -797,7 +921,6 @@ def compute_market_price_for_row(reference_link: str, product_type: str, grade: 
     return float(mv or 0.0)
 
 
-
 def _money(x) -> float:
     try:
         if x is None or x == "":
@@ -806,11 +929,14 @@ def _money(x) -> float:
     except Exception:
         return 0.0
 
+
 def _compute_total(purchase_price, shipping, tax):
     return round(_money(purchase_price) + _money(shipping) + _money(tax), 2)
 
+
 def _compute_total_cost(total_price, grading_fee):
     return round(_money(total_price) + _money(grading_fee), 2)
+
 
 def _safe_money_display(x):
     if pd.isna(x) or x is None or x == "":
@@ -819,6 +945,7 @@ def _safe_money_display(x):
         return f"${float(x):,.2f}"
     except Exception:
         return str(x)
+
 
 # =========================================================
 # SHEETS LOAD/SAVE
@@ -834,7 +961,7 @@ def sheets_load_inventory() -> pd.DataFrame:
     if df.empty:
         df = pd.DataFrame(columns=DEFAULT_COLUMNS)
 
-    # rename sheet headers -> internal names (may create duplicates!)
+    # rename sheet headers -> internal names
     df = df.rename(columns={c: sheet_header_to_internal(c) for c in df.columns})
 
     # ensure expected columns exist
@@ -872,19 +999,21 @@ def sheets_load_inventory() -> pd.DataFrame:
                 s = obj.astype(str)
                 df[col] = s.where(s.str.strip() != "", "")
 
-    # drop duplicate columns (keep first)
+    # drop duplicate columns
     df = df.loc[:, ~df.columns.duplicated()].copy()
 
     # enforce ordering
     df = df[[c for c in DEFAULT_COLUMNS if c in df.columns]].copy()
 
-    # numeric cleanup
+    # normalize ids early
+    df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
+
     # numeric cleanup
     for c in NUMERIC_COLS:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
-    # keep total_price and total_cost consistent
+    # compute total_price from purchase/shipping/tax
     if set(["purchase_price", "shipping", "tax"]).issubset(df.columns):
         df["total_price"] = (
             pd.to_numeric(df["purchase_price"], errors="coerce").fillna(0.0)
@@ -892,28 +1021,24 @@ def sheets_load_inventory() -> pd.DataFrame:
             + pd.to_numeric(df["tax"], errors="coerce").fillna(0.0)
         ).round(2)
 
-    if "grading_fee" not in df.columns:
-        df["grading_fee"] = 0.0
-    df["grading_fee"] = pd.to_numeric(df["grading_fee"], errors="coerce").fillna(0.0)
+    # pull grading fees from grading worksheet by inventory_id
+    df = _apply_grading_fees_from_grading_sheet(df)
 
+    # compute total_cost
     df["total_cost"] = (
         pd.to_numeric(df["total_price"], errors="coerce").fillna(0.0)
         + pd.to_numeric(df["grading_fee"], errors="coerce").fillna(0.0)
     ).round(2)
 
     # normalize defaults
-    df["inventory_id"] = df["inventory_id"].astype(str)
     df["product_type"] = df["product_type"].replace("", "Card").fillna("Card")
     df["inventory_status"] = df["inventory_status"].replace("", STATUS_ACTIVE).fillna(STATUS_ACTIVE)
 
-    # normalize card_type to ONLY Pokemon / Sports (never Other)
+    # normalize card_type to ONLY Pokemon / Sports
     df["card_type"] = df["card_type"].astype(str).str.strip()
     df.loc[df["card_type"].str.lower().eq("sports"), "card_type"] = "Sports"
     df.loc[df["card_type"].str.lower().eq("pokemon"), "card_type"] = "Pokemon"
-
-    # anything blank/unknown/Other -> Pokemon
     df.loc[~df["card_type"].isin(["Pokemon", "Sports"]), "card_type"] = "Pokemon"
-
 
     # enforce condition invariants
     df["condition"] = df["condition"].astype(str)
@@ -921,6 +1046,7 @@ def sheets_load_inventory() -> pd.DataFrame:
     df.loc[df["product_type"] == "Graded Card", "condition"] = "Graded"
 
     return df
+
 
 def sheets_append_inventory_row(row_internal: dict):
     ws = get_worksheet()
@@ -934,6 +1060,7 @@ def sheets_append_inventory_row(row_internal: dict):
 
     ws.append_row(ordered, value_input_option="USER_ENTERED")
 
+
 def sheets_update_rows(rows_internal: pd.DataFrame):
     if rows_internal.empty:
         return
@@ -942,7 +1069,6 @@ def sheets_update_rows(rows_internal: pd.DataFrame):
     sheet_headers = ensure_headers(ws)
     header_to_internal = {h: sheet_header_to_internal(h) for h in sheet_headers}
 
-    # map inventory_id -> row number by reading col A once
     col_a = ws.col_values(1)
     id_to_row = {}
     for idx, val in enumerate(col_a[1:], start=2):
@@ -968,6 +1094,7 @@ def sheets_update_rows(rows_internal: pd.DataFrame):
         rng = f"A{rownum}:{last_col_letter}{rownum}"
         ws.update(rng, [values], value_input_option="USER_ENTERED")
 
+
 def sheets_delete_rows_by_ids(inventory_ids):
     if not inventory_ids:
         return
@@ -987,6 +1114,7 @@ def sheets_delete_rows_by_ids(inventory_ids):
     for rn in sorted(rownums, reverse=True):
         ws.delete_rows(rn)
 
+
 # =========================================================
 # STATE
 # =========================================================
@@ -995,13 +1123,15 @@ def init_inventory_from_sheets():
     if INVENTORY_STATE_KEY not in st.session_state:
         st.session_state[INVENTORY_STATE_KEY] = sheets_load_inventory()
 
+
 def refresh_inventory_from_sheets():
+    load_grading_fee_map.clear()
     st.session_state[INVENTORY_STATE_KEY] = sheets_load_inventory()
+
 
 # =========================================================
 # UI
 # =========================================================
-
 
 init_inventory_from_sheets()
 
@@ -1014,6 +1144,7 @@ with top_right:
         st.success("Reloaded from Google Sheets.")
 
 tab_new, tab_list, tab_summary = st.tabs(["New Inventory", "Inventory List", "Inventory Summary"])
+
 
 # ---------------------------
 # TAB 1: New Inventory
@@ -1039,14 +1170,12 @@ with tab_new:
 
     prefill = st.session_state.get("prefill_details", {}) or {}
 
-    # show image
     img = prefill.get("image_url")
     if img:
         try:
             st.image(img, width=160)
         except Exception:
             st.caption("Image unavailable")
-
 
     with st.form("new_inventory_form_v8", clear_on_submit=True):
         a1, a2, a3, a4 = st.columns([1.4, 1.2, 2.4, 1.0])
@@ -1220,13 +1349,12 @@ with tab_new:
                         "inventory_status": STATUS_ACTIVE,
                         "listed_transaction_id": "",
                         "market_price": float(mv),
-                        "market_value": float(mv),  # keep in sync
+                        "market_value": float(mv),
                         "market_price_updated_at": pd.Timestamp.utcnow().isoformat() if mv else "",
                     }
 
                     sheets_append_inventory_row(new_row)
                     created_ids.append(new_row["inventory_id"])
-
 
                 st.session_state["prefill_details"] = {}
                 refresh_inventory_from_sheets()
@@ -1239,8 +1367,10 @@ with tab_new:
     if len(df) > 0:
         st.markdown("#### Recently added")
         show = df.tail(10).copy()
-        for col in ["purchase_price", "shipping", "tax", "total_price", "market_price"]:
-            show[col] = show[col].apply(_safe_money_display)
+
+        for col in ["purchase_price", "shipping", "tax", "total_price", "grading_fee", "total_cost", "market_price"]:
+            if col in show.columns:
+                show[col] = show[col].apply(_safe_money_display)
 
         st.dataframe(
             show,
@@ -1254,7 +1384,7 @@ with tab_new:
     else:
         st.info("No inventory yet — add your first item above.")
 
-# ---------------------------
+
 # ---------------------------
 # TAB 2: Inventory List
 # ---------------------------
@@ -1265,7 +1395,7 @@ with tab_list:
     if df_all.empty:
         st.info("No inventory yet. Add items in the New Inventory tab.")
     else:
-        # ---- filters (keep your existing filters) ----
+        # ---- filters ----
         status_options = sorted(df_all["inventory_status"].dropna().unique().tolist())
         default_status = [s for s in [STATUS_ACTIVE, STATUS_LISTED] if s in status_options]
         if not default_status and status_options:
@@ -1351,7 +1481,7 @@ with tab_list:
         filtered.loc[filtered["product_type"] == "Sealed", "condition"] = "Sealed"
         filtered.loc[filtered["product_type"] == "Graded Card", "condition"] = "Graded"
 
-        # ---- Build compact editor view ----
+        # ---- compact editor view ----
         show_cols = [
             "inventory_id",
             "image_url",
@@ -1372,7 +1502,6 @@ with tab_list:
         display = filtered[show_cols].copy()
         display.insert(0, "delete", False)
 
-        # ---- Make rows/images larger (CSS) ----
         st.markdown(
             """
             <style>
@@ -1404,17 +1533,17 @@ with tab_list:
                 "purchase_price": st.column_config.NumberColumn("Purchase Price", format="$%.2f"),
                 "shipping": st.column_config.NumberColumn("Shipping", format="$%.2f"),
                 "tax": st.column_config.NumberColumn("Tax", format="$%.2f"),
-                "grading_fee": st.column_config.NumberColumn("Grading Fee", format="$%.2f"),
+                "grading_fee": st.column_config.NumberColumn("Grading Fee", format="$%.2f", disabled=True),
                 "total_cost": st.column_config.NumberColumn("Total Cost", format="$%.2f", disabled=True),
                 "condition": st.column_config.TextColumn("Condition"),
                 "inventory_status": st.column_config.TextColumn("Status"),
                 "market_price": st.column_config.NumberColumn("Market Price", format="$%.2f"),
                 "est_profit": st.column_config.NumberColumn("Est Profit", format="$%.2f", disabled=True),
             },
-            disabled=["total_cost", "est_profit"],
+            disabled=["grading_fee", "total_cost", "est_profit"],
         )
 
-        # ---- Profit/Loss highlighted view (read-only, styled) ----
+        # ---- Profit / Loss highlighted view ----
         view = edited.drop(columns=["delete"], errors="ignore").copy()
 
         for c in ["purchase_price", "shipping", "tax", "grading_fee", "total_cost", "market_price", "est_profit"]:
@@ -1427,9 +1556,9 @@ with tab_list:
             except Exception:
                 v = 0.0
             if v > 0:
-                return ["background-color: #e8f5e9"] * len(r)  # light green
+                return ["background-color: #e8f5e9"] * len(r)
             if v < 0:
-                return ["background-color: #ffebee"] * len(r)  # light red
+                return ["background-color: #ffebee"] * len(r)
             return [""] * len(r)
 
         st.markdown("##### Profit / Loss highlight (preview)")
@@ -1464,47 +1593,44 @@ with tab_list:
             )
 
         if apply_btn:
-            # ---- deletions ----
             delete_ids = edited.loc[edited["delete"] == True, "inventory_id"].astype(str).tolist()
 
-            # ---- merge edits back into full df so we don't wipe other columns ----
             edited_core = edited.drop(columns=["delete"], errors="ignore").copy()
 
-            # numeric cleanup on edited columns
-            for c in ["purchase_price", "shipping", "tax", "grading_fee", "market_price"]:
+            # numeric cleanup on editable columns only
+            for c in ["purchase_price", "shipping", "tax", "market_price"]:
                 if c in edited_core.columns:
                     edited_core[c] = pd.to_numeric(edited_core[c], errors="coerce").fillna(0.0)
 
-            # start from full df and apply updates for the rows that are in the filtered view
             updated_full = df_all.copy()
             updated_full["inventory_id"] = updated_full["inventory_id"].astype(str)
 
             edited_core["inventory_id"] = edited_core["inventory_id"].astype(str)
 
-            # columns user is allowed to change in this compact view
+            # grading_fee is NOT editable here; it comes from the grading tab
             updatable_cols = [
                 "purchase_price",
                 "shipping",
                 "tax",
-                "grading_fee",
                 "condition",
                 "inventory_status",
                 "market_price",
             ]
             updatable_cols = [c for c in updatable_cols if c in edited_core.columns and c in updated_full.columns]
 
-            # update row-by-row by inventory_id
             edit_map = edited_core.set_index("inventory_id")[updatable_cols]
             updated_full = updated_full.set_index("inventory_id")
 
-            # Only apply to ids present in edit_map (i.e., currently filtered rows)
             valid_ids = edit_map.index.intersection(updated_full.index)
             for col in updatable_cols:
                 updated_full.loc[valid_ids, col] = edit_map.loc[valid_ids, col]
 
             updated_full = updated_full.reset_index()
 
-            # recompute total_price and total_cost
+            # re-apply grading fee from grading sheet so it stays in sync
+            updated_full = _apply_grading_fees_from_grading_sheet(updated_full)
+
+            # recompute totals
             if set(["purchase_price", "shipping", "tax"]).issubset(updated_full.columns):
                 updated_full["total_price"] = (
                     pd.to_numeric(updated_full["purchase_price"], errors="coerce").fillna(0.0)
@@ -1521,16 +1647,13 @@ with tab_list:
                 + pd.to_numeric(updated_full["grading_fee"], errors="coerce").fillna(0.0)
             ).round(2)
 
-            # keep market_value synced (your existing rule)
             if "market_price" in updated_full.columns and "market_value" in updated_full.columns:
                 updated_full["market_value"] = updated_full["market_price"]
 
-            # enforce condition invariants
             updated_full["condition"] = updated_full["condition"].astype(str)
             updated_full.loc[updated_full["product_type"] == "Sealed", "condition"] = "Sealed"
             updated_full.loc[updated_full["product_type"] == "Graded Card", "condition"] = "Graded"
 
-            # clear fields based on product_type rules (kept from your existing logic)
             updated_full.loc[
                 updated_full["product_type"] == "Sealed",
                 ["variant", "card_subtype", "card_number", "grading_company", "grade"]
@@ -1538,7 +1661,6 @@ with tab_list:
             updated_full.loc[updated_full["product_type"] == "Graded Card", "sealed_product_type"] = ""
             updated_full.loc[updated_full["product_type"] == "Card", ["sealed_product_type", "grading_company", "grade"]] = ""
 
-            # write updates + deletes
             sheets_update_rows(updated_full)
 
             if delete_ids:
@@ -1548,6 +1670,7 @@ with tab_list:
             refresh_inventory_from_sheets()
             if not delete_ids:
                 st.success("Changes saved.")
+
 
 # ---------------------------
 # TAB 3: Inventory Summary
