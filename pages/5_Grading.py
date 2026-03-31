@@ -2069,6 +2069,7 @@ with tab_summary:
         df["additional_costs"] = df["additional_costs"].apply(lambda v: safe_float(v, 0.0))
         df["psa9_price"] = df["psa9_price"].apply(lambda v: safe_float(v, 0.0))
         df["psa10_price"] = df["psa10_price"].apply(lambda v: safe_float(v, 0.0))
+        df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
 
         need_mask = (
             ((df["psa9_price"] == 0.0) | (df["psa10_price"] == 0.0))
@@ -2085,26 +2086,140 @@ with tab_summary:
 
         df["grading_total_cost"] = (df["grading_fee_initial"] + df["additional_costs"]).round(2)
 
-        grp = (
-            df.groupby(["submission_id", "submission_date", "estimated_return_date"], dropna=False)
-            .agg(
-                cards=("grading_row_id", "count"),
-                purchase_cost=("purchase_total", "sum"),
-                grading_cost=("grading_total_cost", "sum"),
-                psa9_value=("psa9_price", "sum"),
-                psa10_value=("psa10_price", "sum"),
+        def first_existing_col(columns, candidates):
+            cols_lower = {str(c).strip().lower(): c for c in columns}
+            for cand in candidates:
+                match = cols_lower.get(str(cand).strip().lower())
+                if match is not None:
+                    return match
+            return None
+
+        inv_roll = pd.DataFrame(columns=["inventory_id", "inventory_status", "inv_market_value", "inv_net_proceeds"])
+
+        if inv_df is not None and not inv_df.empty:
+            inv_roll = inv_df.copy()
+            inv_roll["inventory_id"] = inv_roll["inventory_id"].astype(str).str.strip()
+
+            if "inventory_status" not in inv_roll.columns:
+                inv_roll["inventory_status"] = ""
+            inv_roll["inventory_status"] = inv_roll["inventory_status"].astype(str).str.strip().str.upper()
+
+            market_val_col = first_existing_col(
+                inv_roll.columns,
+                ["market_value", "market price", "market_price"]
             )
-            .reset_index()
+            sold_val_col = first_existing_col(
+                inv_roll.columns,
+                [
+                    "net_proceeds",
+                    "net proceeds",
+                    "net_sale_proceeds",
+                    "net sale proceeds",
+                    "sold_net_proceeds",
+                    "sold net proceeds",
+                ]
+            )
+
+            inv_roll["inv_market_value"] = (
+                inv_roll[market_val_col].apply(lambda v: safe_float(v, 0.0))
+                if market_val_col is not None else 0.0
+            )
+            inv_roll["inv_net_proceeds"] = (
+                inv_roll[sold_val_col].apply(lambda v: safe_float(v, 0.0))
+                if sold_val_col is not None else 0.0
+            )
+
+            inv_roll = (
+                inv_roll[["inventory_id", "inventory_status", "inv_market_value", "inv_net_proceeds"]]
+                .drop_duplicates(subset=["inventory_id"], keep="last")
+                .copy()
+            )
+
+        df = df.merge(inv_roll, on="inventory_id", how="left")
+        df["inventory_status"] = df["inventory_status"].fillna("").astype(str).str.strip().str.upper()
+        df["inv_market_value"] = df["inv_market_value"].fillna(0.0).apply(lambda v: safe_float(v, 0.0))
+        df["inv_net_proceeds"] = df["inv_net_proceeds"].fillna(0.0).apply(lambda v: safe_float(v, 0.0))
+
+        df["row_returned"] = (
+            df["status"].astype(str).str.strip().str.upper().eq("RETURNED")
+            | (~df["returned_date"].apply(is_blank))
+            | (~df["received_grade"].apply(is_blank))
         )
+
+        summary_rows = []
+
+        grouped = df.groupby(["submission_id", "submission_date", "estimated_return_date"], dropna=False)
+
+        for (submission_id, submission_date, estimated_return_date), g in grouped:
+            submission_status = "Returned" if bool(g["row_returned"].all()) else "Pending"
+
+            purchase_cost = round(g["purchase_total"].sum(), 2)
+            grading_cost = round(g["grading_total_cost"].sum(), 2)
+            psa9_value = round(g["psa9_price"].sum(), 2)
+            psa10_value = round(g["psa10_price"].sum(), 2)
+
+            returned_sub_inventory_value = (
+                round(g["inv_market_value"].sum(), 2) if submission_status == "Returned" else None
+            )
+
+            market_value_in_inventory = round(
+                g.loc[g["inventory_status"].isin([STATUS_ACTIVE, STATUS_LISTED]), "inv_market_value"].sum(),
+                2,
+            )
+
+            total_sold_value = round(
+                g.loc[g["inventory_status"].eq(STATUS_SOLD), "inv_net_proceeds"].sum(),
+                2,
+            )
+
+            summary_rows.append(
+                {
+                    "submission_id": submission_id,
+                    "submission_date": submission_date,
+                    "estimated_return_date": estimated_return_date,
+                    "status_summary": submission_status,
+                    "cards": int(g["grading_row_id"].count()),
+                    "purchase_cost": purchase_cost,
+                    "grading_cost": grading_cost,
+                    "psa9_value": psa9_value,
+                    "psa10_value": psa10_value,
+                    "returned_sub_inventory_value": returned_sub_inventory_value,
+                    "market_value_in_inventory": market_value_in_inventory,
+                    "total_sold_value": total_sold_value,
+                }
+            )
+
+        grp = pd.DataFrame(summary_rows)
 
         grp["profit_all_psa9"] = (grp["psa9_value"] - (grp["purchase_cost"] + grp["grading_cost"])).round(2)
         grp["profit_all_psa10"] = (grp["psa10_value"] - (grp["purchase_cost"] + grp["grading_cost"])).round(2)
 
+        grp = grp.rename(
+            columns={
+                "status_summary": "Status",
+                "returned_sub_inventory_value": "Returned Sub Inventory Value",
+                "market_value_in_inventory": "Market Value in Inventory",
+                "total_sold_value": "Total Sold Value",
+            }
+        )
+
         def money(x):
+            if x is None or (isinstance(x, float) and pd.isna(x)):
+                return ""
             return f"${float(x):,.2f}"
 
         show = grp.copy()
-        for c in ["purchase_cost", "grading_cost", "psa9_value", "psa10_value", "profit_all_psa9", "profit_all_psa10"]:
+        for c in [
+            "purchase_cost",
+            "grading_cost",
+            "psa9_value",
+            "psa10_value",
+            "Returned Sub Inventory Value",
+            "Market Value in Inventory",
+            "Total Sold Value",
+            "profit_all_psa9",
+            "profit_all_psa10",
+        ]:
             show[c] = show[c].apply(money)
 
         st.dataframe(show, use_container_width=True, hide_index=True)
