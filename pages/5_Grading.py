@@ -2062,14 +2062,14 @@ with tab_summary:
         st.info("No grading data.")
     else:
         df = grading_df.copy()
-        df["submission_id"] = df["submission_id"].astype(str)
+        df["submission_id"] = df["submission_id"].astype(str).str.strip()
+        df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
 
         df["purchase_total"] = df["purchase_total"].apply(lambda v: safe_float(v, 0.0))
         df["grading_fee_initial"] = df["grading_fee_initial"].apply(lambda v: safe_float(v, 0.0))
         df["additional_costs"] = df["additional_costs"].apply(lambda v: safe_float(v, 0.0))
         df["psa9_price"] = df["psa9_price"].apply(lambda v: safe_float(v, 0.0))
         df["psa10_price"] = df["psa10_price"].apply(lambda v: safe_float(v, 0.0))
-        df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
 
         need_mask = (
             ((df["psa9_price"] == 0.0) | (df["psa10_price"] == 0.0))
@@ -2086,66 +2086,147 @@ with tab_summary:
 
         df["grading_total_cost"] = (df["grading_fee_initial"] + df["additional_costs"]).round(2)
 
-        def first_existing_col(columns, candidates):
-            cols_lower = {str(c).strip().lower(): c for c in columns}
-            for cand in candidates:
-                match = cols_lower.get(str(cand).strip().lower())
-                if match is not None:
-                    return match
-            return None
-
-        inv_roll = pd.DataFrame(columns=["inventory_id", "inventory_status", "inv_market_value", "inv_net_proceeds"])
+        # -------------------------------------------------
+        # Inventory rollup data
+        # -------------------------------------------------
+        inv_roll = pd.DataFrame(columns=[
+            "inventory_id",
+            "inventory_status",
+            "market_value",
+            "listed_transaction_id",
+        ])
 
         if inv_df is not None and not inv_df.empty:
             inv_roll = inv_df.copy()
+
+            # Handle either inventory_id or Inventory ID casing if needed
+            if "inventory_id" not in inv_roll.columns:
+                inv_roll["inventory_id"] = ""
             inv_roll["inventory_id"] = inv_roll["inventory_id"].astype(str).str.strip()
 
             if "inventory_status" not in inv_roll.columns:
                 inv_roll["inventory_status"] = ""
             inv_roll["inventory_status"] = inv_roll["inventory_status"].astype(str).str.strip().str.upper()
 
-            market_val_col = first_existing_col(
-                inv_roll.columns,
-                ["market_value", "market price", "market_price"]
-            )
-            sold_val_col = first_existing_col(
-                inv_roll.columns,
-                [
-                    "net_proceeds",
-                    "net proceeds",
-                    "net_sale_proceeds",
-                    "net sale proceeds",
-                    "sold_net_proceeds",
-                    "sold net proceeds",
-                ]
-            )
+            if "market_value" not in inv_roll.columns:
+                inv_roll["market_value"] = 0.0
+            inv_roll["market_value"] = inv_roll["market_value"].apply(lambda v: safe_float(v, 0.0))
 
-            inv_roll["inv_market_value"] = (
-                inv_roll[market_val_col].apply(lambda v: safe_float(v, 0.0))
-                if market_val_col is not None else 0.0
-            )
-            inv_roll["inv_net_proceeds"] = (
-                inv_roll[sold_val_col].apply(lambda v: safe_float(v, 0.0))
-                if sold_val_col is not None else 0.0
-            )
+            if "listed_transaction_id" not in inv_roll.columns:
+                inv_roll["listed_transaction_id"] = ""
+            inv_roll["listed_transaction_id"] = inv_roll["listed_transaction_id"].astype(str).str.strip()
 
             inv_roll = (
-                inv_roll[["inventory_id", "inventory_status", "inv_market_value", "inv_net_proceeds"]]
+                inv_roll[["inventory_id", "inventory_status", "market_value", "listed_transaction_id"]]
                 .drop_duplicates(subset=["inventory_id"], keep="last")
                 .copy()
             )
 
-        df = df.merge(inv_roll, on="inventory_id", how="left")
-        df["inventory_status"] = df["inventory_status"].fillna("").astype(str).str.strip().str.upper()
-        df["inv_market_value"] = df["inv_market_value"].fillna(0.0).apply(lambda v: safe_float(v, 0.0))
-        df["inv_net_proceeds"] = df["inv_net_proceeds"].fillna(0.0).apply(lambda v: safe_float(v, 0.0))
+        # -------------------------------------------------
+        # Transactions rollup data
+        # Total Sold Value must come from transactions.net_proceeds
+        # -------------------------------------------------
+        TRANSACTIONS_WS_NAME = st.secrets.get("transactions_worksheet", "transactions")
 
+        tx_df = pd.DataFrame()
+        try:
+            sh = get_sheet()
+            tx_ws = get_ws(sh, TRANSACTIONS_WS_NAME)
+            tx_df = read_ws_df(tx_ws)
+        except Exception:
+            tx_df = pd.DataFrame()
+
+        tx_roll_by_inv = pd.DataFrame(columns=["inventory_id", "sold_net_proceeds"])
+        tx_roll_by_tid = pd.DataFrame(columns=["transaction_id", "sold_net_proceeds_from_tid"])
+
+        if tx_df is not None and not tx_df.empty:
+            # Normalize likely column names
+            tx_cols = {str(c).strip().lower(): c for c in tx_df.columns}
+
+            inv_col = tx_cols.get("inventory_id")
+            tid_col = tx_cols.get("transaction_id")
+            net_col = tx_cols.get("net_proceeds") or tx_cols.get("net proceeds")
+            status_col = tx_cols.get("tx status") or tx_cols.get("tx_status") or tx_cols.get("status")
+
+            if inv_col is not None and net_col is not None:
+                work_tx = tx_df.copy()
+
+                work_tx["__inventory_id"] = work_tx[inv_col].astype(str).str.strip()
+                work_tx["__net_proceeds"] = work_tx[net_col].apply(lambda v: safe_float(v, 0.0))
+
+                if tid_col is not None:
+                    work_tx["__transaction_id"] = work_tx[tid_col].astype(str).str.strip()
+                else:
+                    work_tx["__transaction_id"] = ""
+
+                if status_col is not None:
+                    work_tx["__tx_status"] = work_tx[status_col].astype(str).str.strip().str.upper()
+                    work_tx = work_tx[work_tx["__tx_status"] == "SOLD"].copy()
+
+                tx_roll_by_inv = (
+                    work_tx.groupby("__inventory_id", dropna=False)["__net_proceeds"]
+                    .sum()
+                    .reset_index()
+                    .rename(columns={
+                        "__inventory_id": "inventory_id",
+                        "__net_proceeds": "sold_net_proceeds",
+                    })
+                )
+
+                if tid_col is not None:
+                    tx_roll_by_tid = (
+                        work_tx.groupby("__transaction_id", dropna=False)["__net_proceeds"]
+                        .sum()
+                        .reset_index()
+                        .rename(columns={
+                            "__transaction_id": "transaction_id",
+                            "__net_proceeds": "sold_net_proceeds_from_tid",
+                        })
+                    )
+
+        # -------------------------------------------------
+        # Merge grading -> inventory -> transactions
+        # Prefer exact match via listed_transaction_id -> transaction_id
+        # Fallback to inventory_id -> inventory_id
+        # -------------------------------------------------
+        df = df.merge(inv_roll, on="inventory_id", how="left")
+
+        if not tx_roll_by_tid.empty and "listed_transaction_id" in df.columns:
+            df["listed_transaction_id"] = df["listed_transaction_id"].astype(str).str.strip()
+            df = df.merge(
+                tx_roll_by_tid,
+                left_on="listed_transaction_id",
+                right_on="transaction_id",
+                how="left"
+            )
+        else:
+            df["sold_net_proceeds_from_tid"] = 0.0
+
+        if not tx_roll_by_inv.empty:
+            df = df.merge(tx_roll_by_inv, on="inventory_id", how="left")
+        else:
+            df["sold_net_proceeds"] = 0.0
+
+        df["inventory_status"] = df["inventory_status"].fillna("").astype(str).str.strip().str.upper()
+        df["market_value"] = df["market_value"].fillna(0.0).apply(lambda v: safe_float(v, 0.0))
+        df["sold_net_proceeds_from_tid"] = df["sold_net_proceeds_from_tid"].fillna(0.0).apply(lambda v: safe_float(v, 0.0))
+        df["sold_net_proceeds"] = df["sold_net_proceeds"].fillna(0.0).apply(lambda v: safe_float(v, 0.0))
+
+        # Prefer sold proceeds found by exact linked transaction id; otherwise fallback to inventory_id match
+        df["sold_value_final"] = df["sold_net_proceeds_from_tid"]
+        fallback_mask = df["sold_value_final"] == 0.0
+        df.loc[fallback_mask, "sold_value_final"] = df.loc[fallback_mask, "sold_net_proceeds"]
+
+        # Row returned logic
         df["row_returned"] = (
             df["status"].astype(str).str.strip().str.upper().eq("RETURNED")
             | (~df["returned_date"].apply(is_blank))
             | (~df["received_grade"].apply(is_blank))
         )
 
+        # -------------------------------------------------
+        # Build submission summary rows
+        # -------------------------------------------------
         summary_rows = []
 
         grouped = df.groupby(["submission_id", "submission_date", "estimated_return_date"], dropna=False)
@@ -2159,49 +2240,38 @@ with tab_summary:
             psa10_value = round(g["psa10_price"].sum(), 2)
 
             returned_sub_inventory_value = (
-                round(g["inv_market_value"].sum(), 2) if submission_status == "Returned" else None
+                round(g["market_value"].sum(), 2) if submission_status == "Returned" else None
             )
 
             market_value_in_inventory = round(
-                g.loc[g["inventory_status"].isin([STATUS_ACTIVE, STATUS_LISTED]), "inv_market_value"].sum(),
-                2,
+                g.loc[g["inventory_status"].isin([STATUS_ACTIVE, STATUS_LISTED]), "market_value"].sum(),
+                2
             )
 
             total_sold_value = round(
-                g.loc[g["inventory_status"].eq(STATUS_SOLD), "inv_net_proceeds"].sum(),
-                2,
+                g.loc[g["inventory_status"] == STATUS_SOLD, "sold_value_final"].sum(),
+                2
             )
 
-            summary_rows.append(
-                {
-                    "submission_id": submission_id,
-                    "submission_date": submission_date,
-                    "estimated_return_date": estimated_return_date,
-                    "status_summary": submission_status,
-                    "cards": int(g["grading_row_id"].count()),
-                    "purchase_cost": purchase_cost,
-                    "grading_cost": grading_cost,
-                    "psa9_value": psa9_value,
-                    "psa10_value": psa10_value,
-                    "returned_sub_inventory_value": returned_sub_inventory_value,
-                    "market_value_in_inventory": market_value_in_inventory,
-                    "total_sold_value": total_sold_value,
-                }
-            )
+            summary_rows.append({
+                "submission_id": submission_id,
+                "submission_date": submission_date,
+                "estimated_return_date": estimated_return_date,
+                "Status": submission_status,
+                "cards": int(g["grading_row_id"].count()),
+                "purchase_cost": purchase_cost,
+                "grading_cost": grading_cost,
+                "psa9_value": psa9_value,
+                "psa10_value": psa10_value,
+                "Returned Sub Inventory Value": returned_sub_inventory_value,
+                "Market Value in Inventory": market_value_in_inventory,
+                "Total Sold Value": total_sold_value,
+            })
 
         grp = pd.DataFrame(summary_rows)
 
         grp["profit_all_psa9"] = (grp["psa9_value"] - (grp["purchase_cost"] + grp["grading_cost"])).round(2)
         grp["profit_all_psa10"] = (grp["psa10_value"] - (grp["purchase_cost"] + grp["grading_cost"])).round(2)
-
-        grp = grp.rename(
-            columns={
-                "status_summary": "Status",
-                "returned_sub_inventory_value": "Returned Sub Inventory Value",
-                "market_value_in_inventory": "Market Value in Inventory",
-                "total_sold_value": "Total Sold Value",
-            }
-        )
 
         def money(x):
             if x is None or (isinstance(x, float) and pd.isna(x)):
