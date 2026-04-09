@@ -1760,7 +1760,7 @@ with tab_bs:
                 "Proceeds": "${:,.2f}",
                 "Profit": "${:,.2f}",
             })
-            .applymap(_style_red_green, subset=["Profit"])
+            .map(_style_red_green, subset=["Profit"])
             .set_table_styles(_styler_table_header())
         )
         st.dataframe(sty3, use_container_width=True, hide_index=True)
@@ -1821,7 +1821,8 @@ with tab_bs:
                 "Fees/shipping": "${:,.2f}",
                 "Profit/Loss": "${:,.2f}",
             })
-            .applymap(_style_red_green, subset=["Profit/Loss"])
+            .map(_style_red_green, subset=["Profit/Loss"])
+            
             .set_table_styles(_styler_table_header())
         )
         st.dataframe(sty4, use_container_width=True, hide_index=True)
