@@ -1,5 +1,6 @@
 # pages/2_Inventory.py
 import io
+import importlib.util
 import json
 import re
 import time
@@ -1286,11 +1287,43 @@ def get_upload_template_df() -> pd.DataFrame:
     ], columns=UPLOAD_TEMPLATE_COLUMNS)
 
 
+def _module_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except Exception:
+        return False
+
+
+def _get_excel_template_engine() -> str | None:
+    if _module_available("xlsxwriter"):
+        return "xlsxwriter"
+    if _module_available("openpyxl"):
+        return "openpyxl"
+    return None
+
+
+def _get_excel_read_engine(file_name: str) -> str | None:
+    lowered = (file_name or "").lower()
+    if lowered.endswith(".xlsx") or lowered.endswith(".xlsm"):
+        if _module_available("openpyxl"):
+            return "openpyxl"
+        return None
+    if lowered.endswith(".xls"):
+        if _module_available("xlrd"):
+            return "xlrd"
+        return None
+    return None
+
+
 @st.cache_data(show_spinner=False)
 def build_upload_template_excel_bytes() -> bytes:
     template_df = get_upload_template_df()
+    engine = _get_excel_template_engine()
+    if not engine:
+        return b""
+
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    with pd.ExcelWriter(output, engine=engine) as writer:
         template_df.to_excel(writer, sheet_name="inventory_upload", index=False)
     output.seek(0)
     return output.getvalue()
@@ -1554,15 +1587,20 @@ with tab_new:
         template_df = get_upload_template_df()
         st.dataframe(template_df, use_container_width=True, hide_index=True)
 
+        excel_template_bytes = build_upload_template_excel_bytes()
+
         t1, t2 = st.columns([1, 1])
         with t1:
-            st.download_button(
-                "Download Excel template",
-                data=build_upload_template_excel_bytes(),
-                file_name="inventory_upload_template.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+            if excel_template_bytes:
+                st.download_button(
+                    "Download Excel template",
+                    data=excel_template_bytes,
+                    file_name="inventory_upload_template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            else:
+                st.info("Excel template download is unavailable in this environment. Use the CSV template below.")
         with t2:
             st.download_button(
                 "Download CSV template",
@@ -1588,7 +1626,22 @@ with tab_new:
                 if file_name.endswith(".csv"):
                     raw_upload_df = pd.read_csv(uploaded_inventory_file)
                 else:
-                    raw_upload_df = pd.read_excel(uploaded_inventory_file)
+                    excel_engine = _get_excel_read_engine(file_name)
+                    if not excel_engine:
+                        if file_name.endswith(".xlsx") or file_name.endswith(".xlsm"):
+                            st.error("This app environment is missing the library needed to read .xlsx files. Please upload the file as CSV or install openpyxl.")
+                        elif file_name.endswith(".xls"):
+                            st.error("This app environment is missing the library needed to read .xls files. Please upload the file as CSV or install xlrd.")
+                        else:
+                            st.error("Unsupported file type. Please upload .xlsx, .xls, or .csv.")
+                        raw_upload_df = pd.DataFrame()
+                    else:
+                        raw_upload_df = pd.read_excel(uploaded_inventory_file, engine=excel_engine)
+
+                if raw_upload_df.empty and not file_name.endswith(".csv") and not ((file_name.endswith(".xlsx") or file_name.endswith(".xlsm") or file_name.endswith(".xls")) and _get_excel_read_engine(file_name)):
+                    upload_preview_df = pd.DataFrame()
+                else:
+                    upload_preview_df = normalize_uploaded_inventory_df(raw_upload_df)
 
                 upload_preview_df = normalize_uploaded_inventory_df(raw_upload_df)
 
