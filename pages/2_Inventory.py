@@ -1,4 +1,5 @@
 # pages/2_Inventory.py
+import io
 import json
 import re
 import time
@@ -1083,6 +1084,373 @@ def sheets_append_inventory_row(row_internal: dict):
     ws.append_row(ordered, value_input_option="USER_ENTERED")
 
 
+def sheets_append_inventory_rows(rows_internal: list[dict]):
+    if not rows_internal:
+        return
+
+    ws = get_worksheet()
+    sheet_headers = ensure_headers(ws)
+    header_to_internal = {h: sheet_header_to_internal(h) for h in sheet_headers}
+
+    payload = []
+    for row_internal in rows_internal:
+        ordered = []
+        for sheet_h in sheet_headers:
+            internal = header_to_internal.get(sheet_h, sheet_h)
+            ordered.append(row_internal.get(internal, ""))
+        payload.append(ordered)
+
+    ws.append_rows(payload, value_input_option="USER_ENTERED")
+
+
+UPLOAD_TEMPLATE_COLUMNS = [
+    "Reference link",
+    "Product Type",
+    "Card Type",
+    "Brand/League",
+    "Set",
+    "Variant",
+    "Year",
+    "Card Name",
+    "Card Subtype",
+    "Card #",
+    "Condition",
+    "Purchase Date",
+    "Purchase Price",
+    "Tax",
+    "Purchased from",
+    "Shipping",
+    "Notes",
+]
+
+UPLOAD_COLUMN_ALIASES = {
+    "reference_link": ["Reference link", "Reference Link", "reference_link", "Reference_Link"],
+    "product_type": ["Product Type", "product_type"],
+    "card_type": ["Card Type", "card_type"],
+    "brand_or_league": ["Brand/League", "Brand / League", "Brand or League", "brand_or_league", "brand_orleague"],
+    "set_name": ["Set", "Set Name", "set_name"],
+    "variant": ["Variant", "variant"],
+    "year": ["Year", "year"],
+    "card_name": ["Card Name", "Item Name", "item_name", "card_name"],
+    "card_subtype": ["Card Subtype", "card_subtype"],
+    "card_number": ["Card #", "Card Number", "card_number", "card #"],
+    "condition": ["Condition", "condition"],
+    "purchase_date": ["Purchase Date", "purchase_date"],
+    "purchase_price": ["Purchase Price", "purchase_price"],
+    "tax": ["Tax", "tax"],
+    "purchased_from": ["Purchased from", "Purchased From", "purchased_from"],
+    "shipping": ["Shipping", "shipping"],
+    "notes": ["Notes", "notes"],
+    # supported extras for sealed / graded / repeated rows
+    "sealed_product_type": ["Sealed Product Type", "sealed_product_type"],
+    "grading_company": ["Grading Company", "grading_company"],
+    "grade": ["Grade", "grade"],
+    "quantity": ["Quantity", "quantity"],
+    "image_url": ["Image URL", "image_url"],
+}
+
+
+CONDITION_NORMALIZATION = {
+    "nm": "Near Mint",
+    "nearmint": "Near Mint",
+    "mint": "Near Mint",
+    "lp": "Lightly Played",
+    "lightlyplayed": "Lightly Played",
+    "mp": "Moderately Played",
+    "moderatelyplayed": "Moderately Played",
+    "hp": "Heavily Played",
+    "heavilyplayed": "Heavily Played",
+    "dmg": "Damaged",
+    "damaged": "Damaged",
+}
+
+
+def required_label(label: str) -> str:
+    return f"{label} (Required)"
+
+
+def optional_label(label: str) -> str:
+    return f"{label} (Optional)"
+
+
+def _clean_text(x) -> str:
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    return str(x).strip()
+
+
+def _has_value(x) -> bool:
+    return _clean_text(x) != ""
+
+
+def _first_non_blank(*values):
+    for v in values:
+        txt = _clean_text(v)
+        if txt != "":
+            return txt
+    return ""
+
+
+def _normalize_product_type_value(x: str) -> str:
+    val = _clean_text(x).lower()
+    if val in {"card", "raw", "raw card"}:
+        return "Card"
+    if val in {"sealed", "sealed product", "product"}:
+        return "Sealed"
+    if val in {"graded", "graded card", "slab", "slabbed"}:
+        return "Graded Card"
+    return _clean_text(x)
+
+
+def _normalize_card_type_value(x: str) -> str:
+    val = _clean_text(x).lower()
+    if val == "pokemon":
+        return "Pokemon"
+    if val == "sports":
+        return "Sports"
+    return _clean_text(x)
+
+
+def _normalize_condition_value(x: str) -> str:
+    raw = _clean_text(x)
+    key = _normalize_header_name(raw)
+    if key in CONDITION_NORMALIZATION:
+        return CONDITION_NORMALIZATION[key]
+
+    for option in CONDITION_OPTIONS:
+        if _normalize_header_name(option) == key:
+            return option
+
+    return raw
+
+
+def _normalize_grading_company_value(x: str) -> str:
+    val = _clean_text(x).upper()
+    if val in {"PSA", "CGC", "BECKETT"}:
+        return val if val != "BECKETT" else "Beckett"
+    return _clean_text(x)
+
+
+def _coerce_purchase_date(x) -> str:
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+
+    parsed = pd.to_datetime(x, errors="coerce")
+    if pd.isna(parsed):
+        return ""
+    return str(parsed.date())
+
+
+def _coerce_quantity(x) -> int:
+    txt = _clean_text(x)
+    if not txt:
+        return 1
+    try:
+        q = int(float(txt))
+        return max(1, q)
+    except Exception:
+        return 1
+
+
+def get_upload_template_df() -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "Reference link": "https://www.pricecharting.com/game/pokemon-surging-sparks/pikachu-ex-247",
+            "Product Type": "Card",
+            "Card Type": "Pokemon",
+            "Brand/League": "Pokemon TCG",
+            "Set": "Surging Sparks",
+            "Variant": "EX",
+            "Year": "2024",
+            "Card Name": "Pikachu",
+            "Card Subtype": "Illustration Rare",
+            "Card #": "247",
+            "Condition": "Near Mint",
+            "Purchase Date": "2026-04-17",
+            "Purchase Price": 18.00,
+            "Tax": 1.53,
+            "Purchased from": "Card Show",
+            "Shipping": 0.00,
+            "Notes": "Example row",
+        }
+    ], columns=UPLOAD_TEMPLATE_COLUMNS)
+
+
+@st.cache_data(show_spinner=False)
+def build_upload_template_excel_bytes() -> bytes:
+    template_df = get_upload_template_df()
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        template_df.to_excel(writer, sheet_name="inventory_upload", index=False)
+    output.seek(0)
+    return output.getvalue()
+
+
+def normalize_uploaded_inventory_df(upload_df: pd.DataFrame) -> pd.DataFrame:
+    if upload_df is None or upload_df.empty:
+        return pd.DataFrame(columns=list(UPLOAD_COLUMN_ALIASES.keys()))
+
+    df = upload_df.copy()
+    rename_map = {}
+    for internal, aliases in UPLOAD_COLUMN_ALIASES.items():
+        match = _find_matching_column(df.columns, aliases)
+        if match:
+            rename_map[match] = internal
+
+    df = df.rename(columns=rename_map)
+
+    for col in UPLOAD_COLUMN_ALIASES.keys():
+        if col not in df.columns:
+            df[col] = ""
+
+    df = df[list(UPLOAD_COLUMN_ALIASES.keys())].copy()
+
+    # drop fully empty rows
+    df = df[df.apply(lambda r: any(_has_value(v) for v in r.tolist()), axis=1)].copy()
+
+    return df
+
+
+def build_inventory_rows_from_inputs(input_row: dict, prefill_details: dict | None = None) -> tuple[list[dict], list[str]]:
+    input_row = input_row or {}
+    details = dict(prefill_details or {})
+
+    ref_link = _clean_text(input_row.get("reference_link"))
+    if ref_link and not details:
+        try:
+            details = fetch_details_and_image(ref_link)
+        except Exception:
+            details = {}
+
+    product_type = _normalize_product_type_value(_first_non_blank(input_row.get("product_type"), details.get("product_type"), "Card"))
+    card_type = _normalize_card_type_value(_first_non_blank(input_row.get("card_type"), details.get("card_type"), "Pokemon"))
+    brand_or_league = _first_non_blank(input_row.get("brand_or_league"), details.get("brand_or_league"))
+    set_name = _first_non_blank(input_row.get("set_name"), details.get("set_name"))
+    year = _first_non_blank(input_row.get("year"), details.get("year"))
+    card_name = _first_non_blank(input_row.get("card_name"), details.get("card_name"))
+    card_number = _first_non_blank(input_row.get("card_number"), details.get("card_number"))
+    variant = _first_non_blank(input_row.get("variant"), details.get("variant"))
+    card_subtype = _first_non_blank(input_row.get("card_subtype"), details.get("card_subtype"))
+    sealed_product_type = _first_non_blank(input_row.get("sealed_product_type"), details.get("sealed_product_type"))
+    grading_company = _normalize_grading_company_value(input_row.get("grading_company"))
+    grade = _clean_text(input_row.get("grade"))
+    condition = _normalize_condition_value(input_row.get("condition"))
+    purchase_date = _coerce_purchase_date(input_row.get("purchase_date"))
+    purchased_from = _clean_text(input_row.get("purchased_from"))
+    purchase_price = _money(input_row.get("purchase_price"))
+    shipping = _money(input_row.get("shipping"))
+    tax = _money(input_row.get("tax"))
+    notes = _clean_text(input_row.get("notes"))
+    image_url = _first_non_blank(input_row.get("image_url"), details.get("image_url"))
+    quantity = _coerce_quantity(input_row.get("quantity"))
+
+    if product_type == "Sealed":
+        condition = "Sealed"
+    elif product_type == "Graded Card":
+        condition = "Graded"
+
+    missing = []
+    if not product_type:
+        missing.append("Product Type")
+    if not card_type:
+        missing.append("Card Type")
+    if not card_name:
+        missing.append("Item/Card name")
+    if not brand_or_league:
+        missing.append("Brand / League")
+    if not purchase_date:
+        missing.append("Purchase Date")
+    if not purchased_from:
+        missing.append("Purchased from")
+
+    if product_type == "Sealed" and not sealed_product_type:
+        missing.append("Sealed Product Type")
+
+    if product_type == "Card" and not condition:
+        missing.append("Condition")
+
+    if product_type == "Graded Card":
+        if not grading_company:
+            missing.append("Grading Company")
+        if not grade:
+            missing.append("Grade")
+
+    if product_type not in PRODUCT_TYPE_OPTIONS:
+        missing.append("Valid Product Type")
+    if card_type not in CARD_TYPE_OPTIONS:
+        missing.append("Valid Card Type")
+    if product_type == "Card" and condition and condition not in CONDITION_OPTIONS:
+        missing.append("Valid Condition")
+    if product_type == "Graded Card" and grading_company and grading_company not in GRADING_COMPANY_OPTIONS:
+        missing.append("Valid Grading Company")
+
+    if missing:
+        deduped = []
+        for item in missing:
+            if item not in deduped:
+                deduped.append(item)
+        return [], deduped
+
+    total_price = _compute_total(purchase_price, shipping, tax)
+    mv = 0.0
+    if ref_link and "pricecharting.com" in ref_link.lower():
+        mv = compute_market_price_for_row(
+            ref_link,
+            product_type,
+            grade if product_type == "Graded Card" else "",
+            grading_company if product_type == "Graded Card" else "",
+        )
+
+    created_at = pd.Timestamp.utcnow().isoformat()
+    rows = []
+    for _ in range(quantity):
+        rows.append({
+            "inventory_id": str(uuid.uuid4())[:8],
+            "image_url": image_url,
+            "product_type": product_type,
+            "sealed_product_type": sealed_product_type if product_type == "Sealed" else "",
+            "card_type": card_type,
+            "brand_or_league": brand_or_league,
+            "set_name": set_name,
+            "year": year,
+            "card_name": card_name,
+            "card_number": card_number if product_type in ["Card", "Graded Card"] else "",
+            "variant": variant if product_type in ["Card", "Graded Card"] else "",
+            "card_subtype": card_subtype if product_type in ["Card", "Graded Card"] else "",
+            "grading_company": grading_company if product_type == "Graded Card" else "",
+            "grade": grade if product_type == "Graded Card" else "",
+            "reference_link": ref_link,
+            "purchase_date": purchase_date,
+            "purchased_from": purchased_from,
+            "purchase_price": float(purchase_price),
+            "shipping": float(shipping),
+            "tax": float(tax),
+            "total_price": float(total_price),
+            "grading_fee": 0.0,
+            "total_cost": float(_compute_total_cost(total_price, 0.0)),
+            "condition": condition,
+            "notes": notes,
+            "created_at": created_at,
+            "inventory_status": STATUS_ACTIVE,
+            "listed_transaction_id": "",
+            "market_price": float(mv),
+            "market_value": float(mv),
+            "market_price_updated_at": created_at if mv else "",
+        })
+
+    return rows, []
+
+
 def sheets_update_rows(rows_internal: pd.DataFrame):
     if rows_internal.empty:
         return
@@ -1173,12 +1541,98 @@ tab_new, tab_list, tab_summary = st.tabs(["New Inventory", "Inventory List", "In
 # ---------------------------
 with tab_new:
     st.subheader("Add new inventory (intake)")
-    st.caption("Paste a PriceCharting link and click Pull details to auto-fill fields (and image).")
+    st.caption("Use the form for one-off entries or upload an Excel intake file for bulk adds.")
+
+    bulk_upload_expander = st.expander("Bulk upload from Excel", expanded=False)
+    with bulk_upload_expander:
+        st.caption(
+            "Upload an .xlsx or .xls file using the template columns below. "
+            "For raw cards, the template is enough. For sealed or graded inventory, you can also include "
+            "Sealed Product Type, Grading Company, Grade, and Quantity columns if needed."
+        )
+
+        template_df = get_upload_template_df()
+        st.dataframe(template_df, use_container_width=True, hide_index=True)
+
+        t1, t2 = st.columns([1, 1])
+        with t1:
+            st.download_button(
+                "Download Excel template",
+                data=build_upload_template_excel_bytes(),
+                file_name="inventory_upload_template.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with t2:
+            st.download_button(
+                "Download CSV template",
+                data=template_df.to_csv(index=False).encode("utf-8"),
+                file_name="inventory_upload_template.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        uploaded_inventory_file = st.file_uploader(
+            "Upload inventory file",
+            type=["xlsx", "xls", "csv"],
+            key="inventory_bulk_upload_file",
+            help="Each row becomes one inventory item unless you add an optional Quantity column.",
+        )
+
+        upload_preview_df = pd.DataFrame()
+        upload_errors_df = pd.DataFrame()
+
+        if uploaded_inventory_file is not None:
+            try:
+                file_name = (uploaded_inventory_file.name or "").lower()
+                if file_name.endswith(".csv"):
+                    raw_upload_df = pd.read_csv(uploaded_inventory_file)
+                else:
+                    raw_upload_df = pd.read_excel(uploaded_inventory_file)
+
+                upload_preview_df = normalize_uploaded_inventory_df(raw_upload_df)
+
+                if upload_preview_df.empty:
+                    st.warning("The uploaded file does not have any data rows to process.")
+                else:
+                    st.markdown("##### Upload preview")
+                    st.dataframe(upload_preview_df.head(25), use_container_width=True, hide_index=True)
+
+                    if st.button("Add uploaded rows to inventory", type="primary", use_container_width=True, key="bulk_add_inventory_rows"):
+                        rows_to_insert = []
+                        error_rows = []
+
+                        for i, (_, upload_row) in enumerate(upload_preview_df.iterrows(), start=2):
+                            built_rows, row_errors = build_inventory_rows_from_inputs(upload_row.to_dict())
+                            if row_errors:
+                                error_rows.append({
+                                    "Excel Row": i,
+                                    "Card Name": _clean_text(upload_row.get("card_name")),
+                                    "Errors": ", ".join(row_errors),
+                                })
+                            else:
+                                rows_to_insert.extend(built_rows)
+
+                        if error_rows:
+                            upload_errors_df = pd.DataFrame(error_rows)
+                            st.error("Nothing was uploaded. Fix the rows below and re-upload the file.")
+                            st.dataframe(upload_errors_df, use_container_width=True, hide_index=True)
+                        elif not rows_to_insert:
+                            st.warning("No valid rows were found to upload.")
+                        else:
+                            sheets_append_inventory_rows(rows_to_insert)
+                            refresh_inventory_from_sheets()
+                            st.success(f"Added {len(rows_to_insert)} item(s) from the uploaded file.")
+            except Exception as exc:
+                st.error(f"Could not read the upload file: {exc}")
+
+    st.markdown("---")
+    st.caption("Paste a PriceCharting link and click Pull details to auto-fill fields and image for a manual entry.")
 
     link_col1, link_col2 = st.columns([4, 1])
     with link_col1:
         reference_link = st.text_input(
-            "Reference link (recommended)",
+            optional_label("Reference link") + " — recommended",
             key="ref_link_input",
             placeholder="https://www.pricecharting.com/game/pokemon-surging-sparks/elite-trainer-box",
         )
@@ -1204,14 +1658,14 @@ with tab_new:
 
         with a1:
             product_type = st.selectbox(
-                "Product Type*",
+                required_label("Product Type"),
                 PRODUCT_TYPE_OPTIONS,
                 index=(PRODUCT_TYPE_OPTIONS.index(prefill.get("product_type")) if prefill.get("product_type") in PRODUCT_TYPE_OPTIONS else 0),
             )
 
         with a2:
             card_type = st.selectbox(
-                "Card Type*",
+                required_label("Card Type"),
                 CARD_TYPE_OPTIONS,
                 index=(CARD_TYPE_OPTIONS.index(prefill.get("card_type")) if prefill.get("card_type") in CARD_TYPE_OPTIONS else 0),
             )
@@ -1226,24 +1680,24 @@ with tab_new:
                     pre = (prefill.get("sealed_product_type") or "").strip()
                     options = [""] + POKEMON_SEALED_TYPE_OPTIONS
                     idx = options.index(pre) if pre in options else 0
-                    sealed_product_type = st.selectbox("Sealed Product Type*", options=options, index=idx)
+                    sealed_product_type = st.selectbox(required_label("Sealed Product Type"), options=options, index=idx)
                 else:
-                    sealed_product_type = st.text_input("Sealed Product Type*", value=(prefill.get("sealed_product_type") or ""))
+                    sealed_product_type = st.text_input(required_label("Sealed Product Type"), value=(prefill.get("sealed_product_type") or ""))
 
             elif product_type == "Graded Card":
-                grading_company = st.selectbox("Grading Company*", GRADING_COMPANY_OPTIONS, index=0)
+                grading_company = st.selectbox(required_label("Grading Company"), GRADING_COMPANY_OPTIONS, index=0)
                 if grading_company == "PSA":
-                    grade = st.selectbox("Grade*", PSA_GRADE_OPTIONS, index=0)
+                    grade = st.selectbox(required_label("Grade"), PSA_GRADE_OPTIONS, index=0)
                 elif grading_company == "CGC":
-                    grade = st.selectbox("Grade*", CGC_GRADE_OPTIONS, index=0)
+                    grade = st.selectbox(required_label("Grade"), CGC_GRADE_OPTIONS, index=0)
                 else:
-                    grade = st.selectbox("Grade*", BECKETT_GRADE_OPTIONS, index=0)
+                    grade = st.selectbox(required_label("Grade"), BECKETT_GRADE_OPTIONS, index=0)
             else:
                 st.caption("Sealed/Grading fields show when applicable.")
 
         with a4:
             quantity = st.number_input(
-                "Quantity*",
+                required_label("Quantity"),
                 min_value=1,
                 step=1,
                 value=1,
@@ -1254,134 +1708,89 @@ with tab_new:
 
         with c1:
             brand_or_league = st.text_input(
-                "Brand / League*",
+                required_label("Brand / League"),
                 value=prefill.get("brand_or_league", ""),
                 placeholder="Pokemon TCG / Football / NBA / MLB / Soccer / etc.",
             )
-            year = st.text_input("Year (optional)", value=prefill.get("year", ""), placeholder="2024, 2025, ...")
+            year = st.text_input(optional_label("Year"), value=prefill.get("year", ""), placeholder="2024, 2025, ...")
 
         with c2:
-            set_name = st.text_input("Set (optional)", value=prefill.get("set_name", ""), placeholder="Surging Sparks, Prizm, Optic, ...")
-            name_label = "Item name*" if product_type == "Sealed" else "Card name*"
+            set_name = st.text_input(optional_label("Set"), value=prefill.get("set_name", ""), placeholder="Surging Sparks, Prizm, Optic, ...")
+            name_label = required_label("Item name") if product_type == "Sealed" else required_label("Card name")
             card_name = st.text_input(name_label, value=prefill.get("card_name", ""), placeholder="Elite Trainer Box / Pikachu / etc.")
 
             if product_type in ["Card", "Graded Card"]:
-                card_number = st.text_input("Card # (optional)", value=prefill.get("card_number", ""), placeholder="332")
+                card_number = st.text_input(optional_label("Card #"), value=prefill.get("card_number", ""), placeholder="332")
             else:
                 card_number = ""
 
         with c3:
             if product_type in ["Card", "Graded Card"]:
-                variant = st.text_input("Variant (optional)", value=prefill.get("variant", ""), placeholder="Silver, Holo, Parallel, EX, ...")
-                card_subtype = st.text_input("Card subtype (optional)", value=prefill.get("card_subtype", ""), placeholder="Rookie, Insert, Parallel, etc.")
+                variant = st.text_input(optional_label("Variant"), value=prefill.get("variant", ""), placeholder="Silver, Holo, Parallel, EX, ...")
+                card_subtype = st.text_input(optional_label("Card subtype"), value=prefill.get("card_subtype", ""), placeholder="Rookie, Insert, Parallel, etc.")
 
                 if product_type == "Card":
-                    condition = st.selectbox("Condition*", CONDITION_OPTIONS, index=0)
+                    condition = st.selectbox(required_label("Condition"), CONDITION_OPTIONS, index=0)
                 else:
                     condition = "Graded"
-                    st.caption("Condition is not used for graded cards (grade is stored instead).")
+                    st.caption("Condition is not used for graded cards because the grade is stored instead.")
             else:
                 variant = ""
                 card_subtype = ""
                 condition = "Sealed"
-                st.caption("Variant / Card subtype / Card # / Condition are not applicable for sealed.")
+                st.caption("Variant / Card subtype / Card # / Condition are not applicable for sealed items.")
 
         st.markdown("---")
 
         c4, c5, c6 = st.columns(3)
         with c4:
-            purchase_date = st.date_input("Purchase date*", value=date.today())
-            purchased_from = st.text_input("Purchased from*", placeholder="eBay, Whatnot, card show, LCS, etc.")
+            purchase_date = st.date_input(required_label("Purchase date"), value=date.today())
+            purchased_from = st.text_input(required_label("Purchased from"), placeholder="eBay, Whatnot, card show, LCS, etc.")
 
         with c5:
-            purchase_price = st.number_input("Purchase price (per item)*", min_value=0.0, step=1.0, format="%.2f")
-            shipping = st.number_input("Shipping (per item)", min_value=0.0, step=1.0, format="%.2f")
+            purchase_price = st.number_input(required_label("Purchase price (per item)"), min_value=0.0, step=1.0, format="%.2f")
+            shipping = st.number_input(optional_label("Shipping (per item)"), min_value=0.0, step=1.0, format="%.2f")
 
         with c6:
-            tax = st.number_input("Tax (per item)", min_value=0.0, step=1.0, format="%.2f")
-            notes = st.text_area("Notes (optional)", height=92)
+            tax = st.number_input(optional_label("Tax (per item)"), min_value=0.0, step=1.0, format="%.2f")
+            notes = st.text_area(optional_label("Notes"), height=92)
 
         submitted = st.form_submit_button("Add to Inventory", type="primary", use_container_width=True)
 
         if submitted:
-            missing = []
-            if not card_name.strip():
-                missing.append("Item/Card name")
-            if not brand_or_league.strip():
-                missing.append("Brand / League")
-            if not purchased_from.strip():
-                missing.append("Purchased from")
+            manual_input = {
+                "reference_link": reference_link,
+                "product_type": product_type,
+                "card_type": card_type,
+                "sealed_product_type": sealed_product_type,
+                "brand_or_league": brand_or_league,
+                "set_name": set_name,
+                "variant": variant,
+                "year": year,
+                "card_name": card_name,
+                "card_subtype": card_subtype,
+                "card_number": card_number,
+                "condition": condition,
+                "purchase_date": purchase_date,
+                "purchase_price": purchase_price,
+                "tax": tax,
+                "purchased_from": purchased_from,
+                "shipping": shipping,
+                "notes": notes,
+                "grading_company": grading_company,
+                "grade": grade,
+                "quantity": quantity,
+            }
 
-            if product_type == "Sealed" and not sealed_product_type.strip():
-                missing.append("Sealed Product Type")
-
-            if product_type == "Card" and not str(condition).strip():
-                missing.append("Condition")
-
-            if product_type == "Graded Card":
-                if not str(grading_company).strip():
-                    missing.append("Grading Company")
-                if not str(grade).strip():
-                    missing.append("Grade")
+            new_rows, missing = build_inventory_rows_from_inputs(manual_input, prefill_details=prefill)
 
             if missing:
                 st.error("Missing required fields: " + ", ".join(missing))
             else:
-                total_price = _compute_total(purchase_price, shipping, tax)
-                created_ids = []
-
-                for _ in range(int(quantity)):
-                    ref_link = reference_link.strip() if reference_link else ""
-                    mv = 0.0
-                    if ref_link and "pricecharting.com" in ref_link.lower():
-                        mv = compute_market_price_for_row(
-                            ref_link,
-                            product_type,
-                            grade if product_type == "Graded Card" else "",
-                            grading_company if product_type == "Graded Card" else "",
-                        )
-
-                    new_row = {
-                        "inventory_id": str(uuid.uuid4())[:8],
-                        "image_url": (prefill.get("image_url") or ""),
-                        "product_type": product_type.strip(),
-                        "sealed_product_type": sealed_product_type.strip() if product_type == "Sealed" else "",
-                        "card_type": card_type.strip(),
-                        "brand_or_league": brand_or_league.strip(),
-                        "set_name": set_name.strip() if set_name else "",
-                        "year": year.strip() if year else "",
-                        "card_name": card_name.strip(),
-                        "card_number": card_number.strip() if card_number else "",
-                        "variant": variant.strip() if variant else "",
-                        "card_subtype": card_subtype.strip() if card_subtype else "",
-                        "grading_company": grading_company.strip() if product_type == "Graded Card" else "",
-                        "grade": grade.strip() if product_type == "Graded Card" else "",
-                        "reference_link": ref_link,
-                        "purchase_date": str(purchase_date),
-                        "purchased_from": purchased_from.strip(),
-                        "purchase_price": float(purchase_price),
-                        "shipping": float(shipping),
-                        "tax": float(tax),
-                        "total_price": float(total_price),
-                        "grading_fee": 0.0,
-                        "total_cost": float(_compute_total_cost(total_price, 0.0)),
-                        "condition": "Sealed" if product_type == "Sealed" else ("Graded" if product_type == "Graded Card" else condition),
-                        "notes": notes.strip() if notes else "",
-                        "created_at": pd.Timestamp.utcnow().isoformat(),
-                        "inventory_status": STATUS_ACTIVE,
-                        "listed_transaction_id": "",
-                        "market_price": float(mv),
-                        "market_value": float(mv),
-                        "market_price_updated_at": pd.Timestamp.utcnow().isoformat() if mv else "",
-                    }
-
-                    sheets_append_inventory_row(new_row)
-                    created_ids.append(new_row["inventory_id"])
-
+                sheets_append_inventory_rows(new_rows)
                 st.session_state["prefill_details"] = {}
                 refresh_inventory_from_sheets()
-
-                st.success(f"Added {len(created_ids)} item(s).")
+                st.success(f"Added {len(new_rows)} item(s).")
 
     df = st.session_state[INVENTORY_STATE_KEY].copy()
     df = df[df["inventory_status"].isin([STATUS_ACTIVE, STATUS_LISTED])]
