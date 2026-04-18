@@ -1880,7 +1880,37 @@ with tab_list:
         st.info("No inventory yet. Add items in the New Inventory tab.")
     else:
         # ---- filters ----
-        status_options = sorted(df_all["inventory_status"].dropna().unique().tolist())
+        # Google Sheets can return mixed types in text columns after bulk uploads
+        # (example: set_name can contain both strings like "Promo" and numbers like 233).
+        # Python cannot sort mixed int/float/string values, so normalize filter fields to text first.
+        filter_text_cols = [
+            "inventory_status",
+            "product_type",
+            "card_type",
+            "brand_or_league",
+            "set_name",
+        ]
+
+        for col in filter_text_cols:
+            if col not in df_all.columns:
+                df_all[col] = ""
+            else:
+                df_all[col] = df_all[col].apply(lambda x: "" if pd.isna(x) else str(x).strip())
+
+        def _safe_filter_options(df: pd.DataFrame, col: str) -> list[str]:
+            if col not in df.columns:
+                return []
+            vals = []
+            for v in df[col].tolist():
+                if pd.isna(v):
+                    continue
+                s = str(v).strip()
+                if not s or s.lower() in {"nan", "none", "nat"}:
+                    continue
+                vals.append(s)
+            return sorted(set(vals), key=lambda x: x.lower())
+
+        status_options = _safe_filter_options(df_all, "inventory_status")
         default_status = [s for s in [STATUS_ACTIVE, STATUS_LISTED] if s in status_options]
         if not default_status and status_options:
             default_status = [status_options[0]]
@@ -1890,13 +1920,13 @@ with tab_list:
         with f1:
             status_filter = st.multiselect("Status", status_options, default=default_status)
         with f2:
-            product_filter = st.multiselect("Product Type", sorted(df_all["product_type"].dropna().unique().tolist()), default=[])
+            product_filter = st.multiselect("Product Type", _safe_filter_options(df_all, "product_type"), default=[])
         with f3:
-            type_filter = st.multiselect("Card Type", sorted(df_all["card_type"].dropna().unique().tolist()), default=[])
+            type_filter = st.multiselect("Card Type", _safe_filter_options(df_all, "card_type"), default=[])
         with f4:
-            league_filter = st.multiselect("Brand/League", sorted(df_all["brand_or_league"].dropna().unique().tolist()), default=[])
+            league_filter = st.multiselect("Brand/League", _safe_filter_options(df_all, "brand_or_league"), default=[])
         with f5:
-            set_filter = st.multiselect("Set", sorted(df_all["set_name"].dropna().unique().tolist()), default=[])
+            set_filter = st.multiselect("Set", _safe_filter_options(df_all, "set_name"), default=[])
         with f6:
             search = st.text_input("Search (name/set/notes/id)", placeholder="Type to filter…")
 
