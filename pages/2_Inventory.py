@@ -34,6 +34,7 @@ STATUS_TRADED = "TRADED"
 
 PRODUCT_TYPE_OPTIONS = ["Card", "Sealed", "Graded Card"]
 CARD_TYPE_OPTIONS = ["Pokemon", "Sports"]
+INVENTORY_TYPE_OPTIONS = ["Show Inventory", "Personal Inventory"]
 
 POKEMON_SEALED_TYPE_OPTIONS = [
     "Booster Box",
@@ -78,6 +79,7 @@ DEFAULT_COLUMNS = [
     "product_type",            # Card / Sealed / Graded Card
     "sealed_product_type",     # only for sealed
     "card_type",               # Pokemon / Sports
+    "inventory_type",          # Show Inventory / Personal Inventory
     "brand_or_league",         # Pokemon TCG / Football / etc.
     "set_name",
     "year",
@@ -122,6 +124,7 @@ NUMERIC_COLS = [
 HEADER_ALIASES = {
     "product_type": ["product_type", "Product Type"],
     "sealed_product_type": ["sealed_product_type", "Sealed Product Type"],
+    "inventory_type": ["inventory_type", "Inventory Type"],
 }
 
 
@@ -141,6 +144,8 @@ def internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
         return "Product Type"
     if internal == "sealed_product_type":
         return "Sealed Product Type"
+    if internal == "inventory_type":
+        return "Inventory Type"
     return internal
 
 
@@ -243,6 +248,8 @@ def ensure_headers(ws):
                 sheet_headers.append("Product Type")
             elif internal == "sealed_product_type":
                 sheet_headers.append("Sealed Product Type")
+            elif internal == "inventory_type":
+                sheet_headers.append("Inventory Type")
             else:
                 sheet_headers.append(internal)
         ws.append_row(sheet_headers)
@@ -997,6 +1004,7 @@ def sheets_load_inventory() -> pd.DataFrame:
     coalesce_cols = [
         "product_type",
         "sealed_product_type",
+        "inventory_type",
         "inventory_status",
         "listed_transaction_id",
         "image_url",
@@ -1056,6 +1064,9 @@ def sheets_load_inventory() -> pd.DataFrame:
 
     # normalize defaults
     df["product_type"] = df["product_type"].replace("", "Card").fillna("Card")
+    if "inventory_type" not in df.columns:
+        df["inventory_type"] = ""
+    df["inventory_type"] = df["inventory_type"].apply(lambda x: "" if pd.isna(x) else str(x).strip())
     df["inventory_status"] = df["inventory_status"].replace("", STATUS_ACTIVE).fillna(STATUS_ACTIVE)
 
     # normalize card_type
@@ -1107,6 +1118,7 @@ def sheets_append_inventory_rows(rows_internal: list[dict]):
 UPLOAD_TEMPLATE_COLUMNS = [
     "Reference link",
     "Product Type",
+    "Inventory Type",
     "Card Type",
     "Brand/League",
     "Set",
@@ -1127,6 +1139,7 @@ UPLOAD_TEMPLATE_COLUMNS = [
 UPLOAD_COLUMN_ALIASES = {
     "reference_link": ["Reference link", "Reference Link", "reference_link", "Reference_Link"],
     "product_type": ["Product Type", "product_type"],
+    "inventory_type": ["Inventory Type", "inventory_type"],
     "card_type": ["Card Type", "card_type"],
     "brand_or_league": ["Brand/League", "Brand / League", "Brand or League", "brand_or_league", "brand_orleague"],
     "set_name": ["Set", "Set Name", "set_name"],
@@ -1217,6 +1230,15 @@ def _normalize_card_type_value(x: str) -> str:
     return _clean_text(x)
 
 
+def _normalize_inventory_type_value(x: str) -> str:
+    val = _clean_text(x).lower()
+    if val in {"show inventory", "show", "showinventory"}:
+        return "Show Inventory"
+    if val in {"personal inventory", "personal", "personalinventory"}:
+        return "Personal Inventory"
+    return _clean_text(x)
+
+
 def _normalize_condition_value(x: str) -> str:
     raw = _clean_text(x)
     key = _normalize_header_name(raw)
@@ -1268,6 +1290,7 @@ def get_upload_template_df() -> pd.DataFrame:
         {
             "Reference link": "https://www.pricecharting.com/game/pokemon-surging-sparks/pikachu-ex-247",
             "Product Type": "Card",
+            "Inventory Type": "Show Inventory",
             "Card Type": "Pokemon",
             "Brand/League": "Pokemon TCG",
             "Set": "Surging Sparks",
@@ -1366,6 +1389,7 @@ def build_inventory_rows_from_inputs(input_row: dict, prefill_details: dict | No
             details = {}
 
     product_type = _normalize_product_type_value(_first_non_blank(input_row.get("product_type"), details.get("product_type"), "Card"))
+    inventory_type = _normalize_inventory_type_value(input_row.get("inventory_type"))
     card_type = _normalize_card_type_value(_first_non_blank(input_row.get("card_type"), details.get("card_type"), "Pokemon"))
     brand_or_league = _first_non_blank(input_row.get("brand_or_league"), details.get("brand_or_league"))
     set_name = _first_non_blank(input_row.get("set_name"), details.get("set_name"))
@@ -1395,6 +1419,8 @@ def build_inventory_rows_from_inputs(input_row: dict, prefill_details: dict | No
     missing = []
     if not product_type:
         missing.append("Product Type")
+    if not inventory_type:
+        missing.append("Inventory Type")
     if not card_type:
         missing.append("Card Type")
     if not card_name:
@@ -1420,6 +1446,8 @@ def build_inventory_rows_from_inputs(input_row: dict, prefill_details: dict | No
 
     if product_type not in PRODUCT_TYPE_OPTIONS:
         missing.append("Valid Product Type")
+    if inventory_type not in INVENTORY_TYPE_OPTIONS:
+        missing.append("Valid Inventory Type")
     if card_type not in CARD_TYPE_OPTIONS:
         missing.append("Valid Card Type")
     if product_type == "Card" and condition and condition not in CONDITION_OPTIONS:
@@ -1453,6 +1481,7 @@ def build_inventory_rows_from_inputs(input_row: dict, prefill_details: dict | No
             "product_type": product_type,
             "sealed_product_type": sealed_product_type if product_type == "Sealed" else "",
             "card_type": card_type,
+            "inventory_type": inventory_type,
             "brand_or_league": brand_or_league,
             "set_name": set_name,
             "year": year,
@@ -1580,8 +1609,9 @@ with tab_new:
     with bulk_upload_expander:
         st.caption(
             "Upload an .xlsx or .xls file using the template columns below. "
-            "For raw cards, the template is enough. For sealed or graded inventory, you can also include "
-            "Sealed Product Type, Grading Company, Grade, and Quantity columns if needed."
+            "Inventory Type is now included and should be either Show Inventory or Personal Inventory. "
+            "For sealed or graded inventory, you can also include Sealed Product Type, Grading Company, "
+            "Grade, and Quantity columns if needed."
         )
 
         template_df = get_upload_template_df()
@@ -1614,7 +1644,7 @@ with tab_new:
             "Upload inventory file",
             type=["xlsx", "xls", "csv"],
             key="inventory_bulk_upload_file",
-            help="Each row becomes one inventory item unless you add an optional Quantity column.",
+            help="Each row becomes one inventory item unless you add an optional Quantity column. Inventory Type is required for new uploads.",
         )
 
         upload_preview_df = pd.DataFrame()
@@ -1717,13 +1747,20 @@ with tab_new:
             )
 
         with a2:
+            inventory_type = st.selectbox(
+                required_label("Inventory Type"),
+                INVENTORY_TYPE_OPTIONS,
+                index=0,
+            )
+
+        with a3:
             card_type = st.selectbox(
                 required_label("Card Type"),
                 CARD_TYPE_OPTIONS,
                 index=(CARD_TYPE_OPTIONS.index(prefill.get("card_type")) if prefill.get("card_type") in CARD_TYPE_OPTIONS else 0),
             )
 
-        with a3:
+        with a4:
             sealed_product_type = ""
             grading_company = ""
             grade = ""
@@ -1814,6 +1851,7 @@ with tab_new:
             manual_input = {
                 "reference_link": reference_link,
                 "product_type": product_type,
+                "inventory_type": inventory_type,
                 "card_type": card_type,
                 "sealed_product_type": sealed_product_type,
                 "brand_or_league": brand_or_league,
@@ -1886,6 +1924,7 @@ with tab_list:
         filter_text_cols = [
             "inventory_status",
             "product_type",
+            "inventory_type",
             "card_type",
             "brand_or_league",
             "set_name",
@@ -1915,19 +1954,21 @@ with tab_list:
         if not default_status and status_options:
             default_status = [status_options[0]]
 
-        f1, f2, f3, f4, f5, f6 = st.columns([1.1, 1.1, 1.1, 1.1, 1.4, 2.2])
+        f1, f2, f3, f4, f5, f6, f7 = st.columns([1.1, 1.1, 1.2, 1.1, 1.1, 1.4, 2.0])
 
         with f1:
             status_filter = st.multiselect("Status", status_options, default=default_status)
         with f2:
             product_filter = st.multiselect("Product Type", _safe_filter_options(df_all, "product_type"), default=[])
         with f3:
-            type_filter = st.multiselect("Card Type", _safe_filter_options(df_all, "card_type"), default=[])
+            inventory_type_filter = st.multiselect("Inventory Type", _safe_filter_options(df_all, "inventory_type"), default=[])
         with f4:
-            league_filter = st.multiselect("Brand/League", _safe_filter_options(df_all, "brand_or_league"), default=[])
+            type_filter = st.multiselect("Card Type", _safe_filter_options(df_all, "card_type"), default=[])
         with f5:
-            set_filter = st.multiselect("Set", _safe_filter_options(df_all, "set_name"), default=[])
+            league_filter = st.multiselect("Brand/League", _safe_filter_options(df_all, "brand_or_league"), default=[])
         with f6:
+            set_filter = st.multiselect("Set", _safe_filter_options(df_all, "set_name"), default=[])
+        with f7:
             search = st.text_input("Search (name/set/notes/id)", placeholder="Type to filter…")
 
         filtered = df_all.copy()
@@ -1935,6 +1976,8 @@ with tab_list:
             filtered = filtered[filtered["inventory_status"].isin(status_filter)]
         if product_filter:
             filtered = filtered[filtered["product_type"].isin(product_filter)]
+        if inventory_type_filter:
+            filtered = filtered[filtered["inventory_type"].isin(inventory_type_filter)]
         if type_filter:
             filtered = filtered[filtered["card_type"].isin(type_filter)]
         if league_filter:
@@ -1948,6 +1991,7 @@ with tab_list:
                     lambda r: (
                         s in str(r.get("inventory_id", "")).lower()
                         or s in str(r.get("product_type", "")).lower()
+                        or s in str(r.get("inventory_type", "")).lower()
                         or s in str(r.get("sealed_product_type", "")).lower()
                         or s in str(r.get("card_name", "")).lower()
                         or s in str(r.get("set_name", "")).lower()
@@ -2002,6 +2046,7 @@ with tab_list:
         show_cols = [
             "inventory_id",
             "image_url",
+            "inventory_type",
             "purchase_price",
             "shipping",
             "tax",
@@ -2047,6 +2092,7 @@ with tab_list:
                 "delete": st.column_config.CheckboxColumn("Delete", help="Check to delete this row"),
                 "inventory_id": st.column_config.TextColumn("Inventory ID", disabled=True),
                 "image_url": st.column_config.ImageColumn("Image", width="medium"),
+                "inventory_type": st.column_config.SelectboxColumn("Inventory Type", options=INVENTORY_TYPE_OPTIONS, required=True),
                 "purchase_price": st.column_config.NumberColumn("Purchase Price", format="$%.2f"),
                 "shipping": st.column_config.NumberColumn("Shipping", format="$%.2f"),
                 "tax": st.column_config.NumberColumn("Tax", format="$%.2f"),
@@ -2126,6 +2172,7 @@ with tab_list:
 
             # grading_fee is NOT editable here; it comes from the grading tab
             updatable_cols = [
+                "inventory_type",
                 "purchase_price",
                 "shipping",
                 "tax",
@@ -2220,6 +2267,16 @@ with tab_summary:
             .sort_values("invested", ascending=False)
         )
         st.dataframe(p_summary, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.markdown("### Breakdown by Inventory Type")
+        inv_type_summary = (
+            df.groupby("inventory_type", dropna=False)
+            .agg(items=("inventory_id", "count"), invested=(invested_col, "sum"), market=("market_price", "sum"))
+            .reset_index()
+            .sort_values("items", ascending=False)
+        )
+        st.dataframe(inv_type_summary, use_container_width=True, hide_index=True)
 
         st.markdown("---")
         st.markdown("### Breakdown by Status")
