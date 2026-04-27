@@ -1,0 +1,1522 @@
+# pages/4_Shows.py
+# ---------------------------------------------------------
+# Shows page (Google Sheets-backed)
+#
+# Tabs:
+# 1) Show Inventory Summary
+#    - ACTIVE inventory only
+#    - Inventory Type = Show Inventory
+#    - KPIs: # items, Total Cost, Total Market Value
+#
+# 2) Manage Shows
+#    - Create shows with date/location/description
+#    - When a show is created, snapshot current Show Inventory
+#      into show_inventory_snapshots and store snapshot totals
+#      on the shows sheet.
+#
+# 3) Show Sales Sync
+#    - Finds the next upcoming show
+#    - Displays inventory for that show
+#    - Allows sell_price entry in-app or via Excel/CSV export/import
+#    - Sync Sales marks inventory SOLD and appends SOLD rows to transactions
+# ---------------------------------------------------------
+
+import io
+import json
+import re
+import time
+import uuid
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+import gspread
+from google.oauth2.service_account import Credentials
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+st.set_page_config(page_title="Shows", layout="wide")
+
+INVENTORY_WS_DEFAULT = "inventory"
+TRANSACTIONS_WS_DEFAULT = "transactions"
+SHOWS_WS_DEFAULT = "shows"
+SHOW_SNAPSHOTS_WS_DEFAULT = "show_inventory_snapshots"
+
+STATUS_ACTIVE = "ACTIVE"
+STATUS_LISTED = "LISTED"
+STATUS_SOLD = "SOLD"
+TX_STATUS_SOLD = "SOLD"
+
+SHOW_STATUS_OPTIONS = ["Planned", "Completed", "Cancelled"]
+
+# Inventory columns used by this page. These match your Inventory page schema.
+INV_COLUMNS = [
+    "inventory_id",
+    "image_url",
+    "product_type",
+    "sealed_product_type",
+    "card_type",
+    "inventory_type",
+    "brand_or_league",
+    "set_name",
+    "year",
+    "card_name",
+    "card_number",
+    "variant",
+    "card_subtype",
+    "grading_company",
+    "grade",
+    "reference_link",
+    "purchase_date",
+    "purchased_from",
+    "purchase_price",
+    "shipping",
+    "tax",
+    "total_price",
+    "grading_fee",
+    "total_cost",
+    "condition",
+    "notes",
+    "created_at",
+    "inventory_status",
+    "listed_transaction_id",
+    "market_price",
+    "market_value",
+    "market_price_updated_at",
+]
+
+# Transaction columns. Header aliases below allow existing sheet headers like
+# "Fees Total", "TX Status", "Product Type", "Image URL", etc.
+TX_COLUMNS = [
+    "transaction_id",
+    "inventory_id",
+    "transaction_type",
+    "platform",
+    "list_date",
+    "list_price",
+    "sold_date",
+    "sold_price",
+    "fees",
+    "shipping_charged",
+    "fees_total",
+    "net_proceeds",
+    "profit",
+    "notes",
+    "status",
+    "created_at",
+    "updated_at",
+    "product_type",
+    "sealed_product_type",
+    "card_type",
+    "brand_or_league",
+    "set_name",
+    "year",
+    "card_name",
+    "card_number",
+    "variant",
+    "card_subtype",
+    "reference_link",
+    "image_url",
+    "purchase_date",
+    "purchased_from",
+    "purchase_total",
+    "grading_fee_total",
+    "all_in_cost",
+    "grading_company",
+    "grade",
+    "condition",
+]
+
+SHOW_COLUMNS = [
+    "show_id",
+    "show_name",
+    "show_date",
+    "location",
+    "description",
+    "status",
+    "snapshot_item_count",
+    "snapshot_total_cost",
+    "snapshot_total_market_value",
+    "snapshot_created_at",
+    "created_at",
+    "updated_at",
+]
+
+SNAPSHOT_COLUMNS = [
+    "snapshot_id",
+    "show_id",
+    "show_name",
+    "show_date",
+    "snapshot_created_at",
+    "inventory_id",
+    "product_type",
+    "sealed_product_type",
+    "card_type",
+    "inventory_type",
+    "brand_or_league",
+    "set_name",
+    "year",
+    "card_name",
+    "card_number",
+    "variant",
+    "card_subtype",
+    "grading_company",
+    "grade",
+    "reference_link",
+    "image_url",
+    "purchase_date",
+    "purchased_from",
+    "purchase_price",
+    "shipping",
+    "tax",
+    "total_price",
+    "grading_fee",
+    "total_cost",
+    "market_price",
+    "market_value",
+    "condition",
+    "inventory_status_at_snapshot",
+    "sold_price",
+    "synced_at",
+    "synced_transaction_id",
+]
+
+NUMERIC_INV = [
+    "purchase_price",
+    "shipping",
+    "tax",
+    "total_price",
+    "grading_fee",
+    "total_cost",
+    "market_price",
+    "market_value",
+]
+NUMERIC_TX = [
+    "list_price",
+    "sold_price",
+    "fees",
+    "shipping_charged",
+    "fees_total",
+    "net_proceeds",
+    "profit",
+    "purchase_total",
+    "grading_fee_total",
+    "all_in_cost",
+]
+NUMERIC_SHOW = [
+    "snapshot_item_count",
+    "snapshot_total_cost",
+    "snapshot_total_market_value",
+]
+NUMERIC_SNAPSHOT = [
+    "purchase_price",
+    "shipping",
+    "tax",
+    "total_price",
+    "grading_fee",
+    "total_cost",
+    "market_price",
+    "market_value",
+    "sold_price",
+]
+
+
+# =========================================================
+# HEADER NORMALIZATION / ALIASES
+# =========================================================
+
+HEADER_ALIASES = {
+    # IDs / statuses
+    "inventory_id": ["inventory_id", "Inventory ID"],
+    "transaction_id": ["transaction_id", "Transaction ID"],
+    "show_id": ["show_id", "Show ID"],
+    "snapshot_id": ["snapshot_id", "Snapshot ID"],
+    "status": ["status", "TX Status", "tx_status", "Status", "Show Status"],
+    "inventory_status": ["inventory_status", "Inventory Status", "inventoryStatus"],
+    "listed_transaction_id": ["listed_transaction_id", "Listed Transaction ID"],
+
+    # Inventory / product fields
+    "product_type": ["product_type", "Product Type"],
+    "sealed_product_type": ["sealed_product_type", "Sealed Product Type"],
+    "inventory_type": ["inventory_type", "Inventory Type"],
+    "image_url": ["image_url", "Image URL", "image", "Image"],
+    "brand_or_league": ["brand_or_league", "Brand/League", "Brand / League", "Brand or League"],
+    "set_name": ["set_name", "Set", "Set Name"],
+    "card_name": ["card_name", "Card Name", "Item Name"],
+    "card_number": ["card_number", "Card #", "Card Number"],
+    "card_subtype": ["card_subtype", "Card Subtype"],
+    "reference_link": ["reference_link", "Reference Link", "Reference link"],
+    "purchase_date": ["purchase_date", "Purchase Date"],
+    "purchased_from": ["purchased_from", "Purchased From", "Purchased from"],
+    "purchase_price": ["purchase_price", "Purchase Price"],
+    "total_price": ["total_price", "Total Price", "Purchase Total", "purchase_total"],
+    "grading_fee": ["grading_fee", "Grading Fee"],
+    "total_cost": ["total_cost", "Total Cost", "All In Cost", "all_in_cost"],
+    "grading_company": ["grading_company", "Grading Company"],
+    "grade": ["grade", "Grade"],
+    "market_price": ["market_price", "Market Price", "Market price", "market price"],
+    "market_value": ["market_value", "Market Value", "market value"],
+    "market_price_updated_at": ["market_price_updated_at", "Market Price Updated At"],
+
+    # Transactions
+    "transaction_type": ["transaction_type", "Transaction Type", "listing_type"],
+    "fees": ["fees", "Fees", "platform_fees", "fee"],
+    "shipping_charged": ["shipping_charged", "Shipping Charged"],
+    "fees_total": ["fees_total", "Fees Total", "fees_total_calc", "fees_total_dashboard"],
+    "net_proceeds": ["net_proceeds", "Net Proceeds"],
+    "profit": ["profit", "Profit", "Profit/Loss", "profit_loss"],
+    "purchase_total": ["purchase_total", "Purchase Total", "cost_basis", "Cost Basis", "purchase_total_allin"],
+    "grading_fee_total": ["grading_fee_total", "Grading Fee", "grading_fee", "total_grading_cost"],
+    "all_in_cost": ["all_in_cost", "All In Cost", "all_in"],
+
+    # Shows
+    "show_name": ["show_name", "Show Name"],
+    "show_date": ["show_date", "Show Date"],
+    "snapshot_item_count": ["snapshot_item_count", "Snapshot Item Count"],
+    "snapshot_total_cost": ["snapshot_total_cost", "Snapshot Total Cost"],
+    "snapshot_total_market_value": ["snapshot_total_market_value", "Snapshot Total Market Value"],
+    "snapshot_created_at": ["snapshot_created_at", "Snapshot Created At"],
+    "inventory_status_at_snapshot": ["inventory_status_at_snapshot", "Inventory Status At Snapshot"],
+    "sold_price": ["sold_price", "Sold Price", "sell_price", "Sell Price"],
+    "synced_at": ["synced_at", "Synced At"],
+    "synced_transaction_id": ["synced_transaction_id", "Synced Transaction ID"],
+}
+
+
+def _norm_header(s: str) -> str:
+    s = str(s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+
+def sheet_header_to_internal(header: str) -> str:
+    h_norm = _norm_header(header)
+    for internal, aliases in HEADER_ALIASES.items():
+        for alias in aliases:
+            if _norm_header(alias) == h_norm:
+                return internal
+    return h_norm
+
+
+def internal_to_sheet_header(internal: str, existing_headers: list[str] | None = None) -> str:
+    existing_headers = existing_headers or []
+    aliases = HEADER_ALIASES.get(internal, [internal])
+    existing_norm = {_norm_header(x): x for x in existing_headers}
+
+    for alias in aliases:
+        if _norm_header(alias) in existing_norm:
+            return existing_norm[_norm_header(alias)]
+
+    defaults = {
+        "product_type": "Product Type",
+        "sealed_product_type": "Sealed Product Type",
+        "inventory_type": "Inventory Type",
+        "image_url": "Image URL",
+        "inventory_status": "Inventory Status",
+        "transaction_id": "transaction_id",
+        "fees_total": "Fees Total",
+        "status": "TX Status",
+        "profit": "Profit",
+        "grading_fee_total": "Grading Fee",
+        "all_in_cost": "All In Cost",
+        "grading_company": "Grading Company",
+        "show_id": "show_id",
+        "show_name": "show_name",
+        "show_date": "show_date",
+    }
+    return defaults.get(internal, internal)
+
+
+# =========================================================
+# MONEY / DATE HELPERS
+# =========================================================
+
+
+def _money_float(x) -> float:
+    try:
+        if x is None:
+            return 0.0
+        if isinstance(x, float) and pd.isna(x):
+            return 0.0
+        s = str(x).strip()
+        if s == "":
+            return 0.0
+        neg = s.startswith("(") and s.endswith(")")
+        s = s.replace("$", "").replace(",", "")
+        s = re.sub(r"[^0-9.\-]", "", s)
+        if s in {"", ".", "-", "-."}:
+            return 0.0
+        val = float(s)
+        return -val if neg and val > 0 else val
+    except Exception:
+        return 0.0
+
+
+def _coerce_money_series(s: pd.Series) -> pd.Series:
+    return s.apply(_money_float).astype(float)
+
+
+def _money_display(x) -> str:
+    return f"${_money_float(x):,.2f}"
+
+
+def _clean_text(x) -> str:
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    return str(x).strip()
+
+
+def _utc_now_iso() -> str:
+    return pd.Timestamp.utcnow().isoformat()
+
+
+def _date_str(x) -> str:
+    parsed = pd.to_datetime(x, errors="coerce")
+    if pd.isna(parsed):
+        return ""
+    return str(parsed.date())
+
+
+def _parse_date_series(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce").dt.date
+
+
+def _normalize_status(x) -> str:
+    return _clean_text(x).upper()
+
+
+def _normalize_inventory_type(x) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _clean_text(x).lower())
+
+
+# =========================================================
+# GOOGLE SHEETS CLIENT + READ/WRITE HELPERS
+# =========================================================
+
+
+def _is_quota_429(e: Exception) -> bool:
+    try:
+        return isinstance(e, gspread.exceptions.APIError) and getattr(e, "response", None) and e.response.status_code == 429
+    except Exception:
+        return False
+
+
+def _with_backoff(fn, tries: int = 6, base_sleep: float = 0.8):
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if _is_quota_429(e):
+                time.sleep(base_sleep * (2 ** i))
+                continue
+            raise
+    raise last
+
+
+@st.cache_resource
+def get_gspread_client():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    if "gcp_service_account" in st.secrets and not isinstance(st.secrets["gcp_service_account"], str):
+        sa = st.secrets["gcp_service_account"]
+        sa_info = {k: sa[k] for k in sa.keys()}
+        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        return gspread.authorize(creds)
+
+    if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], str):
+        sa_info = json.loads(st.secrets["gcp_service_account"])
+        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        return gspread.authorize(creds)
+
+    if "service_account_json_path" in st.secrets:
+        sa_rel = st.secrets["service_account_json_path"]
+        sa_path = Path(sa_rel)
+        if not sa_path.is_absolute():
+            sa_path = Path.cwd() / sa_rel
+        if not sa_path.exists():
+            raise FileNotFoundError(f"Service account JSON not found at: {sa_path}")
+        sa_info = json.loads(sa_path.read_text(encoding="utf-8"))
+        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        return gspread.authorize(creds)
+
+    raise KeyError('Missing secrets: add "gcp_service_account" or "service_account_json_path".')
+
+
+@st.cache_resource
+def _get_spreadsheet(spreadsheet_id: str):
+    client = get_gspread_client()
+    return _with_backoff(lambda: client.open_by_key(spreadsheet_id))
+
+
+def _get_or_create_ws(spreadsheet_id: str, worksheet_name: str, internal_headers: list[str]):
+    sh = _get_spreadsheet(spreadsheet_id)
+    try:
+        return _with_backoff(lambda: sh.worksheet(worksheet_name))
+    except gspread.exceptions.WorksheetNotFound:
+        rows = 1000
+        cols = max(len(internal_headers) + 5, 20)
+        ws = _with_backoff(lambda: sh.add_worksheet(title=worksheet_name, rows=rows, cols=cols))
+        sheet_headers = [internal_to_sheet_header(h, []) for h in internal_headers]
+        _with_backoff(lambda: ws.update("1:1", [sheet_headers], value_input_option="USER_ENTERED"))
+        return ws
+
+
+def _ensure_headers(ws, internal_headers: list[str]) -> list[str]:
+    values = _with_backoff(lambda: ws.get_all_values())
+    first_row = values[0] if values else []
+
+    if not first_row:
+        sheet_headers = [internal_to_sheet_header(h, []) for h in internal_headers]
+        _with_backoff(lambda: ws.update("1:1", [sheet_headers], value_input_option="USER_ENTERED"))
+        _read_sheet_values_cached.clear()
+        return sheet_headers
+
+    existing_sheet_headers = first_row
+    existing_internal = [sheet_header_to_internal(h) for h in existing_sheet_headers]
+    missing_internal = [h for h in internal_headers if h not in set(existing_internal)]
+
+    if missing_internal:
+        additions = [internal_to_sheet_header(h, existing_sheet_headers) for h in missing_internal]
+        new_headers = existing_sheet_headers + additions
+        _with_backoff(lambda: ws.update("1:1", [new_headers], value_input_option="USER_ENTERED"))
+        _read_sheet_values_cached.clear()
+        return new_headers
+
+    return existing_sheet_headers
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def _read_sheet_values_cached(spreadsheet_id: str, worksheet_name: str) -> list[list[str]]:
+    # The worksheet should already exist before this function is called.
+    sh = _get_spreadsheet(spreadsheet_id)
+    ws = _with_backoff(lambda: sh.worksheet(worksheet_name))
+    return _with_backoff(lambda: ws.get_all_values())
+
+
+def _coalesce_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if not df.columns.duplicated().any():
+        return df
+
+    new = pd.DataFrame(index=df.index)
+    for col in pd.unique(df.columns):
+        cols = df.loc[:, df.columns == col]
+        if cols.shape[1] == 1:
+            new[col] = cols.iloc[:, 0]
+        else:
+            stacked = cols.astype(str).replace("nan", "").replace("None", "")
+            new[col] = stacked.apply(lambda r: next((v for v in r.tolist() if str(v).strip() != ""), ""), axis=1)
+    return new
+
+
+def _sheet_to_df(values: list[list[str]], internal_cols: list[str]) -> tuple[pd.DataFrame, list[str]]:
+    if not values:
+        return pd.DataFrame(columns=internal_cols), []
+
+    sheet_headers = values[0]
+    raw_rows = values[1:] if len(values) > 1 else []
+
+    rows = []
+    for row in raw_rows:
+        if len(row) < len(sheet_headers):
+            rows.append(row + [""] * (len(sheet_headers) - len(row)))
+        elif len(row) > len(sheet_headers):
+            rows.append(row[:len(sheet_headers)])
+        else:
+            rows.append(row)
+
+    df = pd.DataFrame(rows, columns=sheet_headers)
+    df = df.rename(columns={h: sheet_header_to_internal(h) for h in df.columns})
+    df = _coalesce_duplicate_columns(df)
+
+    for c in internal_cols:
+        if c not in df.columns:
+            df[c] = ""
+
+    return df[internal_cols].copy(), sheet_headers
+
+
+def _coerce_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    df = df.copy()
+    for c in cols:
+        if c in df.columns:
+            df[c] = _coerce_money_series(df[c])
+    return df
+
+
+def _load_sheet_df(worksheet_name: str, internal_cols: list[str], numeric_cols: list[str]) -> pd.DataFrame:
+    spreadsheet_id = st.secrets["spreadsheet_id"]
+    ws = _get_or_create_ws(spreadsheet_id, worksheet_name, internal_cols)
+    _ensure_headers(ws, internal_cols)
+    values = _read_sheet_values_cached(spreadsheet_id, worksheet_name)
+    df, _headers = _sheet_to_df(values, internal_cols)
+    df = _coerce_numeric(df, numeric_cols)
+    return df
+
+
+def load_inventory_df() -> pd.DataFrame:
+    ws_name = st.secrets.get("inventory_worksheet", INVENTORY_WS_DEFAULT)
+    df = _load_sheet_df(ws_name, INV_COLUMNS, NUMERIC_INV)
+    if df.empty:
+        return df
+
+    df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
+    df["inventory_status"] = df["inventory_status"].replace("", STATUS_ACTIVE).fillna(STATUS_ACTIVE)
+    df["inventory_type"] = df["inventory_type"].astype(str).str.strip()
+
+    # Keep totals reliable even if the sheet has blanks.
+    df["total_price"] = (
+        _coerce_money_series(df["purchase_price"])
+        + _coerce_money_series(df["shipping"])
+        + _coerce_money_series(df["tax"])
+    ).round(2)
+
+    df["total_cost"] = (
+        _coerce_money_series(df["total_price"])
+        + _coerce_money_series(df["grading_fee"])
+    ).round(2)
+
+    # Resolve market value from market_value first, then market_price.
+    df["market_value_resolved"] = _coerce_money_series(df["market_value"])
+    fallback_market = _coerce_money_series(df["market_price"])
+    df["market_value_resolved"] = df["market_value_resolved"].where(df["market_value_resolved"] > 0, fallback_market)
+
+    return df
+
+
+def load_transactions_df() -> pd.DataFrame:
+    ws_name = st.secrets.get("transactions_worksheet", TRANSACTIONS_WS_DEFAULT)
+    df = _load_sheet_df(ws_name, TX_COLUMNS, NUMERIC_TX)
+    if df.empty:
+        return df
+    df["transaction_id"] = df["transaction_id"].astype(str).str.strip()
+    df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
+    return df
+
+
+def load_shows_df() -> pd.DataFrame:
+    ws_name = st.secrets.get("shows_worksheet", SHOWS_WS_DEFAULT)
+    df = _load_sheet_df(ws_name, SHOW_COLUMNS, NUMERIC_SHOW)
+    if df.empty:
+        return df
+    df["show_id"] = df["show_id"].astype(str).str.strip()
+    df["show_date"] = df["show_date"].apply(_date_str)
+    return df
+
+
+def load_snapshots_df() -> pd.DataFrame:
+    ws_name = st.secrets.get("show_snapshots_worksheet", SHOW_SNAPSHOTS_WS_DEFAULT)
+    df = _load_sheet_df(ws_name, SNAPSHOT_COLUMNS, NUMERIC_SNAPSHOT)
+    if df.empty:
+        return df
+    df["show_id"] = df["show_id"].astype(str).str.strip()
+    df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
+    return df
+
+
+def _append_rows(worksheet_name: str, internal_headers: list[str], rows_internal: list[dict]):
+    if not rows_internal:
+        return
+
+    spreadsheet_id = st.secrets["spreadsheet_id"]
+    ws = _get_or_create_ws(spreadsheet_id, worksheet_name, internal_headers)
+    sheet_headers = _ensure_headers(ws, internal_headers)
+    header_to_internal = {h: sheet_header_to_internal(h) for h in sheet_headers}
+
+    payload = []
+    for row in rows_internal:
+        ordered = []
+        for sheet_h in sheet_headers:
+            internal = header_to_internal.get(sheet_h, sheet_h)
+            v = row.get(internal, "")
+            if isinstance(v, (pd.Series, pd.DataFrame)):
+                v = ""
+            if pd.isna(v) if not isinstance(v, str) else False:
+                v = ""
+            ordered.append(v)
+        payload.append(ordered)
+
+    _with_backoff(lambda: ws.append_rows(payload, value_input_option="USER_ENTERED"))
+    _read_sheet_values_cached.clear()
+
+
+def _find_rownums_by_id(values: list[list[str]], id_internal_col: str, ids: list[str]) -> dict[str, int | None]:
+    if not values:
+        return {str(i): None for i in ids}
+
+    headers = values[0]
+    id_col_idx = None
+    for i, h in enumerate(headers, start=1):
+        if sheet_header_to_internal(h) == id_internal_col:
+            id_col_idx = i
+            break
+
+    if id_col_idx is None:
+        return {str(i): None for i in ids}
+
+    found = {}
+    for rownum, row in enumerate(values[1:], start=2):
+        val = row[id_col_idx - 1] if len(row) >= id_col_idx else ""
+        if val:
+            found[str(val).strip()] = rownum
+
+    return {str(i).strip(): found.get(str(i).strip()) for i in ids}
+
+
+def _batch_update_full_rows(worksheet_name: str, internal_headers: list[str], updates: list[tuple[int, dict]]):
+    if not updates:
+        return
+
+    spreadsheet_id = st.secrets["spreadsheet_id"]
+    ws = _get_or_create_ws(spreadsheet_id, worksheet_name, internal_headers)
+    sheet_headers = _ensure_headers(ws, internal_headers)
+    header_to_internal = {h: sheet_header_to_internal(h) for h in sheet_headers}
+    last_col_letter = gspread.utils.rowcol_to_a1(1, len(sheet_headers)).split("1")[0]
+
+    data = []
+    for rownum, row_internal in updates:
+        values = []
+        for sheet_h in sheet_headers:
+            internal = header_to_internal.get(sheet_h, sheet_h)
+            v = row_internal.get(internal, "")
+            if isinstance(v, (pd.Series, pd.DataFrame)):
+                v = ""
+            if pd.isna(v) if not isinstance(v, str) else False:
+                v = ""
+            values.append(v)
+        data.append({"range": f"A{rownum}:{last_col_letter}{rownum}", "values": [values]})
+
+    _with_backoff(lambda: ws.batch_update(data, value_input_option="USER_ENTERED"))
+    _read_sheet_values_cached.clear()
+
+
+def _delete_rows_by_filter(worksheet_name: str, internal_headers: list[str], filter_fn):
+    spreadsheet_id = st.secrets["spreadsheet_id"]
+    ws = _get_or_create_ws(spreadsheet_id, worksheet_name, internal_headers)
+    _ensure_headers(ws, internal_headers)
+    values = _with_backoff(lambda: ws.get_all_values())
+    if not values or len(values) <= 1:
+        return 0
+
+    df, headers = _sheet_to_df(values, internal_headers)
+    rownums_to_delete = []
+    for idx, row in df.iterrows():
+        if filter_fn(row):
+            # idx 0 corresponds to sheet row 2
+            rownums_to_delete.append(idx + 2)
+
+    for rownum in sorted(rownums_to_delete, reverse=True):
+        _with_backoff(lambda rn=rownum: ws.delete_rows(rn))
+
+    if rownums_to_delete:
+        _read_sheet_values_cached.clear()
+    return len(rownums_to_delete)
+
+
+def _row_from_sheet_values(values: list[list[str]], rownum: int) -> dict:
+    if not values or rownum is None or rownum < 2:
+        return {}
+
+    headers = values[0]
+    row_vals = values[rownum - 1] if len(values) >= rownum else []
+    if len(row_vals) < len(headers):
+        row_vals = row_vals + [""] * (len(headers) - len(row_vals))
+    elif len(row_vals) > len(headers):
+        row_vals = row_vals[:len(headers)]
+
+    out = {sheet_header_to_internal(h): v for h, v in zip(headers, row_vals)}
+    out = _coalesce_duplicate_columns(pd.DataFrame([out])).iloc[0].to_dict()
+    return out
+
+
+# =========================================================
+# BUSINESS LOGIC HELPERS
+# =========================================================
+
+
+def get_active_show_inventory(inv_df: pd.DataFrame) -> pd.DataFrame:
+    if inv_df.empty:
+        return inv_df.copy()
+
+    df = inv_df.copy()
+    df["inventory_status_norm"] = df["inventory_status"].apply(_normalize_status)
+    df["inventory_type_norm"] = df["inventory_type"].apply(_normalize_inventory_type)
+
+    df = df[
+        (df["inventory_status_norm"] == STATUS_ACTIVE)
+        & (df["inventory_type_norm"] == "showinventory")
+    ].copy()
+
+    df["total_cost"] = _coerce_money_series(df["total_cost"])
+    df["market_value_resolved"] = _coerce_money_series(df.get("market_value_resolved", df.get("market_value", 0.0)))
+
+    return df
+
+
+def _snapshot_totals(show_inv_df: pd.DataFrame) -> tuple[int, float, float]:
+    if show_inv_df.empty:
+        return 0, 0.0, 0.0
+    item_count = int(len(show_inv_df))
+    total_cost = float(round(_coerce_money_series(show_inv_df["total_cost"]).sum(), 2))
+    total_market = float(round(_coerce_money_series(show_inv_df["market_value_resolved"]).sum(), 2))
+    return item_count, total_cost, total_market
+
+
+def build_snapshot_rows(show_row: dict, show_inv_df: pd.DataFrame) -> list[dict]:
+    now_iso = _utc_now_iso()
+    rows = []
+
+    for _, inv in show_inv_df.iterrows():
+        market_value = _money_float(inv.get("market_value_resolved", inv.get("market_value", inv.get("market_price", 0.0))))
+        rows.append({
+            "snapshot_id": str(uuid.uuid4()),
+            "show_id": show_row["show_id"],
+            "show_name": show_row["show_name"],
+            "show_date": show_row["show_date"],
+            "snapshot_created_at": now_iso,
+            "inventory_id": str(inv.get("inventory_id", "")).strip(),
+            "product_type": _clean_text(inv.get("product_type")),
+            "sealed_product_type": _clean_text(inv.get("sealed_product_type")),
+            "card_type": _clean_text(inv.get("card_type")),
+            "inventory_type": _clean_text(inv.get("inventory_type")),
+            "brand_or_league": _clean_text(inv.get("brand_or_league")),
+            "set_name": _clean_text(inv.get("set_name")),
+            "year": _clean_text(inv.get("year")),
+            "card_name": _clean_text(inv.get("card_name")),
+            "card_number": _clean_text(inv.get("card_number")),
+            "variant": _clean_text(inv.get("variant")),
+            "card_subtype": _clean_text(inv.get("card_subtype")),
+            "grading_company": _clean_text(inv.get("grading_company")),
+            "grade": _clean_text(inv.get("grade")),
+            "reference_link": _clean_text(inv.get("reference_link")),
+            "image_url": _clean_text(inv.get("image_url")),
+            "purchase_date": _clean_text(inv.get("purchase_date")),
+            "purchased_from": _clean_text(inv.get("purchased_from")),
+            "purchase_price": _money_float(inv.get("purchase_price")),
+            "shipping": _money_float(inv.get("shipping")),
+            "tax": _money_float(inv.get("tax")),
+            "total_price": _money_float(inv.get("total_price")),
+            "grading_fee": _money_float(inv.get("grading_fee")),
+            "total_cost": _money_float(inv.get("total_cost")),
+            "market_price": _money_float(inv.get("market_price")),
+            "market_value": market_value,
+            "condition": _clean_text(inv.get("condition")),
+            "inventory_status_at_snapshot": _clean_text(inv.get("inventory_status")),
+            "sold_price": 0.0,
+            "synced_at": "",
+            "synced_transaction_id": "",
+        })
+
+    return rows
+
+
+def _choose_next_show(shows_df: pd.DataFrame) -> pd.Series | None:
+    if shows_df.empty:
+        return None
+
+    df = shows_df.copy()
+    df["_date"] = pd.to_datetime(df["show_date"], errors="coerce")
+    df["_status"] = df["status"].astype(str).str.strip().str.lower()
+    today_ts = pd.Timestamp(date.today())
+
+    active_future = df[
+        (df["_date"].notna())
+        & (df["_date"] >= today_ts)
+        & (~df["_status"].isin(["completed", "cancelled", "canceled"]))
+    ].copy()
+
+    if not active_future.empty:
+        return active_future.sort_values(["_date", "show_name"]).iloc[0]
+
+    # Fallback: most recent non-cancelled show. This keeps the page usable
+    # after the show date has passed but before you mark it completed.
+    active_any = df[(~df["_status"].isin(["cancelled", "canceled"])) & df["_date"].notna()].copy()
+    if not active_any.empty:
+        return active_any.sort_values(["_date", "show_name"], ascending=[False, True]).iloc[0]
+
+    return None
+
+
+def _build_sales_editor_df(show: pd.Series, snapshots_df: pd.DataFrame, inv_df: pd.DataFrame) -> pd.DataFrame:
+    show_id = str(show.get("show_id", "")).strip()
+    show_snaps = snapshots_df[snapshots_df["show_id"].astype(str).str.strip() == show_id].copy()
+
+    if show_snaps.empty:
+        # Fallback for old shows or if snapshot sheet was cleared.
+        base = get_active_show_inventory(inv_df).copy()
+        base["market_value"] = base.get("market_value_resolved", base.get("market_value", 0.0))
+        base["sold_price"] = 0.0
+    else:
+        base = show_snaps.copy()
+
+    if base.empty:
+        return pd.DataFrame(columns=["inventory_id", "card_name", "purchase_price", "sell_price"])
+
+    # Merge in current inventory status so we do not sell something already sold/listed.
+    current = inv_df[["inventory_id", "inventory_status", "inventory_type", "listed_transaction_id"]].copy()
+    current["inventory_id"] = current["inventory_id"].astype(str).str.strip()
+    base["inventory_id"] = base["inventory_id"].astype(str).str.strip()
+    base = base.merge(current, on="inventory_id", how="left", suffixes=("", "_current"))
+
+    status_col = "inventory_status_current" if "inventory_status_current" in base.columns else "inventory_status"
+    type_col = "inventory_type_current" if "inventory_type_current" in base.columns else "inventory_type"
+
+    base["current_status"] = base[status_col].apply(_normalize_status)
+    base["current_inventory_type"] = base[type_col].apply(_normalize_inventory_type)
+
+    base = base[
+        (base["current_status"] == STATUS_ACTIVE)
+        & (base["current_inventory_type"] == "showinventory")
+    ].copy()
+
+    base["sell_price"] = _coerce_money_series(base.get("sold_price", pd.Series(0.0, index=base.index)))
+
+    # Keep the sales-entry table simple, but include inventory_id for safe sync/upload.
+    out_cols = [
+        "inventory_id",
+        "card_name",
+        "set_name",
+        "variant",
+        "card_number",
+        "purchase_price",
+        "total_cost",
+        "market_value",
+        "sell_price",
+    ]
+    for c in out_cols:
+        if c not in base.columns:
+            base[c] = "" if c not in ["purchase_price", "total_cost", "market_value", "sell_price"] else 0.0
+
+    out = base[out_cols].copy()
+    for c in ["purchase_price", "total_cost", "market_value", "sell_price"]:
+        out[c] = _coerce_money_series(out[c])
+
+    return out.sort_values(["card_name", "set_name", "inventory_id"], na_position="last").reset_index(drop=True)
+
+
+def _build_sales_template_bytes(sales_df: pd.DataFrame) -> tuple[bytes, str, str]:
+    export_cols = [
+        "inventory_id",
+        "card_name",
+        "set_name",
+        "variant",
+        "card_number",
+        "purchase_price",
+        "total_cost",
+        "market_value",
+        "sell_price",
+    ]
+    df = sales_df.copy()
+    for c in export_cols:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[export_cols]
+
+    # Prefer Excel. Fall back to CSV if the environment does not have an engine.
+    try:
+        import xlsxwriter  # noqa: F401
+        engine = "xlsxwriter"
+    except Exception:
+        try:
+            import openpyxl  # noqa: F401
+            engine = "openpyxl"
+        except Exception:
+            engine = ""
+
+    if engine:
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine=engine) as writer:
+            df.to_excel(writer, index=False, sheet_name="show_sales")
+        output.seek(0)
+        return (
+            output.getvalue(),
+            "show_sales_template.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    return df.to_csv(index=False).encode("utf-8"), "show_sales_template.csv", "text/csv"
+
+
+def _read_sales_upload(uploaded_file) -> pd.DataFrame:
+    if uploaded_file is None:
+        return pd.DataFrame()
+
+    file_name = (uploaded_file.name or "").lower()
+    if file_name.endswith(".csv"):
+        raw = pd.read_csv(uploaded_file)
+    else:
+        try:
+            raw = pd.read_excel(uploaded_file, engine="openpyxl")
+        except Exception as exc:
+            raise ValueError(f"Could not read Excel upload. Try saving as CSV. Error: {exc}")
+
+    if raw.empty:
+        return pd.DataFrame()
+
+    rename = {}
+    for col in raw.columns:
+        internal = sheet_header_to_internal(col)
+        if internal in {"inventory_id", "sold_price", "card_name"}:
+            rename[col] = "sell_price" if internal == "sold_price" else internal
+        elif _norm_header(col) in {"sell_price", "sale_price", "show_sale_price"}:
+            rename[col] = "sell_price"
+
+    df = raw.rename(columns=rename).copy()
+
+    if "inventory_id" not in df.columns:
+        raise ValueError("Upload must include inventory_id. Use the export template so each sale maps to the right item.")
+    if "sell_price" not in df.columns:
+        raise ValueError("Upload must include sell_price / Sell Price.")
+
+    df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
+    df["sell_price"] = _coerce_money_series(df["sell_price"])
+    df = df[df["inventory_id"] != ""].copy()
+    return df[["inventory_id", "sell_price"]]
+
+
+def _tx_row_from_inventory(inv_rec: dict, show: pd.Series, sell_price: float, tx_id: str) -> dict:
+    show_name = _clean_text(show.get("show_name"))
+    show_date = _date_str(show.get("show_date")) or str(date.today())
+    now_iso = _utc_now_iso()
+
+    purchase_total = _money_float(inv_rec.get("total_price"))
+    grading_fee_total = _money_float(inv_rec.get("grading_fee"))
+    all_in_cost = _money_float(inv_rec.get("total_cost"))
+    if all_in_cost <= 0:
+        all_in_cost = round(purchase_total + grading_fee_total, 2)
+
+    sold_price = round(float(sell_price or 0.0), 2)
+    fees = 0.0
+    shipping_charged = 0.0
+    fees_total = 0.0
+    net_proceeds = round(sold_price - fees - shipping_charged, 2)
+    profit = round(net_proceeds - all_in_cost, 2)
+
+    return {
+        "transaction_id": tx_id,
+        "inventory_id": _clean_text(inv_rec.get("inventory_id")),
+        "transaction_type": "Card Show Sale",
+        "platform": f"Card Show - {show_name}" if show_name else "Card Show",
+        "list_date": show_date,
+        "list_price": sold_price,
+        "sold_date": show_date,
+        "sold_price": sold_price,
+        "fees": fees,
+        "shipping_charged": shipping_charged,
+        "fees_total": fees_total,
+        "net_proceeds": net_proceeds,
+        "profit": profit,
+        "notes": f"{show_name} | show_id={_clean_text(show.get('show_id'))}",
+        "status": TX_STATUS_SOLD,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "product_type": _clean_text(inv_rec.get("product_type")),
+        "sealed_product_type": _clean_text(inv_rec.get("sealed_product_type")),
+        "card_type": _clean_text(inv_rec.get("card_type")),
+        "brand_or_league": _clean_text(inv_rec.get("brand_or_league")),
+        "set_name": _clean_text(inv_rec.get("set_name")),
+        "year": _clean_text(inv_rec.get("year")),
+        "card_name": _clean_text(inv_rec.get("card_name")),
+        "card_number": _clean_text(inv_rec.get("card_number")),
+        "variant": _clean_text(inv_rec.get("variant")),
+        "card_subtype": _clean_text(inv_rec.get("card_subtype")),
+        "reference_link": _clean_text(inv_rec.get("reference_link")),
+        "image_url": _clean_text(inv_rec.get("image_url")),
+        "purchase_date": _clean_text(inv_rec.get("purchase_date")),
+        "purchased_from": _clean_text(inv_rec.get("purchased_from")),
+        "purchase_total": purchase_total,
+        "grading_fee_total": grading_fee_total,
+        "all_in_cost": all_in_cost,
+        "grading_company": _clean_text(inv_rec.get("grading_company")),
+        "grade": _clean_text(inv_rec.get("grade")),
+        "condition": _clean_text(inv_rec.get("condition")),
+    }
+
+
+def sync_show_sales(show: pd.Series, edited_sales_df: pd.DataFrame) -> tuple[int, list[str]]:
+    if edited_sales_df.empty:
+        return 0, ["No sales rows found."]
+
+    sales = edited_sales_df.copy()
+    sales["inventory_id"] = sales["inventory_id"].astype(str).str.strip()
+    sales["sell_price"] = _coerce_money_series(sales["sell_price"])
+    sales = sales[(sales["inventory_id"] != "") & (sales["sell_price"] > 0)].copy()
+
+    if sales.empty:
+        return 0, ["No sell_price values greater than $0 were entered."]
+
+    # One sale per inventory item.
+    sales = sales.drop_duplicates(subset=["inventory_id"], keep="last")
+
+    spreadsheet_id = st.secrets["spreadsheet_id"]
+    inv_ws_name = st.secrets.get("inventory_worksheet", INVENTORY_WS_DEFAULT)
+    tx_ws_name = st.secrets.get("transactions_worksheet", TRANSACTIONS_WS_DEFAULT)
+    snap_ws_name = st.secrets.get("show_snapshots_worksheet", SHOW_SNAPSHOTS_WS_DEFAULT)
+
+    inv_ws = _get_or_create_ws(spreadsheet_id, inv_ws_name, INV_COLUMNS)
+    tx_ws = _get_or_create_ws(spreadsheet_id, tx_ws_name, TX_COLUMNS)
+    snap_ws = _get_or_create_ws(spreadsheet_id, snap_ws_name, SNAPSHOT_COLUMNS)
+
+    inv_headers = _ensure_headers(inv_ws, INV_COLUMNS)
+    tx_headers = _ensure_headers(tx_ws, TX_COLUMNS)
+    snap_headers = _ensure_headers(snap_ws, SNAPSHOT_COLUMNS)
+
+    inv_values = _with_backoff(lambda: inv_ws.get_all_values())
+    snap_values = _with_backoff(lambda: snap_ws.get_all_values())
+
+    inv_ids = sales["inventory_id"].tolist()
+    inv_rownums = _find_rownums_by_id(inv_values, "inventory_id", inv_ids)
+
+    # Existing transactions safety: skip if already SOLD in transactions.
+    try:
+        tx_df = load_transactions_df()
+        existing_sold_ids = set(
+            tx_df[
+                (tx_df["inventory_id"].astype(str).str.strip().isin(inv_ids))
+                & (tx_df["status"].astype(str).str.upper() == TX_STATUS_SOLD)
+            ]["inventory_id"].astype(str).str.strip().tolist()
+        )
+    except Exception:
+        existing_sold_ids = set()
+
+    tx_rows = []
+    inv_updates = []
+    snapshot_updates = []
+    warnings = []
+    now_iso = _utc_now_iso()
+    show_id = _clean_text(show.get("show_id"))
+
+    # Build snapshot row lookup by show_id + inventory_id.
+    snap_row_lookup = {}
+    if snap_values and len(snap_values) > 1:
+        snap_df, _ = _sheet_to_df(snap_values, SNAPSHOT_COLUMNS)
+        for idx, snap_row in snap_df.iterrows():
+            key = (_clean_text(snap_row.get("show_id")), _clean_text(snap_row.get("inventory_id")))
+            if key[0] and key[1]:
+                snap_row_lookup[key] = idx + 2
+
+    for _, sale in sales.iterrows():
+        inv_id = _clean_text(sale.get("inventory_id"))
+        sell_price = _money_float(sale.get("sell_price"))
+
+        if inv_id in existing_sold_ids:
+            warnings.append(f"Skipped {inv_id}: already has a SOLD transaction.")
+            continue
+
+        inv_rownum = inv_rownums.get(inv_id)
+        if not inv_rownum:
+            warnings.append(f"Skipped {inv_id}: inventory row not found.")
+            continue
+
+        inv_rec = _row_from_sheet_values(inv_values, inv_rownum)
+        current_status = _normalize_status(inv_rec.get("inventory_status", STATUS_ACTIVE))
+        current_type = _normalize_inventory_type(inv_rec.get("inventory_type"))
+
+        if current_status != STATUS_ACTIVE:
+            warnings.append(f"Skipped {inv_id}: inventory status is {current_status}, not ACTIVE.")
+            continue
+        if current_type != "showinventory":
+            warnings.append(f"Skipped {inv_id}: Inventory Type is not Show Inventory.")
+            continue
+
+        tx_id = str(uuid.uuid4())
+        tx_rows.append(_tx_row_from_inventory(inv_rec, show, sell_price, tx_id))
+
+        inv_rec["inventory_status"] = STATUS_SOLD
+        inv_rec["listed_transaction_id"] = tx_id
+        inv_updates.append((inv_rownum, inv_rec))
+
+        snap_rownum = snap_row_lookup.get((show_id, inv_id))
+        if snap_rownum:
+            snap_rec = _row_from_sheet_values(snap_values, snap_rownum)
+            snap_rec["sold_price"] = float(round(sell_price, 2))
+            snap_rec["synced_at"] = now_iso
+            snap_rec["synced_transaction_id"] = tx_id
+            snapshot_updates.append((snap_rownum, snap_rec))
+
+    if not tx_rows:
+        return 0, warnings or ["No valid sales were synced."]
+
+    # Write transactions first, then inventory updates. If inventory update fails, at least
+    # the transaction row exists and can be manually reconciled.
+    _append_rows(tx_ws_name, TX_COLUMNS, tx_rows)
+    _batch_update_full_rows(inv_ws_name, INV_COLUMNS, inv_updates)
+    if snapshot_updates:
+        _batch_update_full_rows(snap_ws_name, SNAPSHOT_COLUMNS, snapshot_updates)
+
+    _read_sheet_values_cached.clear()
+    return len(tx_rows), warnings
+
+
+# =========================================================
+# UI
+# =========================================================
+
+st.title("Shows")
+
+refresh_col1, refresh_col2 = st.columns([4, 1])
+with refresh_col2:
+    if st.button("🔄 Refresh", use_container_width=True):
+        _read_sheet_values_cached.clear()
+        st.rerun()
+
+inv_df = load_inventory_df()
+shows_df = load_shows_df()
+snapshots_df = load_snapshots_df()
+show_inv_df = get_active_show_inventory(inv_df)
+
+
+tab_summary, tab_manage, tab_sales = st.tabs([
+    "Show Inventory Summary",
+    "Manage Shows",
+    "Show Sales Sync",
+])
+
+
+# =========================================================
+# TAB 1: SHOW INVENTORY SUMMARY
+# =========================================================
+with tab_summary:
+    st.subheader("Show Inventory Summary")
+    st.caption("ACTIVE items where Inventory Type = Show Inventory.")
+
+    item_count, total_cost, total_market = _snapshot_totals(show_inv_df)
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("# of Items", f"{item_count:,}")
+    k2.metric("Total Cost", _money_display(total_cost))
+    k3.metric("Total Market Value", _money_display(total_market))
+
+    st.markdown("---")
+
+    if show_inv_df.empty:
+        st.info("No ACTIVE Show Inventory found. Set items to Inventory Type = Show Inventory in the Inventory page.")
+    else:
+        display_cols = [
+            "image_url",
+            "inventory_id",
+            "card_name",
+            "set_name",
+            "variant",
+            "card_number",
+            "product_type",
+            "purchase_price",
+            "total_cost",
+            "market_value_resolved",
+            "condition",
+            "reference_link",
+        ]
+        for c in display_cols:
+            if c not in show_inv_df.columns:
+                show_inv_df[c] = ""
+
+        display = show_inv_df[display_cols].copy()
+        display = display.rename(columns={"market_value_resolved": "market_value"})
+
+        st.dataframe(
+            display,
+            use_container_width=True,
+            hide_index=True,
+            height=700,
+            column_config={
+                "image_url": st.column_config.ImageColumn("Image", width="small"),
+                "reference_link": st.column_config.LinkColumn("Reference"),
+                "purchase_price": st.column_config.NumberColumn("Purchase Price", format="$%.2f"),
+                "total_cost": st.column_config.NumberColumn("Total Cost", format="$%.2f"),
+                "market_value": st.column_config.NumberColumn("Market Value", format="$%.2f"),
+            },
+        )
+
+        st.download_button(
+            "Download Show Inventory CSV",
+            data=display.to_csv(index=False).encode("utf-8"),
+            file_name="show_inventory_summary.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+
+# =========================================================
+# TAB 2: MANAGE SHOWS
+# =========================================================
+with tab_manage:
+    st.subheader("Create / Manage Shows")
+    st.caption("Creating a show saves a snapshot of the ACTIVE Show Inventory totals and item-level inventory at that moment.")
+
+    with st.form("create_show_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns([1.5, 1.0, 1.4])
+        with c1:
+            show_name = st.text_input("Show name*", placeholder="Example: Huntsville Card Show")
+        with c2:
+            show_date = st.date_input("Show date*", value=date.today())
+        with c3:
+            location = st.text_input("Location", placeholder="City / venue")
+
+        description = st.text_area("Description / notes", placeholder="Table number, promoter, setup notes, etc.")
+        submitted = st.form_submit_button("Create Show + Snapshot Current Show Inventory", type="primary", use_container_width=True)
+
+    if submitted:
+        if not show_name.strip():
+            st.error("Show name is required.")
+        else:
+            item_count, total_cost, total_market = _snapshot_totals(show_inv_df)
+            now_iso = _utc_now_iso()
+            show_id = str(uuid.uuid4())[:8]
+            show_row = {
+                "show_id": show_id,
+                "show_name": show_name.strip(),
+                "show_date": str(show_date),
+                "location": location.strip(),
+                "description": description.strip(),
+                "status": "Planned",
+                "snapshot_item_count": item_count,
+                "snapshot_total_cost": total_cost,
+                "snapshot_total_market_value": total_market,
+                "snapshot_created_at": now_iso,
+                "created_at": now_iso,
+                "updated_at": now_iso,
+            }
+
+            snap_rows = build_snapshot_rows(show_row, show_inv_df)
+            _append_rows(st.secrets.get("shows_worksheet", SHOWS_WS_DEFAULT), SHOW_COLUMNS, [show_row])
+            _append_rows(st.secrets.get("show_snapshots_worksheet", SHOW_SNAPSHOTS_WS_DEFAULT), SNAPSHOT_COLUMNS, snap_rows)
+
+            st.success(f"Created {show_name.strip()} and snapshotted {item_count:,} Show Inventory item(s).")
+            st.rerun()
+
+    st.markdown("---")
+    st.markdown("### Shows")
+
+    if shows_df.empty:
+        st.info("No shows created yet.")
+    else:
+        show_display = shows_df.copy()
+        show_display = show_display.sort_values("show_date", ascending=True)
+        st.dataframe(
+            show_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "snapshot_total_cost": st.column_config.NumberColumn("Snapshot Total Cost", format="$%.2f"),
+                "snapshot_total_market_value": st.column_config.NumberColumn("Snapshot Total Market", format="$%.2f"),
+            },
+        )
+
+        st.markdown("---")
+        st.markdown("### Update an existing show")
+        st.caption("Use this if you add/remove show inventory after creating a show and want the saved snapshot refreshed.")
+
+        labels = []
+        for _, r in show_display.iterrows():
+            labels.append(f"{r.get('show_date', '')} — {r.get('show_name', '')} — {r.get('show_id', '')}")
+
+        selected_label = st.selectbox("Select show", labels, index=0)
+        selected_show = show_display.iloc[labels.index(selected_label)]
+        selected_show_id = _clean_text(selected_show.get("show_id"))
+
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            new_status = st.selectbox(
+                "Show status",
+                SHOW_STATUS_OPTIONS,
+                index=SHOW_STATUS_OPTIONS.index(selected_show.get("status")) if selected_show.get("status") in SHOW_STATUS_OPTIONS else 0,
+            )
+            update_status = st.button("Update Show Status", use_container_width=True)
+        with c2:
+            replace_snapshot = st.button("Replace Snapshot with Current Show Inventory", type="secondary", use_container_width=True)
+            st.caption("This deletes the old snapshot rows for this show and saves today’s ACTIVE Show Inventory.")
+
+        if update_status:
+            show_ws_name = st.secrets.get("shows_worksheet", SHOWS_WS_DEFAULT)
+            spreadsheet_id = st.secrets["spreadsheet_id"]
+            show_ws = _get_or_create_ws(spreadsheet_id, show_ws_name, SHOW_COLUMNS)
+            _ensure_headers(show_ws, SHOW_COLUMNS)
+            values = _with_backoff(lambda: show_ws.get_all_values())
+            rownums = _find_rownums_by_id(values, "show_id", [selected_show_id])
+            rownum = rownums.get(selected_show_id)
+            if not rownum:
+                st.error("Could not find selected show row to update.")
+            else:
+                show_rec = _row_from_sheet_values(values, rownum)
+                show_rec["status"] = new_status
+                show_rec["updated_at"] = _utc_now_iso()
+                _batch_update_full_rows(show_ws_name, SHOW_COLUMNS, [(rownum, show_rec)])
+                st.success("Show status updated.")
+                st.rerun()
+
+        if replace_snapshot:
+            deleted = _delete_rows_by_filter(
+                st.secrets.get("show_snapshots_worksheet", SHOW_SNAPSHOTS_WS_DEFAULT),
+                SNAPSHOT_COLUMNS,
+                lambda r: _clean_text(r.get("show_id")) == selected_show_id,
+            )
+
+            item_count, total_cost, total_market = _snapshot_totals(show_inv_df)
+            now_iso = _utc_now_iso()
+            refreshed_show_row = selected_show.to_dict()
+            refreshed_show_row["snapshot_item_count"] = item_count
+            refreshed_show_row["snapshot_total_cost"] = total_cost
+            refreshed_show_row["snapshot_total_market_value"] = total_market
+            refreshed_show_row["snapshot_created_at"] = now_iso
+            refreshed_show_row["updated_at"] = now_iso
+
+            snap_rows = build_snapshot_rows(refreshed_show_row, show_inv_df)
+            _append_rows(st.secrets.get("show_snapshots_worksheet", SHOW_SNAPSHOTS_WS_DEFAULT), SNAPSHOT_COLUMNS, snap_rows)
+
+            # Update show totals.
+            show_ws_name = st.secrets.get("shows_worksheet", SHOWS_WS_DEFAULT)
+            spreadsheet_id = st.secrets["spreadsheet_id"]
+            show_ws = _get_or_create_ws(spreadsheet_id, show_ws_name, SHOW_COLUMNS)
+            _ensure_headers(show_ws, SHOW_COLUMNS)
+            values = _with_backoff(lambda: show_ws.get_all_values())
+            rownums = _find_rownums_by_id(values, "show_id", [selected_show_id])
+            rownum = rownums.get(selected_show_id)
+            if rownum:
+                show_rec = _row_from_sheet_values(values, rownum)
+                show_rec.update({
+                    "snapshot_item_count": item_count,
+                    "snapshot_total_cost": total_cost,
+                    "snapshot_total_market_value": total_market,
+                    "snapshot_created_at": now_iso,
+                    "updated_at": now_iso,
+                })
+                _batch_update_full_rows(show_ws_name, SHOW_COLUMNS, [(rownum, show_rec)])
+
+            st.success(f"Snapshot replaced. Deleted {deleted:,} old row(s), saved {item_count:,} current item(s).")
+            st.rerun()
+
+
+# =========================================================
+# TAB 3: SHOW SALES SYNC
+# =========================================================
+with tab_sales:
+    next_show = _choose_next_show(shows_df)
+
+    if next_show is None:
+        st.info("Create a show first in the Manage Shows tab.")
+    else:
+        show_id = _clean_text(next_show.get("show_id"))
+        show_name = _clean_text(next_show.get("show_name"))
+        show_date_text = _date_str(next_show.get("show_date"))
+
+        st.subheader(f"Inventory for {show_name} show")
+        st.caption(f"Show date: {show_date_text or 'No date'} | Show ID: {show_id}")
+
+        sales_base = _build_sales_editor_df(next_show, snapshots_df, inv_df)
+
+        if sales_base.empty:
+            st.info("No ACTIVE Show Inventory is available for this show. If needed, refresh the show snapshot in Manage Shows.")
+        else:
+            upload_key = f"uploaded_sales_prices_{show_id}"
+            editor_key = f"show_sales_editor_{show_id}"
+
+            # Apply uploaded prices to the starting table when present.
+            uploaded_price_map = st.session_state.get(upload_key, {})
+            if uploaded_price_map:
+                sales_base["sell_price"] = sales_base.apply(
+                    lambda r: uploaded_price_map.get(str(r["inventory_id"]).strip(), r["sell_price"]),
+                    axis=1,
+                )
+
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                sales_bytes, file_name, mime = _build_sales_template_bytes(sales_base)
+                st.download_button(
+                    "Export Show Inventory for Excel",
+                    data=sales_bytes,
+                    file_name=file_name,
+                    mime=mime,
+                    use_container_width=True,
+                )
+            with c2:
+                uploaded_file = st.file_uploader(
+                    "Re-upload completed Excel/CSV",
+                    type=["xlsx", "csv"],
+                    key=f"sales_upload_{show_id}",
+                )
+
+            if uploaded_file is not None:
+                try:
+                    uploaded_sales = _read_sales_upload(uploaded_file)
+                    if uploaded_sales.empty:
+                        st.warning("Upload did not contain any sale rows.")
+                    else:
+                        price_map = {
+                            str(r["inventory_id"]).strip(): float(r["sell_price"] or 0.0)
+                            for _, r in uploaded_sales.iterrows()
+                        }
+                        st.session_state[upload_key] = price_map
+                        # Force the editor to rebuild from the uploaded sell prices.
+                        st.session_state.pop(editor_key, None)
+                        st.success(f"Loaded {len(price_map):,} sell price row(s) from upload. Review below, then Sync Sales.")
+                        st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+            st.markdown("---")
+            st.caption("Enter sell prices for items sold at the show. Rows with blank/$0 sell_price will not sync.")
+
+            edited_sales = st.data_editor(
+                sales_base,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                height=700,
+                key=editor_key,
+                column_order=[
+                    "inventory_id",
+                    "card_name",
+                    "set_name",
+                    "variant",
+                    "card_number",
+                    "purchase_price",
+                    "sell_price",
+                ],
+                column_config={
+                    "inventory_id": st.column_config.TextColumn("Inventory ID", disabled=True),
+                    "card_name": st.column_config.TextColumn("Card Name", disabled=True),
+                    "set_name": st.column_config.TextColumn("Set", disabled=True),
+                    "variant": st.column_config.TextColumn("Variant", disabled=True),
+                    "card_number": st.column_config.TextColumn("Card #", disabled=True),
+                    "purchase_price": st.column_config.NumberColumn("Purchase Price", format="$%.2f", disabled=True),
+                    "sell_price": st.column_config.NumberColumn("Sell Price", min_value=0.0, step=1.0, format="$%.2f"),
+                },
+            )
+
+            sale_count = int((_coerce_money_series(edited_sales["sell_price"]) > 0).sum())
+            sale_total = float(round(_coerce_money_series(edited_sales["sell_price"]).sum(), 2))
+            st.caption(f"Pending sync: {sale_count:,} sold item(s), {_money_display(sale_total)} sold price total.")
+
+            st.markdown("---")
+            sync_clicked = st.button("Sync Sales", type="primary", use_container_width=True)
+
+            if sync_clicked:
+                synced_count, warnings = sync_show_sales(next_show, edited_sales)
+                if synced_count > 0:
+                    st.success(f"Synced {synced_count:,} sale(s). Inventory marked SOLD and transaction rows created.")
+                    if upload_key in st.session_state:
+                        del st.session_state[upload_key]
+                    st.session_state.pop(editor_key, None)
+                    _read_sheet_values_cached.clear()
+                    if warnings:
+                        st.warning("Some rows were skipped:\n- " + "\n- ".join(warnings))
+                    st.rerun()
+                else:
+                    st.error("No sales were synced.")
+                    if warnings:
+                        st.warning("Details:\n- " + "\n- ".join(warnings))
