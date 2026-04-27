@@ -1163,6 +1163,454 @@ def sync_show_sales(show: pd.Series, edited_sales_df: pd.DataFrame) -> tuple[int
     return len(tx_rows), warnings
 
 
+
+# =========================================================
+# SHOW RESULTS / DASHBOARD HELPERS
+# =========================================================
+
+PRICE_BUCKET_LABELS = [
+    "$1-$10",
+    "$10-$25",
+    "$25-$50",
+    "$50-$100",
+    "$100-$250",
+    "$250-$500",
+    "$500-$1,000",
+    "$1,000+",
+]
+
+PRICE_BUCKET_BINS = [-0.01, 10, 25, 50, 100, 250, 500, 1000, float("inf")]
+
+
+def _safe_pct(numerator: float, denominator: float) -> float:
+    numerator = float(numerator or 0.0)
+    denominator = float(denominator or 0.0)
+    if denominator == 0:
+        return 0.0
+    return float(round(numerator / denominator, 4))
+
+
+def _pct_display(x) -> str:
+    try:
+        return f"{float(x or 0.0) * 100:.1f}%"
+    except Exception:
+        return "0.0%"
+
+
+def _normalize_match_text(x) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _clean_text(x).lower())
+
+
+def _extract_show_id_from_notes(notes: str) -> str:
+    text = _clean_text(notes)
+    if not text:
+        return ""
+    match = re.search(r"show_id\s*=\s*([A-Za-z0-9_\-]+)", text)
+    return match.group(1).strip() if match else ""
+
+
+def _show_name_from_platform(platform: str) -> str:
+    text = _clean_text(platform)
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered.startswith("card show -"):
+        return text.split("-", 1)[1].strip()
+    if lowered.startswith("card show:"):
+        return text.split(":", 1)[1].strip()
+    return ""
+
+
+def _build_show_lookup_maps(shows_df: pd.DataFrame) -> tuple[dict, dict]:
+    by_id = {}
+    by_date_name = {}
+
+    if shows_df.empty:
+        return by_id, by_date_name
+
+    for _, show in shows_df.iterrows():
+        show_id = _clean_text(show.get("show_id"))
+        show_name = _clean_text(show.get("show_name"))
+        show_date = _date_str(show.get("show_date"))
+
+        if show_id:
+            by_id[show_id] = {
+                "show_id": show_id,
+                "show_name": show_name,
+                "show_date": show_date,
+            }
+
+        if show_date and show_name:
+            by_date_name[(show_date, _normalize_match_text(show_name))] = show_id
+
+    return by_id, by_date_name
+
+
+def _infer_show_id_for_tx(tx_row: pd.Series, by_date_name: dict) -> str:
+    show_id = _extract_show_id_from_notes(tx_row.get("notes", ""))
+    if show_id:
+        return show_id
+
+    platform_show_name = _show_name_from_platform(tx_row.get("platform", ""))
+    if not platform_show_name:
+        return ""
+
+    candidate_dates = [
+        _date_str(tx_row.get("sold_date")),
+        _date_str(tx_row.get("list_date")),
+    ]
+
+    normalized_name = _normalize_match_text(platform_show_name)
+    for candidate_date in candidate_dates:
+        if not candidate_date:
+            continue
+        matched = by_date_name.get((candidate_date, normalized_name))
+        if matched:
+            return matched
+
+    return ""
+
+
+def build_show_sales_detail(tx_df: pd.DataFrame, shows_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Builds a clean transaction-level table for card show sales.
+
+    Primary match:
+    - notes contains show_id=...
+    Fallback match:
+    - platform looks like "Card Show - {show_name}" and sold/list date matches show date.
+    """
+    out_cols = [
+        "show_id",
+        "show_name",
+        "show_date",
+        "transaction_id",
+        "inventory_id",
+        "card_name",
+        "set_name",
+        "brand_or_league",
+        "product_type",
+        "sold_price",
+        "all_in_cost",
+        "net_proceeds",
+        "profit",
+        "profit_margin",
+        "price_bucket",
+    ]
+
+    if tx_df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    df = tx_df.copy()
+
+    for col in ["status", "transaction_type", "platform", "notes"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    for col in ["sold_price", "fees", "shipping_charged", "fees_total", "net_proceeds", "profit", "purchase_total", "grading_fee_total", "all_in_cost"]:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = _coerce_money_series(df[col])
+
+    df["status_norm"] = df["status"].astype(str).str.strip().str.upper()
+    df["transaction_type_norm"] = df["transaction_type"].astype(str).str.strip().str.lower()
+    df["platform_norm"] = df["platform"].astype(str).str.strip().str.lower()
+    df["notes_show_id"] = df["notes"].apply(_extract_show_id_from_notes)
+
+    is_card_show_tx = (
+        (df["notes_show_id"] != "")
+        | df["transaction_type_norm"].str.contains("card show", na=False)
+        | df["platform_norm"].str.contains("card show", na=False)
+    )
+
+    df = df[
+        (df["status_norm"] == TX_STATUS_SOLD)
+        & is_card_show_tx
+        & (_coerce_money_series(df["sold_price"]) > 0)
+    ].copy()
+
+    if df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    by_id, by_date_name = _build_show_lookup_maps(shows_df)
+
+    df["show_id"] = df.apply(lambda r: _infer_show_id_for_tx(r, by_date_name), axis=1)
+
+    def _show_name_for_row(r: pd.Series) -> str:
+        show_id = _clean_text(r.get("show_id"))
+        if show_id in by_id:
+            return by_id[show_id].get("show_name", "")
+        from_platform = _show_name_from_platform(r.get("platform", ""))
+        return from_platform or "Unmatched Card Show"
+
+    def _show_date_for_row(r: pd.Series) -> str:
+        show_id = _clean_text(r.get("show_id"))
+        if show_id in by_id:
+            return by_id[show_id].get("show_date", "")
+        return _date_str(r.get("sold_date")) or _date_str(r.get("list_date"))
+
+    df["show_name"] = df.apply(_show_name_for_row, axis=1)
+    df["show_date"] = df.apply(_show_date_for_row, axis=1)
+
+    # Cost basis fallback.
+    df["all_in_cost_calc"] = _coerce_money_series(df["all_in_cost"])
+    purchase_plus_grading = _coerce_money_series(df["purchase_total"]) + _coerce_money_series(df["grading_fee_total"])
+    df["all_in_cost_calc"] = df["all_in_cost_calc"].where(df["all_in_cost_calc"] > 0, purchase_plus_grading)
+
+    # Show sales are usually no fee/no shipping, but this keeps it correct if you add fees later.
+    fees_total_calc = _coerce_money_series(df["fees_total"])
+    fees_plus_ship = _coerce_money_series(df["fees"]) + _coerce_money_series(df["shipping_charged"])
+    fees_total_calc = fees_total_calc.where(fees_total_calc > 0, fees_plus_ship)
+
+    df["net_proceeds_calc"] = (_coerce_money_series(df["sold_price"]) - fees_total_calc).round(2)
+    df["profit_calc"] = (df["net_proceeds_calc"] - df["all_in_cost_calc"]).round(2)
+    df["profit_margin"] = df.apply(lambda r: _safe_pct(r.get("profit_calc", 0.0), r.get("sold_price", 0.0)), axis=1)
+
+    df["price_bucket"] = pd.cut(
+        _coerce_money_series(df["sold_price"]),
+        bins=PRICE_BUCKET_BINS,
+        labels=PRICE_BUCKET_LABELS,
+        include_lowest=True,
+        right=True,
+    ).astype(str)
+
+    df.loc[df["price_bucket"].isin(["nan", "NaN"]), "price_bucket"] = "Unbucketed"
+
+    for col in ["transaction_id", "inventory_id", "card_name", "set_name", "brand_or_league", "product_type"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    out = pd.DataFrame({
+        "show_id": df["show_id"].astype(str),
+        "show_name": df["show_name"].astype(str),
+        "show_date": df["show_date"].astype(str),
+        "transaction_id": df["transaction_id"].astype(str),
+        "inventory_id": df["inventory_id"].astype(str),
+        "card_name": df["card_name"].astype(str),
+        "set_name": df["set_name"].replace("", "(No set)").astype(str),
+        "brand_or_league": df["brand_or_league"].replace("", "(Blank)").astype(str),
+        "product_type": df["product_type"].replace("", "(Blank)").astype(str),
+        "sold_price": _coerce_money_series(df["sold_price"]),
+        "all_in_cost": _coerce_money_series(df["all_in_cost_calc"]),
+        "net_proceeds": _coerce_money_series(df["net_proceeds_calc"]),
+        "profit": _coerce_money_series(df["profit_calc"]),
+        "profit_margin": df["profit_margin"].astype(float),
+        "price_bucket": df["price_bucket"].astype(str),
+    })
+
+    return out[out_cols].copy()
+
+
+def build_show_summary_table(shows_df: pd.DataFrame, snapshots_df: pd.DataFrame, sales_detail: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "show_id",
+        "show_name",
+        "show_date",
+        "status",
+        "incoming_items",
+        "incoming_inventory_cost",
+        "incoming_market_value",
+        "items_sold",
+        "total_sales",
+        "profit",
+        "profit_margin",
+        "sell_through_pct",
+        "sales_to_market_pct",
+    ]
+
+    if shows_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    base = shows_df.copy()
+    for c in ["snapshot_item_count", "snapshot_total_cost", "snapshot_total_market_value"]:
+        if c not in base.columns:
+            base[c] = 0.0
+        base[c] = _coerce_money_series(base[c])
+
+    base["incoming_items"] = base["snapshot_item_count"].astype(float)
+    base["incoming_inventory_cost"] = base["snapshot_total_cost"].astype(float)
+    base["incoming_market_value"] = base["snapshot_total_market_value"].astype(float)
+
+    if not snapshots_df.empty:
+        snap = snapshots_df.copy()
+        for c in ["total_cost", "market_value"]:
+            if c not in snap.columns:
+                snap[c] = 0.0
+            snap[c] = _coerce_money_series(snap[c])
+
+        snap_group = (
+            snap.groupby("show_id", dropna=False)
+            .agg(
+                snapshot_items_from_rows=("inventory_id", "count"),
+                snapshot_cost_from_rows=("total_cost", "sum"),
+                snapshot_market_from_rows=("market_value", "sum"),
+            )
+            .reset_index()
+        )
+
+        base = base.merge(snap_group, on="show_id", how="left")
+
+        base["incoming_items"] = base["incoming_items"].where(
+            base["incoming_items"] > 0,
+            base["snapshot_items_from_rows"].fillna(0),
+        )
+        base["incoming_inventory_cost"] = base["incoming_inventory_cost"].where(
+            base["incoming_inventory_cost"] > 0,
+            base["snapshot_cost_from_rows"].fillna(0),
+        )
+        base["incoming_market_value"] = base["incoming_market_value"].where(
+            base["incoming_market_value"] > 0,
+            base["snapshot_market_from_rows"].fillna(0),
+        )
+
+    if sales_detail.empty:
+        base["items_sold"] = 0
+        base["total_sales"] = 0.0
+        base["profit"] = 0.0
+    else:
+        sales_group = (
+            sales_detail.groupby("show_id", dropna=False)
+            .agg(
+                items_sold=("inventory_id", "count"),
+                total_sales=("sold_price", "sum"),
+                profit=("profit", "sum"),
+            )
+            .reset_index()
+        )
+        base = base.merge(sales_group, on="show_id", how="left")
+        base["items_sold"] = base["items_sold"].fillna(0).astype(int)
+        base["total_sales"] = base["total_sales"].fillna(0.0)
+        base["profit"] = base["profit"].fillna(0.0)
+
+    base["profit_margin"] = base.apply(lambda r: _safe_pct(r.get("profit", 0.0), r.get("total_sales", 0.0)), axis=1)
+    base["sell_through_pct"] = base.apply(lambda r: _safe_pct(r.get("items_sold", 0), r.get("incoming_items", 0)), axis=1)
+    base["sales_to_market_pct"] = base.apply(lambda r: _safe_pct(r.get("total_sales", 0.0), r.get("incoming_market_value", 0.0)), axis=1)
+
+    for c in cols:
+        if c not in base.columns:
+            base[c] = ""
+
+    out = base[cols].copy()
+    out["incoming_items"] = _coerce_money_series(out["incoming_items"]).astype(int)
+    out["items_sold"] = _coerce_money_series(out["items_sold"]).astype(int)
+    out = out.sort_values(["show_date", "show_name"], ascending=[False, True], na_position="last")
+
+    return out
+
+
+def build_price_bucket_summary(sales_detail: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "price_bucket",
+        "items_sold",
+        "total_sales",
+        "total_cost",
+        "profit",
+        "profit_margin",
+        "avg_sale_price",
+    ]
+
+    if sales_detail.empty:
+        return pd.DataFrame(columns=cols)
+
+    df = sales_detail.copy()
+    df = df[df["sold_price"] > 0].copy()
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    grouped = (
+        df.groupby("price_bucket", dropna=False)
+        .agg(
+            items_sold=("inventory_id", "count"),
+            total_sales=("sold_price", "sum"),
+            total_cost=("all_in_cost", "sum"),
+            profit=("profit", "sum"),
+            avg_sale_price=("sold_price", "mean"),
+        )
+        .reset_index()
+    )
+
+    order_df = pd.DataFrame({"price_bucket": PRICE_BUCKET_LABELS})
+    grouped = order_df.merge(grouped, on="price_bucket", how="left")
+    grouped[["items_sold", "total_sales", "total_cost", "profit", "avg_sale_price"]] = grouped[
+        ["items_sold", "total_sales", "total_cost", "profit", "avg_sale_price"]
+    ].fillna(0.0)
+
+    grouped["items_sold"] = grouped["items_sold"].astype(int)
+    grouped["profit_margin"] = grouped.apply(lambda r: _safe_pct(r.get("profit", 0.0), r.get("total_sales", 0.0)), axis=1)
+
+    return grouped[cols].copy()
+
+
+def build_set_summary(sales_detail: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "set_name",
+        "brand_or_league",
+        "items_sold",
+        "total_sales",
+        "total_cost",
+        "profit",
+        "profit_margin",
+        "avg_sale_price",
+    ]
+
+    if sales_detail.empty:
+        return pd.DataFrame(columns=cols)
+
+    df = sales_detail.copy()
+    df["set_name"] = df["set_name"].replace("", "(No set)")
+    df["brand_or_league"] = df["brand_or_league"].replace("", "(Blank)")
+
+    grouped = (
+        df.groupby(["set_name", "brand_or_league"], dropna=False)
+        .agg(
+            items_sold=("inventory_id", "count"),
+            total_sales=("sold_price", "sum"),
+            total_cost=("all_in_cost", "sum"),
+            profit=("profit", "sum"),
+            avg_sale_price=("sold_price", "mean"),
+        )
+        .reset_index()
+    )
+
+    grouped["profit_margin"] = grouped.apply(lambda r: _safe_pct(r.get("profit", 0.0), r.get("total_sales", 0.0)), axis=1)
+
+    return grouped[cols].sort_values(["total_sales", "items_sold"], ascending=[False, False]).copy()
+
+
+def build_product_type_summary(sales_detail: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "product_type",
+        "items_sold",
+        "total_sales",
+        "total_cost",
+        "profit",
+        "profit_margin",
+        "avg_sale_price",
+    ]
+
+    if sales_detail.empty:
+        return pd.DataFrame(columns=cols)
+
+    df = sales_detail.copy()
+    df["product_type"] = df["product_type"].replace("", "(Blank)")
+
+    grouped = (
+        df.groupby("product_type", dropna=False)
+        .agg(
+            items_sold=("inventory_id", "count"),
+            total_sales=("sold_price", "sum"),
+            total_cost=("all_in_cost", "sum"),
+            profit=("profit", "sum"),
+            avg_sale_price=("sold_price", "mean"),
+        )
+        .reset_index()
+    )
+
+    grouped["profit_margin"] = grouped.apply(lambda r: _safe_pct(r.get("profit", 0.0), r.get("total_sales", 0.0)), axis=1)
+
+    return grouped[cols].sort_values(["total_sales", "items_sold"], ascending=[False, False]).copy()
+
+
 # =========================================================
 # UI
 # =========================================================
@@ -1176,15 +1624,17 @@ with refresh_col2:
         st.rerun()
 
 inv_df = load_inventory_df()
+tx_df = load_transactions_df()
 shows_df = load_shows_df()
 snapshots_df = load_snapshots_df()
 show_inv_df = get_active_show_inventory(inv_df)
 
 
-tab_summary, tab_manage, tab_sales = st.tabs([
+tab_summary, tab_manage, tab_sales, tab_results = st.tabs([
     "Show Inventory Summary",
     "Manage Shows",
     "Show Sales Sync",
+    "Show Results",
 ])
 
 
@@ -1520,3 +1970,266 @@ with tab_sales:
                     st.error("No sales were synced.")
                     if warnings:
                         st.warning("Details:\n- " + "\n- ".join(warnings))
+
+
+# =========================================================
+# TAB 4: SHOW RESULTS
+# =========================================================
+with tab_results:
+    st.subheader("Show Results Dashboard")
+    st.caption("Summarizes show snapshots, synced card-show sales, profit, price buckets, and best-selling sets.")
+
+    sales_detail = build_show_sales_detail(tx_df, shows_df)
+    show_summary_table = build_show_summary_table(shows_df, snapshots_df, sales_detail)
+
+    if shows_df.empty:
+        st.info("Create a show first in the Manage Shows tab. Once you sync sales, this dashboard will populate.")
+    else:
+        show_options = ["All Shows"]
+        show_option_to_id = {"All Shows": ""}
+
+        summary_for_options = show_summary_table.copy()
+        summary_for_options = summary_for_options.sort_values(["show_date", "show_name"], ascending=[False, True], na_position="last")
+
+        for _, show in summary_for_options.iterrows():
+            label = f"{show.get('show_date', '')} — {show.get('show_name', '')}"
+            show_id = _clean_text(show.get("show_id"))
+            if show_id:
+                show_options.append(label)
+                show_option_to_id[label] = show_id
+
+        selected_show_label = st.selectbox("View results for", show_options, index=0)
+        selected_show_id = show_option_to_id.get(selected_show_label, "")
+
+        if selected_show_id:
+            scoped_sales = sales_detail[sales_detail["show_id"].astype(str).str.strip() == selected_show_id].copy()
+            scoped_show_summary = show_summary_table[show_summary_table["show_id"].astype(str).str.strip() == selected_show_id].copy()
+        else:
+            scoped_sales = sales_detail.copy()
+            scoped_show_summary = show_summary_table.copy()
+
+        total_sales = float(round(_coerce_money_series(scoped_sales["sold_price"]).sum(), 2)) if not scoped_sales.empty else 0.0
+        total_profit = float(round(_coerce_money_series(scoped_sales["profit"]).sum(), 2)) if not scoped_sales.empty else 0.0
+        items_sold = int(len(scoped_sales)) if not scoped_sales.empty else 0
+        avg_margin = _safe_pct(total_profit, total_sales)
+
+        if selected_show_id and not scoped_show_summary.empty:
+            incoming_cost_kpi = float(scoped_show_summary.iloc[0].get("incoming_inventory_cost", 0.0) or 0.0)
+            incoming_market_kpi = float(scoped_show_summary.iloc[0].get("incoming_market_value", 0.0) or 0.0)
+        else:
+            incoming_cost_kpi = float(round(_coerce_money_series(scoped_show_summary["incoming_inventory_cost"]).sum(), 2)) if not scoped_show_summary.empty else 0.0
+            incoming_market_kpi = float(round(_coerce_money_series(scoped_show_summary["incoming_market_value"]).sum(), 2)) if not scoped_show_summary.empty else 0.0
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Inventory Cost Brought", _money_display(incoming_cost_kpi))
+        k2.metric("Inventory Market Value Brought", _money_display(incoming_market_kpi))
+        k3.metric("Total Sales", _money_display(total_sales))
+        k4.metric("Profit / Margin", f"{_money_display(total_profit)} / {_pct_display(avg_margin)}")
+
+        st.markdown("---")
+        st.markdown("### Show-by-Show Performance")
+
+        if show_summary_table.empty:
+            st.info("No show summary data yet.")
+        else:
+            display_summary = show_summary_table.copy()
+            for pct_col in ["profit_margin", "sell_through_pct", "sales_to_market_pct"]:
+                display_summary[f"{pct_col}_display"] = display_summary[pct_col].apply(_pct_display)
+
+            display_summary = display_summary.rename(columns={
+                "show_name": "Show",
+                "show_date": "Date",
+                "status": "Status",
+                "incoming_items": "Inventory Items Brought",
+                "incoming_inventory_cost": "Inventory Cost Brought",
+                "incoming_market_value": "Inventory Market Value Brought",
+                "items_sold": "Items Sold",
+                "total_sales": "$ Total Sales",
+                "profit": "Profit",
+                "profit_margin_display": "Profit Margin",
+                "sell_through_pct_display": "Sell-Through %",
+                "sales_to_market_pct_display": "Sales / Market Value %",
+            })
+
+            summary_cols = [
+                "Date",
+                "Show",
+                "Status",
+                "Inventory Items Brought",
+                "Inventory Cost Brought",
+                "Inventory Market Value Brought",
+                "Items Sold",
+                "$ Total Sales",
+                "Profit",
+                "Profit Margin",
+                "Sell-Through %",
+                "Sales / Market Value %",
+            ]
+
+            st.dataframe(
+                display_summary[summary_cols],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Inventory Cost Brought": st.column_config.NumberColumn("Inventory Cost Brought", format="$%.2f"),
+                    "Inventory Market Value Brought": st.column_config.NumberColumn("Inventory Market Value Brought", format="$%.2f"),
+                    "$ Total Sales": st.column_config.NumberColumn("$ Total Sales", format="$%.2f"),
+                    "Profit": st.column_config.NumberColumn("Profit", format="$%.2f"),
+                },
+            )
+
+            st.download_button(
+                "Download Show Performance CSV",
+                data=show_summary_table.to_csv(index=False).encode("utf-8"),
+                file_name="show_performance_summary.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        st.markdown("---")
+
+        if scoped_sales.empty:
+            st.info("No synced sales found for this selection yet. Use the Show Sales Sync tab first.")
+        else:
+            bucket_summary = build_price_bucket_summary(scoped_sales)
+            set_summary = build_set_summary(scoped_sales)
+            product_summary = build_product_type_summary(scoped_sales)
+
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                st.markdown("### Sales by Price Bucket")
+                bucket_display = bucket_summary.copy()
+                bucket_display["profit_margin_display"] = bucket_display["profit_margin"].apply(_pct_display)
+                bucket_display = bucket_display.rename(columns={
+                    "price_bucket": "Price Bucket",
+                    "items_sold": "# Sold",
+                    "total_sales": "$ Sales",
+                    "total_cost": "$ Cost",
+                    "profit": "$ Profit",
+                    "profit_margin_display": "Profit Margin",
+                    "avg_sale_price": "Avg Sale",
+                })
+
+                st.dataframe(
+                    bucket_display[["Price Bucket", "# Sold", "$ Sales", "$ Cost", "$ Profit", "Profit Margin", "Avg Sale"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "$ Sales": st.column_config.NumberColumn("$ Sales", format="$%.2f"),
+                        "$ Cost": st.column_config.NumberColumn("$ Cost", format="$%.2f"),
+                        "$ Profit": st.column_config.NumberColumn("$ Profit", format="$%.2f"),
+                        "Avg Sale": st.column_config.NumberColumn("Avg Sale", format="$%.2f"),
+                    },
+                )
+
+                chart_bucket = bucket_summary[["price_bucket", "items_sold"]].copy()
+                chart_bucket = chart_bucket.set_index("price_bucket")
+                st.bar_chart(chart_bucket)
+
+            with c2:
+                st.markdown("### Sales by Product Type")
+                product_display = product_summary.copy()
+                product_display["profit_margin_display"] = product_display["profit_margin"].apply(_pct_display)
+                product_display = product_display.rename(columns={
+                    "product_type": "Product Type",
+                    "items_sold": "# Sold",
+                    "total_sales": "$ Sales",
+                    "total_cost": "$ Cost",
+                    "profit": "$ Profit",
+                    "profit_margin_display": "Profit Margin",
+                    "avg_sale_price": "Avg Sale",
+                })
+
+                st.dataframe(
+                    product_display[["Product Type", "# Sold", "$ Sales", "$ Cost", "$ Profit", "Profit Margin", "Avg Sale"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "$ Sales": st.column_config.NumberColumn("$ Sales", format="$%.2f"),
+                        "$ Cost": st.column_config.NumberColumn("$ Cost", format="$%.2f"),
+                        "$ Profit": st.column_config.NumberColumn("$ Profit", format="$%.2f"),
+                        "Avg Sale": st.column_config.NumberColumn("Avg Sale", format="$%.2f"),
+                    },
+                )
+
+                chart_product = product_summary[["product_type", "total_sales"]].copy()
+                chart_product = chart_product.set_index("product_type")
+                st.bar_chart(chart_product)
+
+            st.markdown("---")
+            st.markdown("### Best-Selling Sets")
+            set_display = set_summary.copy()
+            set_display["profit_margin_display"] = set_display["profit_margin"].apply(_pct_display)
+            set_display = set_display.rename(columns={
+                "set_name": "Set",
+                "brand_or_league": "Brand / League",
+                "items_sold": "# Sold",
+                "total_sales": "$ Sales",
+                "total_cost": "$ Cost",
+                "profit": "$ Profit",
+                "profit_margin_display": "Profit Margin",
+                "avg_sale_price": "Avg Sale",
+            })
+
+            st.dataframe(
+                set_display[["Set", "Brand / League", "# Sold", "$ Sales", "$ Cost", "$ Profit", "Profit Margin", "Avg Sale"]],
+                use_container_width=True,
+                hide_index=True,
+                height=420,
+                column_config={
+                    "$ Sales": st.column_config.NumberColumn("$ Sales", format="$%.2f"),
+                    "$ Cost": st.column_config.NumberColumn("$ Cost", format="$%.2f"),
+                    "$ Profit": st.column_config.NumberColumn("$ Profit", format="$%.2f"),
+                    "Avg Sale": st.column_config.NumberColumn("Avg Sale", format="$%.2f"),
+                },
+            )
+
+            st.markdown("---")
+            st.markdown("### Sold Items Detail")
+            detail_display = scoped_sales.copy()
+            detail_display["profit_margin_display"] = detail_display["profit_margin"].apply(_pct_display)
+            detail_display = detail_display.rename(columns={
+                "show_date": "Show Date",
+                "show_name": "Show",
+                "card_name": "Card Name",
+                "set_name": "Set",
+                "price_bucket": "Price Bucket",
+                "sold_price": "Sold Price",
+                "all_in_cost": "All-In Cost",
+                "profit": "Profit",
+                "profit_margin_display": "Profit Margin",
+            })
+
+            detail_cols = [
+                "Show Date",
+                "Show",
+                "Card Name",
+                "Set",
+                "Price Bucket",
+                "Sold Price",
+                "All-In Cost",
+                "Profit",
+                "Profit Margin",
+                "inventory_id",
+            ]
+
+            st.dataframe(
+                detail_display[detail_cols],
+                use_container_width=True,
+                hide_index=True,
+                height=500,
+                column_config={
+                    "Sold Price": st.column_config.NumberColumn("Sold Price", format="$%.2f"),
+                    "All-In Cost": st.column_config.NumberColumn("All-In Cost", format="$%.2f"),
+                    "Profit": st.column_config.NumberColumn("Profit", format="$%.2f"),
+                },
+            )
+
+            st.download_button(
+                "Download Sold Items Detail CSV",
+                data=scoped_sales.to_csv(index=False).encode("utf-8"),
+                file_name="show_sold_items_detail.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
