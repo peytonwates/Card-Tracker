@@ -414,9 +414,13 @@ def _normalize_inventory_type(x) -> str:
 # =========================================================
 
 
-def _is_quota_429(e: Exception) -> bool:
+def _is_retryable_gspread_error(e: Exception) -> bool:
     try:
-        return isinstance(e, gspread.exceptions.APIError) and getattr(e, "response", None) and e.response.status_code == 429
+        if not isinstance(e, gspread.exceptions.APIError):
+            return False
+        response = getattr(e, "response", None)
+        status_code = getattr(response, "status_code", None)
+        return status_code in {429, 500, 502, 503, 504}
     except Exception:
         return False
 
@@ -428,7 +432,7 @@ def _with_backoff(fn, tries: int = 6, base_sleep: float = 0.8):
             return fn()
         except Exception as e:
             last = e
-            if _is_quota_429(e):
+            if _is_retryable_gspread_error(e):
                 time.sleep(base_sleep * (2 ** i))
                 continue
             raise
@@ -487,8 +491,9 @@ def _get_or_create_ws(spreadsheet_id: str, worksheet_name: str, internal_headers
 
 
 def _ensure_headers(ws, internal_headers: list[str]) -> list[str]:
-    values = _with_backoff(lambda: ws.get_all_values())
-    first_row = values[0] if values else []
+    # Only read row 1 here. Pulling the entire sheet just to inspect headers is
+    # expensive and was causing avoidable Google Sheets API failures.
+    first_row = _with_backoff(lambda: ws.row_values(1))
 
     if not first_row:
         sheet_headers = [internal_to_sheet_header(h, []) for h in internal_headers]
@@ -862,6 +867,44 @@ def _choose_next_show(shows_df: pd.DataFrame) -> pd.Series | None:
     return None
 
 
+
+def _build_show_select_labels(shows_df: pd.DataFrame, *, exclude_cancelled: bool = True) -> tuple[list[str], dict[str, str]]:
+    if shows_df.empty:
+        return [], {}
+
+    df = shows_df.copy()
+    df["show_date"] = df["show_date"].apply(_date_str)
+    if "status" in df.columns:
+        df["status_norm"] = df["status"].astype(str).str.strip().str.lower()
+    else:
+        df["status_norm"] = ""
+
+    if exclude_cancelled:
+        df = df[~df["status_norm"].isin(["cancelled", "canceled"])].copy()
+
+    if df.empty:
+        return [], {}
+
+    df = df.sort_values(["show_date", "show_name"], ascending=[True, True], na_position="last")
+    labels = []
+    label_to_id = {}
+    for _, r in df.iterrows():
+        label = f"{_date_str(r.get('show_date'))} — {_clean_text(r.get('show_name'))} — {_clean_text(r.get('show_id'))}"
+        labels.append(label)
+        label_to_id[label] = _clean_text(r.get("show_id"))
+    return labels, label_to_id
+
+
+def _get_show_by_id(shows_df: pd.DataFrame, show_id: str) -> pd.Series | None:
+    show_id = _clean_text(show_id)
+    if shows_df.empty or not show_id:
+        return None
+
+    matches = shows_df[shows_df["show_id"].astype(str).str.strip() == show_id]
+    if matches.empty:
+        return None
+    return matches.iloc[0]
+
 def _build_sales_editor_df(show: pd.Series, snapshots_df: pd.DataFrame, inv_df: pd.DataFrame) -> pd.DataFrame:
     show_id = str(show.get("show_id", "")).strip()
     show_snaps = snapshots_df[snapshots_df["show_id"].astype(str).str.strip() == show_id].copy()
@@ -936,24 +979,11 @@ def _build_pricing_editor_df(show: pd.Series, snapshots_df: pd.DataFrame, inv_df
             "sticker_price",
         ])
 
+    # Pricing should use the show's saved snapshot, not a re-filtered current inventory
+    # view. Otherwise cards can disappear from the export when their current status/type
+    # changes after the show snapshot was created.
     base = show_snaps.copy()
-
-    current = inv_df[["inventory_id", "inventory_status", "inventory_type"]].copy()
-    current["inventory_id"] = current["inventory_id"].astype(str).str.strip()
     base["inventory_id"] = base["inventory_id"].astype(str).str.strip()
-    base = base.merge(current, on="inventory_id", how="left", suffixes=("", "_current"))
-
-    status_col = "inventory_status_current" if "inventory_status_current" in base.columns else "inventory_status"
-    type_col = "inventory_type_current" if "inventory_type_current" in base.columns else "inventory_type"
-
-    base["current_status"] = base[status_col].apply(_normalize_status)
-    base["current_inventory_type"] = base[type_col].apply(_normalize_inventory_type)
-
-    base = base[
-        (base["current_status"] == STATUS_ACTIVE)
-        & (base["current_inventory_type"] == "showinventory")
-    ].copy()
-
     base["sticker_price"] = _coerce_money_series(base.get("sticker_price", pd.Series(0.0, index=base.index)))
 
     out_cols = [
@@ -974,6 +1004,7 @@ def _build_pricing_editor_df(show: pd.Series, snapshots_df: pd.DataFrame, inv_df
     for c in ["total_cost", "market_value", "sticker_price"]:
         out[c] = _coerce_money_series(out[c])
 
+    out = out.drop_duplicates(subset=["inventory_id"], keep="last")
     return out.sort_values(["card_name", "set_name", "inventory_id"], na_position="last").reset_index(drop=True)
 
 
@@ -1102,15 +1133,6 @@ def sync_show_pricing(show: pd.Series, edited_pricing_df: pd.DataFrame, inv_df: 
     if not snap_values or len(snap_values) <= 1:
         return 0, ["No show snapshot rows exist yet. Create or refresh the show snapshot first."]
 
-    current_lookup = (
-        inv_df[["inventory_id", "inventory_status", "inventory_type"]]
-        .copy()
-        .assign(inventory_id=lambda d: d["inventory_id"].astype(str).str.strip())
-        .drop_duplicates(subset=["inventory_id"], keep="last")
-        .set_index("inventory_id")
-        .to_dict("index")
-    )
-
     snap_df, _ = _sheet_to_df(snap_values, SNAPSHOT_COLUMNS)
     snap_row_lookup = {}
     show_id = _clean_text(show.get("show_id"))
@@ -1125,20 +1147,6 @@ def sync_show_pricing(show: pd.Series, edited_pricing_df: pd.DataFrame, inv_df: 
     for _, price_row in pricing.iterrows():
         inv_id = _clean_text(price_row.get("inventory_id"))
         sticker_price = float(round(_money_float(price_row.get("sticker_price")), 2))
-
-        current = current_lookup.get(inv_id)
-        if not current:
-            warnings.append(f"Skipped {inv_id}: inventory row not found.")
-            continue
-
-        current_status = _normalize_status(current.get("inventory_status", STATUS_ACTIVE))
-        current_type = _normalize_inventory_type(current.get("inventory_type"))
-        if current_status != STATUS_ACTIVE:
-            warnings.append(f"Skipped {inv_id}: inventory status is {current_status}, not ACTIVE.")
-            continue
-        if current_type != "showinventory":
-            warnings.append(f"Skipped {inv_id}: Inventory Type is not Show Inventory.")
-            continue
 
         snap_rownum = snap_row_lookup.get((show_id, inv_id))
         if not snap_rownum:
@@ -1892,13 +1900,16 @@ tab_summary, tab_manage, tab_pricing, tab_sales, tab_results = st.tabs([
 # =========================================================
 with tab_summary:
     st.subheader("Show Inventory Summary")
-    next_show_for_pricing = _choose_next_show(shows_df)
-    if next_show_for_pricing is None:
+    summary_pricing_show = _get_show_by_id(shows_df, st.session_state.get("shows_pricing_selected_show_id", ""))
+    if summary_pricing_show is None:
+        summary_pricing_show = _choose_next_show(shows_df)
+
+    if summary_pricing_show is None:
         st.caption("ACTIVE items where Inventory Type = Show Inventory. Sticker columns populate once a show exists and pricing is synced.")
     else:
         st.caption(
-            f"ACTIVE items where Inventory Type = Show Inventory. Sticker columns are pulled from the next show snapshot: "
-            f"{_clean_text(next_show_for_pricing.get('show_name'))} ({_date_str(next_show_for_pricing.get('show_date'))})."
+            f"ACTIVE items where Inventory Type = Show Inventory. Sticker columns are pulled from the selected show snapshot: "
+            f"{_clean_text(summary_pricing_show.get('show_name'))} ({_date_str(summary_pricing_show.get('show_date'))})."
         )
 
     item_count, total_cost, total_market = _snapshot_totals(show_inv_df)
@@ -1913,7 +1924,7 @@ with tab_summary:
     if show_inv_df.empty:
         st.info("No ACTIVE Show Inventory found. Set items to Inventory Type = Show Inventory in the Inventory page.")
     else:
-        sticker_price_lookup = build_show_sticker_price_lookup(next_show_for_pricing, snapshots_df, inv_df)
+        sticker_price_lookup = build_show_sticker_price_lookup(summary_pricing_show, snapshots_df, inv_df)
 
         display_cols = [
             "image_url",
@@ -2137,127 +2148,154 @@ with tab_manage:
 # TAB 3: PRICING FOR THE SHOW
 # =========================================================
 with tab_pricing:
-    pricing_show = _choose_next_show(shows_df)
-
-    if pricing_show is None:
+    if shows_df.empty:
         st.info("Create a show first in the Manage Shows tab.")
     else:
-        show_id = _clean_text(pricing_show.get("show_id"))
-        show_name = _clean_text(pricing_show.get("show_name"))
-        show_date_text = _date_str(pricing_show.get("show_date"))
-
-        st.subheader(f"Pricing for {show_name}")
-        st.caption(
-            f"Show date: {show_date_text or 'No date'} | Show ID: {show_id}. "
-            "Sticker prices save to this show's snapshot so pricing stays show-specific."
-        )
-
-        pricing_base = _build_pricing_editor_df(pricing_show, snapshots_df, inv_df)
-
-        if pricing_base.empty:
-            st.info("No snapshot inventory is available for this show. Create or refresh the show snapshot in Manage Shows first.")
+        pricing_labels, pricing_label_to_id = _build_show_select_labels(shows_df)
+        if not pricing_labels:
+            st.info("No non-cancelled shows are available to price.")
         else:
-            upload_key = f"uploaded_show_pricing_{show_id}"
-            editor_key = f"show_pricing_editor_{show_id}"
+            default_show = _get_show_by_id(shows_df, st.session_state.get("shows_pricing_selected_show_id", ""))
+            if default_show is None:
+                default_show = _choose_next_show(shows_df)
 
-            uploaded_price_map = st.session_state.get(upload_key, {})
-            if uploaded_price_map:
-                pricing_base["sticker_price"] = pricing_base.apply(
-                    lambda r: uploaded_price_map.get(str(r["inventory_id"]).strip(), r["sticker_price"]),
-                    axis=1,
-                )
+            default_label = pricing_labels[0]
+            if default_show is not None:
+                candidate = f"{_date_str(default_show.get('show_date'))} — {_clean_text(default_show.get('show_name'))} — {_clean_text(default_show.get('show_id'))}"
+                if candidate in pricing_label_to_id:
+                    default_label = candidate
 
-            c1, c2 = st.columns([1, 1])
-            with c1:
-                pricing_bytes, pricing_file_name, pricing_mime = _build_pricing_template_bytes(pricing_base)
-                st.download_button(
-                    "Export Show Pricing File",
-                    data=pricing_bytes,
-                    file_name=pricing_file_name,
-                    mime=pricing_mime,
-                    use_container_width=True,
-                )
-            with c2:
-                uploaded_pricing_file = st.file_uploader(
-                    "Re-upload completed pricing file",
-                    type=["xlsx", "csv"],
-                    key=f"pricing_upload_{show_id}",
-                )
-
-            if uploaded_pricing_file is not None:
-                try:
-                    uploaded_pricing = _read_pricing_upload(uploaded_pricing_file)
-                    if uploaded_pricing.empty:
-                        st.warning("Upload did not contain any pricing rows.")
-                    else:
-                        price_map = {
-                            str(r["inventory_id"]).strip(): float(r["sticker_price"] or 0.0)
-                            for _, r in uploaded_pricing.iterrows()
-                        }
-                        st.session_state[upload_key] = price_map
-                        st.session_state.pop(editor_key, None)
-                        st.success(
-                            f"Loaded {len(price_map):,} sticker price row(s) from upload. "
-                            "Review below, then sync to save them."
-                        )
-                        st.rerun()
-                except Exception as exc:
-                    st.error(str(exc))
-
-            st.markdown("---")
-            st.caption("Enter sticker prices below or upload them from Excel/CSV. Sync saves them to the show snapshot.")
-
-            edited_pricing = st.data_editor(
-                pricing_base,
-                use_container_width=True,
-                hide_index=True,
-                num_rows="fixed",
-                height=700,
-                key=editor_key,
-                column_order=[
-                    "inventory_id",
-                    "card_name",
-                    "set_name",
-                    "variant",
-                    "card_number",
-                    "total_cost",
-                    "market_value",
-                    "sticker_price",
-                ],
-                column_config={
-                    "inventory_id": st.column_config.TextColumn("Inventory ID", disabled=True),
-                    "card_name": st.column_config.TextColumn("Card Name", disabled=True),
-                    "set_name": st.column_config.TextColumn("Set", disabled=True),
-                    "variant": st.column_config.TextColumn("Variant", disabled=True),
-                    "card_number": st.column_config.TextColumn("Card #", disabled=True),
-                    "total_cost": st.column_config.NumberColumn("Total Cost", format="$%.2f", disabled=True),
-                    "market_value": st.column_config.NumberColumn("Market Value", format="$%.2f", disabled=True),
-                    "sticker_price": st.column_config.NumberColumn("Sticker Price", min_value=0.0, step=1.0, format="$%.2f"),
-                },
+            selected_pricing_label = st.selectbox(
+                "Select show to price",
+                pricing_labels,
+                index=pricing_labels.index(default_label),
+                key="shows_pricing_selectbox",
             )
 
-            priced_count = int((_coerce_money_series(edited_pricing["sticker_price"]) > 0).sum())
-            priced_total = float(round(_coerce_money_series(edited_pricing["sticker_price"]).sum(), 2))
-            st.caption(f"Current pricing: {priced_count:,} item(s) with a sticker price, {_money_display(priced_total)} total sticker value.")
+            selected_pricing_show_id = pricing_label_to_id.get(selected_pricing_label, "")
+            st.session_state["shows_pricing_selected_show_id"] = selected_pricing_show_id
+            pricing_show = _get_show_by_id(shows_df, selected_pricing_show_id)
 
-            st.markdown("---")
-            sync_pricing_clicked = st.button("Sync Sticker Prices", type="primary", use_container_width=True)
+            if pricing_show is None:
+                st.info("Could not load the selected show.")
+            else:
+                show_id = _clean_text(pricing_show.get("show_id"))
+                show_name = _clean_text(pricing_show.get("show_name"))
+                show_date_text = _date_str(pricing_show.get("show_date"))
 
-            if sync_pricing_clicked:
-                synced_count, warnings = sync_show_pricing(pricing_show, edited_pricing, inv_df)
-                if synced_count > 0:
-                    st.success(f"Saved sticker pricing for {synced_count:,} row(s) to the show snapshot.")
-                    if upload_key in st.session_state:
-                        del st.session_state[upload_key]
-                    st.session_state.pop(editor_key, None)
-                    _read_sheet_values_cached.clear()
-                    if warnings:
-                        st.warning("Some rows were skipped:\n- " + "\n- ".join(warnings))
-                    st.rerun()
+                st.subheader(f"Pricing for {show_name}")
+                st.caption(
+                    f"Show date: {show_date_text or 'No date'} | Show ID: {show_id}. "
+                    "Sticker prices save to this show's snapshot so pricing stays show-specific."
+                )
+
+                pricing_base = _build_pricing_editor_df(pricing_show, snapshots_df, inv_df)
+
+                if pricing_base.empty:
+                    st.info("No snapshot inventory is available for this show. Create or refresh the show snapshot in Manage Shows first.")
                 else:
-                    st.error("No sticker prices were synced.")
-                    if warnings:
-                        st.warning("Details:\n- " + "\n- ".join(warnings))
+                    upload_key = f"uploaded_show_pricing_{show_id}"
+                    editor_key = f"show_pricing_editor_{show_id}"
+                    uploaded_price_map = st.session_state.get(upload_key, {})
+
+                    c1, c2 = st.columns([1, 1])
+                    with c1:
+                        pricing_bytes, pricing_file_name, pricing_mime = _build_pricing_template_bytes(pricing_base)
+                        st.download_button(
+                            "Export Show Pricing File",
+                            data=pricing_bytes,
+                            file_name=pricing_file_name,
+                            mime=pricing_mime,
+                            use_container_width=True,
+                        )
+                    with c2:
+                        with st.form(f"pricing_upload_form_{show_id}", clear_on_submit=False):
+                            uploaded_pricing_file = st.file_uploader(
+                                "Re-upload completed pricing file",
+                                type=["xlsx", "csv"],
+                                key=f"pricing_upload_{show_id}",
+                            )
+                            load_pricing_file = st.form_submit_button("Load Uploaded Pricing File", use_container_width=True)
+
+                        if load_pricing_file:
+                            try:
+                                uploaded_pricing = _read_pricing_upload(uploaded_pricing_file)
+                                if uploaded_pricing.empty:
+                                    st.warning("Upload did not contain any pricing rows.")
+                                else:
+                                    uploaded_price_map = {
+                                        str(r["inventory_id"]).strip(): float(r["sticker_price"] or 0.0)
+                                        for _, r in uploaded_pricing.iterrows()
+                                    }
+                                    st.session_state[upload_key] = uploaded_price_map
+                                    st.success(
+                                        f"Loaded {len(uploaded_price_map):,} sticker price row(s) from upload. "
+                                        "Review below, then sync to save them."
+                                    )
+                            except Exception as exc:
+                                st.error(str(exc))
+
+                    if uploaded_price_map:
+                        pricing_base["sticker_price"] = pricing_base.apply(
+                            lambda r: uploaded_price_map.get(str(r["inventory_id"]).strip(), r["sticker_price"]),
+                            axis=1,
+                        )
+
+                    st.markdown("---")
+                    st.caption("Enter sticker prices below or upload them from Excel/CSV. Attaching a file alone will not auto-refresh; click Load Uploaded Pricing File first, then Sync Sticker Prices.")
+
+                    edited_pricing = st.data_editor(
+                        pricing_base,
+                        use_container_width=True,
+                        hide_index=True,
+                        num_rows="fixed",
+                        height=700,
+                        key=editor_key,
+                        column_order=[
+                            "inventory_id",
+                            "card_name",
+                            "set_name",
+                            "variant",
+                            "card_number",
+                            "total_cost",
+                            "market_value",
+                            "sticker_price",
+                        ],
+                        column_config={
+                            "inventory_id": st.column_config.TextColumn("Inventory ID", disabled=True),
+                            "card_name": st.column_config.TextColumn("Card Name", disabled=True),
+                            "set_name": st.column_config.TextColumn("Set", disabled=True),
+                            "variant": st.column_config.TextColumn("Variant", disabled=True),
+                            "card_number": st.column_config.TextColumn("Card #", disabled=True),
+                            "total_cost": st.column_config.NumberColumn("Total Cost", format="$%.2f", disabled=True),
+                            "market_value": st.column_config.NumberColumn("Market Value", format="$%.2f", disabled=True),
+                            "sticker_price": st.column_config.NumberColumn("Sticker Price", min_value=0.0, step=1.0, format="$%.2f"),
+                        },
+                    )
+
+                    priced_count = int((_coerce_money_series(edited_pricing["sticker_price"]) > 0).sum())
+                    priced_total = float(round(_coerce_money_series(edited_pricing["sticker_price"]).sum(), 2))
+                    st.caption(f"Current pricing: {priced_count:,} item(s) with a sticker price, {_money_display(priced_total)} total sticker value.")
+
+                    st.markdown("---")
+                    sync_pricing_clicked = st.button("Sync Sticker Prices", type="primary", use_container_width=True)
+
+                    if sync_pricing_clicked:
+                        synced_count, warnings = sync_show_pricing(pricing_show, edited_pricing, inv_df)
+                        if synced_count > 0:
+                            st.success(f"Saved sticker pricing for {synced_count:,} row(s) to the show snapshot.")
+                            if upload_key in st.session_state:
+                                del st.session_state[upload_key]
+                            st.session_state.pop(editor_key, None)
+                            _read_sheet_values_cached.clear()
+                            if warnings:
+                                st.warning("Some rows were skipped:\n- " + "\n- ".join(warnings))
+                            st.rerun()
+                        else:
+                            st.error("No sticker prices were synced.")
+                            if warnings:
+                                st.warning("Details:\n- " + "\n- ".join(warnings))
+
 
 
 # =========================================================
@@ -2303,32 +2341,31 @@ with tab_sales:
                     use_container_width=True,
                 )
             with c2:
-                uploaded_file = st.file_uploader(
-                    "Re-upload completed Excel/CSV",
-                    type=["xlsx", "csv"],
-                    key=f"sales_upload_{show_id}",
-                )
+                with st.form(f"sales_upload_form_{show_id}", clear_on_submit=False):
+                    uploaded_file = st.file_uploader(
+                        "Re-upload completed Excel/CSV",
+                        type=["xlsx", "csv"],
+                        key=f"sales_upload_{show_id}",
+                    )
+                    load_sales_file = st.form_submit_button("Load Uploaded Sales File", use_container_width=True)
 
-            if uploaded_file is not None:
-                try:
-                    uploaded_sales = _read_sales_upload(uploaded_file)
-                    if uploaded_sales.empty:
-                        st.warning("Upload did not contain any sale rows.")
-                    else:
-                        price_map = {
-                            str(r["inventory_id"]).strip(): float(r["sell_price"] or 0.0)
-                            for _, r in uploaded_sales.iterrows()
-                        }
-                        st.session_state[upload_key] = price_map
-                        # Force the editor to rebuild from the uploaded sell prices.
-                        st.session_state.pop(editor_key, None)
-                        st.success(f"Loaded {len(price_map):,} sell price row(s) from upload. Review below, then Sync Sales.")
-                        st.rerun()
-                except Exception as exc:
-                    st.error(str(exc))
+                if load_sales_file:
+                    try:
+                        uploaded_sales = _read_sales_upload(uploaded_file)
+                        if uploaded_sales.empty:
+                            st.warning("Upload did not contain any sale rows.")
+                        else:
+                            price_map = {
+                                str(r["inventory_id"]).strip(): float(r["sell_price"] or 0.0)
+                                for _, r in uploaded_sales.iterrows()
+                            }
+                            st.session_state[upload_key] = price_map
+                            st.success(f"Loaded {len(price_map):,} sell price row(s) from upload. Review below, then Sync Sales.")
+                    except Exception as exc:
+                        st.error(str(exc))
 
             st.markdown("---")
-            st.caption("Enter sell prices for items sold at the show. Rows with blank/$0 sell_price will not sync.")
+            st.caption("Enter sell prices for items sold at the show. Attaching a file alone will not auto-refresh; click Load Uploaded Sales File first. Rows with blank/$0 sell_price will not sync.")
 
             edited_sales = st.data_editor(
                 sales_base,
