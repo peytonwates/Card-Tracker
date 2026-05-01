@@ -11,14 +11,16 @@
 #
 # 2) Manage Shows
 #    - Create shows with date/location/description
-#    - When a show is created, snapshot current Show Inventory
-#      into show_inventory_snapshots and store snapshot totals
-#      on the shows sheet.
+#    - Shows are created without a one-time frozen snapshot
+#    - For shows that are today or in the future, the snapshot auto-syncs
+#      to current Show Inventory so prep stays current
+#    - After the show date passes, the snapshot stops auto-updating so the
+#      historical show inventory remains frozen as-of that show.
 #
 # 3) Pricing for the Show
 #    - Finds the next upcoming show
-#    - Exports that show inventory with a sticker_price column
-#    - Re-upload syncs sticker prices back to the show snapshot
+#    - Exports current live Show Inventory with a sticker_price column
+#    - Re-upload syncs sticker prices back to the show snapshot (upserting missing rows)
 #
 # 4) Show Sales Sync
 #    - Finds the next upcoming show
@@ -59,6 +61,8 @@ STATUS_SOLD = "SOLD"
 TX_STATUS_SOLD = "SOLD"
 
 SHOW_STATUS_OPTIONS = ["Planned", "Completed", "Cancelled"]
+
+SHOW_READY_STATUSES = {STATUS_ACTIVE, STATUS_LISTED}
 
 # Inventory columns used by this page. These match your Inventory page schema.
 INV_COLUMNS = [
@@ -764,6 +768,13 @@ def _row_from_sheet_values(values: list[list[str]], rownum: int) -> dict:
 
 
 def get_active_show_inventory(inv_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Current live show inventory used for show prep, pricing, and summary.
+
+    For the day-before-show workflow, anything currently marked Inventory Type =
+    Show Inventory and not already sold/traded should be available. That means we
+    intentionally include both ACTIVE and LISTED rows here.
+    """
     if inv_df.empty:
         return inv_df.copy()
 
@@ -772,14 +783,61 @@ def get_active_show_inventory(inv_df: pd.DataFrame) -> pd.DataFrame:
     df["inventory_type_norm"] = df["inventory_type"].apply(_normalize_inventory_type)
 
     df = df[
-        (df["inventory_status_norm"] == STATUS_ACTIVE)
-        & (df["inventory_type_norm"] == "showinventory")
+        (df["inventory_type_norm"] == "showinventory")
+        & (df["inventory_status_norm"].isin(SHOW_READY_STATUSES))
     ].copy()
 
     df["total_cost"] = _coerce_money_series(df["total_cost"])
     df["market_value_resolved"] = _coerce_money_series(df.get("market_value_resolved", df.get("market_value", 0.0)))
 
     return df
+
+
+def _build_single_snapshot_row(show_row: dict, inv: dict | pd.Series, *, sticker_price: float = 0.0) -> dict:
+    now_iso = _utc_now_iso()
+    market_value = _money_float(
+        inv.get("market_value_resolved", inv.get("market_value", inv.get("market_price", 0.0)))
+    )
+
+    return {
+        "snapshot_id": str(uuid.uuid4()),
+        "show_id": show_row["show_id"],
+        "show_name": show_row["show_name"],
+        "show_date": show_row["show_date"],
+        "snapshot_created_at": now_iso,
+        "inventory_id": str(inv.get("inventory_id", "")).strip(),
+        "product_type": _clean_text(inv.get("product_type")),
+        "sealed_product_type": _clean_text(inv.get("sealed_product_type")),
+        "card_type": _clean_text(inv.get("card_type")),
+        "inventory_type": _clean_text(inv.get("inventory_type")),
+        "brand_or_league": _clean_text(inv.get("brand_or_league")),
+        "set_name": _clean_text(inv.get("set_name")),
+        "year": _clean_text(inv.get("year")),
+        "card_name": _clean_text(inv.get("card_name")),
+        "card_number": _clean_text(inv.get("card_number")),
+        "variant": _clean_text(inv.get("variant")),
+        "card_subtype": _clean_text(inv.get("card_subtype")),
+        "grading_company": _clean_text(inv.get("grading_company")),
+        "grade": _clean_text(inv.get("grade")),
+        "reference_link": _clean_text(inv.get("reference_link")),
+        "image_url": _clean_text(inv.get("image_url")),
+        "purchase_date": _clean_text(inv.get("purchase_date")),
+        "purchased_from": _clean_text(inv.get("purchased_from")),
+        "purchase_price": _money_float(inv.get("purchase_price")),
+        "shipping": _money_float(inv.get("shipping")),
+        "tax": _money_float(inv.get("tax")),
+        "total_price": _money_float(inv.get("total_price")),
+        "grading_fee": _money_float(inv.get("grading_fee")),
+        "total_cost": _money_float(inv.get("total_cost")),
+        "market_price": _money_float(inv.get("market_price")),
+        "market_value": market_value,
+        "sticker_price": float(round(_money_float(sticker_price), 2)),
+        "condition": _clean_text(inv.get("condition")),
+        "inventory_status_at_snapshot": _clean_text(inv.get("inventory_status")),
+        "sold_price": 0.0,
+        "synced_at": "",
+        "synced_transaction_id": "",
+    }
 
 
 def _snapshot_totals(show_inv_df: pd.DataFrame) -> tuple[int, float, float]:
@@ -791,52 +849,216 @@ def _snapshot_totals(show_inv_df: pd.DataFrame) -> tuple[int, float, float]:
     return item_count, total_cost, total_market
 
 
+def _snapshot_totals_from_snapshot_df(snapshot_df: pd.DataFrame) -> tuple[int, float, float]:
+    if snapshot_df is None or snapshot_df.empty:
+        return 0, 0.0, 0.0
+    item_count = int(len(snapshot_df))
+    total_cost = float(round(_coerce_money_series(snapshot_df.get("total_cost", pd.Series(0.0, index=snapshot_df.index))).sum(), 2))
+    total_market = float(round(_coerce_money_series(snapshot_df.get("market_value", pd.Series(0.0, index=snapshot_df.index))).sum(), 2))
+    return item_count, total_cost, total_market
+
+
+def _show_date_timestamp(show: pd.Series | dict | None) -> pd.Timestamp | None:
+    if show is None:
+        return None
+    dt = pd.to_datetime(show.get("show_date"), errors="coerce")
+    if pd.isna(dt):
+        return None
+    return pd.Timestamp(dt.date())
+
+
+def _show_is_live_sync_eligible(show: pd.Series | dict | None) -> bool:
+    if show is None:
+        return False
+    status = _clean_text(show.get("status")).lower()
+    if status in {"completed", "cancelled", "canceled"}:
+        return False
+    show_ts = _show_date_timestamp(show)
+    if show_ts is None:
+        return False
+    return show_ts >= pd.Timestamp(date.today())
+
+
+def _snapshot_rows_equal(a: dict, b: dict) -> bool:
+    compare_cols = [
+        c for c in SNAPSHOT_COLUMNS
+        if c not in {"snapshot_id", "snapshot_created_at", "sold_price", "synced_at", "synced_transaction_id"}
+    ]
+    for col in compare_cols:
+        av = a.get(col, "")
+        bv = b.get(col, "")
+        if col in NUMERIC_SNAPSHOT or col == "sticker_price":
+            if round(_money_float(av), 2) != round(_money_float(bv), 2):
+                return False
+        else:
+            if _clean_text(av) != _clean_text(bv):
+                return False
+    return True
+
+
+def _delete_rows_by_rownums(worksheet_name: str, internal_headers: list[str], rownums: list[int]) -> int:
+    if not rownums:
+        return 0
+    spreadsheet_id = st.secrets["spreadsheet_id"]
+    ws = _get_or_create_ws(spreadsheet_id, worksheet_name, internal_headers)
+    _ensure_headers(ws, internal_headers)
+    deleted = 0
+    for rownum in sorted(set(int(r) for r in rownums if r and int(r) >= 2), reverse=True):
+        _with_backoff(lambda rn=rownum: ws.delete_rows(rn))
+        deleted += 1
+    if deleted:
+        _read_sheet_values_cached.clear()
+    return deleted
+
+
+def sync_single_show_snapshot_to_live_inventory(show: pd.Series, snapshots_df: pd.DataFrame, inv_df: pd.DataFrame) -> bool:
+    """
+    For shows that are today or in the future, keep snapshot rows aligned to the
+    current live Show Inventory. Once the show date passes, we stop auto-syncing
+    so the historical snapshot remains frozen.
+
+    Sold rows synced through Show Sales Sync are preserved even when the current
+    inventory row is no longer live, so show history/results remain intact.
+    """
+    if not _show_is_live_sync_eligible(show):
+        return False
+
+    show_id = _clean_text(show.get("show_id"))
+    if not show_id:
+        return False
+
+    show_row = {
+        "show_id": show_id,
+        "show_name": _clean_text(show.get("show_name")),
+        "show_date": _date_str(show.get("show_date")),
+    }
+
+    live_show_inv = get_active_show_inventory(inv_df).copy()
+    if "inventory_id" not in live_show_inv.columns:
+        live_show_inv = pd.DataFrame(columns=INV_COLUMNS)
+    live_show_inv["inventory_id"] = live_show_inv["inventory_id"].astype(str).str.strip()
+    live_map = {str(r["inventory_id"]): r.to_dict() for _, r in live_show_inv.iterrows() if _clean_text(r.get("inventory_id"))}
+
+    spreadsheet_id = st.secrets["spreadsheet_id"]
+    snap_ws_name = st.secrets.get("show_snapshots_worksheet", SHOW_SNAPSHOTS_WS_DEFAULT)
+    snap_ws = _get_or_create_ws(spreadsheet_id, snap_ws_name, SNAPSHOT_COLUMNS)
+    _ensure_headers(snap_ws, SNAPSHOT_COLUMNS)
+    snap_values = _with_backoff(lambda: snap_ws.get_all_values())
+    snap_df, _ = _sheet_to_df(snap_values, SNAPSHOT_COLUMNS) if snap_values else (pd.DataFrame(columns=SNAPSHOT_COLUMNS), [])
+
+    show_snaps = snap_df[snap_df["show_id"].astype(str).str.strip() == show_id].copy()
+    if "inventory_id" not in show_snaps.columns:
+        show_snaps["inventory_id"] = ""
+    show_snaps["inventory_id"] = show_snaps["inventory_id"].astype(str).str.strip()
+
+    row_lookup = {}
+    for idx, snap_row in show_snaps.iterrows():
+        inv_id = _clean_text(snap_row.get("inventory_id"))
+        if inv_id:
+            row_lookup[inv_id] = idx + 2
+
+    existing_by_id = {}
+    preserved_sold_ids = set()
+    for _, snap_row in show_snaps.iterrows():
+        inv_id = _clean_text(snap_row.get("inventory_id"))
+        if not inv_id:
+            continue
+        rec = snap_row.to_dict()
+        existing_by_id[inv_id] = rec
+        if _money_float(rec.get("sold_price")) > 0 or _clean_text(rec.get("synced_transaction_id")):
+            preserved_sold_ids.add(inv_id)
+
+    updates = []
+    append_rows = []
+    delete_rownums = []
+
+    for inv_id, live_inv in live_map.items():
+        existing = existing_by_id.get(inv_id)
+        sticker_price = _money_float(existing.get("sticker_price")) if existing else 0.0
+        candidate = _build_single_snapshot_row(show_row, live_inv, sticker_price=sticker_price)
+
+        if existing:
+            candidate["snapshot_id"] = _clean_text(existing.get("snapshot_id")) or candidate["snapshot_id"]
+            candidate["snapshot_created_at"] = _clean_text(existing.get("snapshot_created_at")) or candidate["snapshot_created_at"]
+            candidate["sold_price"] = _money_float(existing.get("sold_price"))
+            candidate["synced_at"] = _clean_text(existing.get("synced_at"))
+            candidate["synced_transaction_id"] = _clean_text(existing.get("synced_transaction_id"))
+            if not _snapshot_rows_equal(existing, candidate):
+                updates.append((row_lookup[inv_id], candidate))
+        else:
+            append_rows.append(candidate)
+
+    current_live_ids = set(live_map.keys())
+    for inv_id in existing_by_id.keys():
+        if inv_id in current_live_ids or inv_id in preserved_sold_ids:
+            continue
+        rownum = row_lookup.get(inv_id)
+        if rownum:
+            delete_rownums.append(rownum)
+
+    changed = False
+    if updates:
+        _batch_update_full_rows(snap_ws_name, SNAPSHOT_COLUMNS, updates)
+        changed = True
+    if append_rows:
+        _append_rows(snap_ws_name, SNAPSHOT_COLUMNS, append_rows)
+        changed = True
+    if delete_rownums:
+        _delete_rows_by_rownums(snap_ws_name, SNAPSHOT_COLUMNS, delete_rownums)
+        changed = True
+
+    current_snapshot_df = show_snaps.copy()
+    if changed:
+        _read_sheet_values_cached.clear()
+        refreshed_snapshots = load_snapshots_df()
+        current_snapshot_df = refreshed_snapshots[refreshed_snapshots["show_id"].astype(str).str.strip() == show_id].copy()
+
+    item_count, total_cost, total_market = _snapshot_totals_from_snapshot_df(current_snapshot_df)
+    existing_item_count = int(_money_float(show.get("snapshot_item_count")))
+    existing_total_cost = round(_money_float(show.get("snapshot_total_cost")), 2)
+    existing_total_market = round(_money_float(show.get("snapshot_total_market_value")), 2)
+
+    if changed or existing_item_count != item_count or existing_total_cost != round(total_cost, 2) or existing_total_market != round(total_market, 2):
+        show_ws_name = st.secrets.get("shows_worksheet", SHOWS_WS_DEFAULT)
+        show_ws = _get_or_create_ws(spreadsheet_id, show_ws_name, SHOW_COLUMNS)
+        _ensure_headers(show_ws, SHOW_COLUMNS)
+        show_values = _with_backoff(lambda: show_ws.get_all_values())
+        rownums = _find_rownums_by_id(show_values, "show_id", [show_id])
+        rownum = rownums.get(show_id)
+        if rownum:
+            show_rec = _row_from_sheet_values(show_values, rownum)
+            show_rec["snapshot_item_count"] = item_count
+            show_rec["snapshot_total_cost"] = total_cost
+            show_rec["snapshot_total_market_value"] = total_market
+            show_rec["updated_at"] = _utc_now_iso()
+            if not _clean_text(show_rec.get("snapshot_created_at")):
+                show_rec["snapshot_created_at"] = _utc_now_iso()
+            _batch_update_full_rows(show_ws_name, SHOW_COLUMNS, [(rownum, show_rec)])
+            changed = True
+
+    return changed
+
+
+def auto_sync_live_show_snapshots(shows_df: pd.DataFrame, snapshots_df: pd.DataFrame, inv_df: pd.DataFrame) -> bool:
+    if shows_df.empty:
+        return False
+    changed_any = False
+    working_snapshots = snapshots_df.copy()
+    for _, show in shows_df.iterrows():
+        if not _show_is_live_sync_eligible(show):
+            continue
+        changed = sync_single_show_snapshot_to_live_inventory(show, working_snapshots, inv_df)
+        if changed:
+            changed_any = True
+            _read_sheet_values_cached.clear()
+            working_snapshots = load_snapshots_df()
+    return changed_any
+
+
 def build_snapshot_rows(show_row: dict, show_inv_df: pd.DataFrame) -> list[dict]:
-    now_iso = _utc_now_iso()
     rows = []
-
     for _, inv in show_inv_df.iterrows():
-        market_value = _money_float(inv.get("market_value_resolved", inv.get("market_value", inv.get("market_price", 0.0))))
-        rows.append({
-            "snapshot_id": str(uuid.uuid4()),
-            "show_id": show_row["show_id"],
-            "show_name": show_row["show_name"],
-            "show_date": show_row["show_date"],
-            "snapshot_created_at": now_iso,
-            "inventory_id": str(inv.get("inventory_id", "")).strip(),
-            "product_type": _clean_text(inv.get("product_type")),
-            "sealed_product_type": _clean_text(inv.get("sealed_product_type")),
-            "card_type": _clean_text(inv.get("card_type")),
-            "inventory_type": _clean_text(inv.get("inventory_type")),
-            "brand_or_league": _clean_text(inv.get("brand_or_league")),
-            "set_name": _clean_text(inv.get("set_name")),
-            "year": _clean_text(inv.get("year")),
-            "card_name": _clean_text(inv.get("card_name")),
-            "card_number": _clean_text(inv.get("card_number")),
-            "variant": _clean_text(inv.get("variant")),
-            "card_subtype": _clean_text(inv.get("card_subtype")),
-            "grading_company": _clean_text(inv.get("grading_company")),
-            "grade": _clean_text(inv.get("grade")),
-            "reference_link": _clean_text(inv.get("reference_link")),
-            "image_url": _clean_text(inv.get("image_url")),
-            "purchase_date": _clean_text(inv.get("purchase_date")),
-            "purchased_from": _clean_text(inv.get("purchased_from")),
-            "purchase_price": _money_float(inv.get("purchase_price")),
-            "shipping": _money_float(inv.get("shipping")),
-            "tax": _money_float(inv.get("tax")),
-            "total_price": _money_float(inv.get("total_price")),
-            "grading_fee": _money_float(inv.get("grading_fee")),
-            "total_cost": _money_float(inv.get("total_cost")),
-            "market_price": _money_float(inv.get("market_price")),
-            "market_value": market_value,
-            "sticker_price": 0.0,
-            "condition": _clean_text(inv.get("condition")),
-            "inventory_status_at_snapshot": _clean_text(inv.get("inventory_status")),
-            "sold_price": 0.0,
-            "synced_at": "",
-            "synced_transaction_id": "",
-        })
-
+        rows.append(_build_single_snapshot_row(show_row, inv, sticker_price=0.0))
     return rows
 
 
@@ -964,10 +1186,15 @@ def _build_sales_editor_df(show: pd.Series, snapshots_df: pd.DataFrame, inv_df: 
 
 
 def _build_pricing_editor_df(show: pd.Series, snapshots_df: pd.DataFrame, inv_df: pd.DataFrame) -> pd.DataFrame:
-    show_id = str(show.get("show_id", "")).strip()
-    show_snaps = snapshots_df[snapshots_df["show_id"].astype(str).str.strip() == show_id].copy()
+    """
+    Build the pricing export from LIVE inventory, not the frozen snapshot.
 
-    if show_snaps.empty:
+    User expectation for show prep is: if the card is in inventory today and its
+    Inventory Type is Show Inventory, it should appear in the downloadable pricing
+    file. We still pull any already-saved sticker prices from this show's snapshot.
+    """
+    live_show_inv = get_active_show_inventory(inv_df).copy()
+    if live_show_inv.empty:
         return pd.DataFrame(columns=[
             "inventory_id",
             "card_name",
@@ -979,12 +1206,21 @@ def _build_pricing_editor_df(show: pd.Series, snapshots_df: pd.DataFrame, inv_df
             "sticker_price",
         ])
 
-    # Pricing should use the show's saved snapshot, not a re-filtered current inventory
-    # view. Otherwise cards can disappear from the export when their current status/type
-    # changes after the show snapshot was created.
-    base = show_snaps.copy()
-    base["inventory_id"] = base["inventory_id"].astype(str).str.strip()
-    base["sticker_price"] = _coerce_money_series(base.get("sticker_price", pd.Series(0.0, index=base.index)))
+    live_show_inv["inventory_id"] = live_show_inv["inventory_id"].astype(str).str.strip()
+
+    out = live_show_inv.copy()
+    out["market_value"] = _coerce_money_series(out.get("market_value_resolved", out.get("market_value", 0.0)))
+    out["sticker_price"] = 0.0
+
+    show_id = str(show.get("show_id", "")).strip()
+    if show_id and not snapshots_df.empty:
+        show_snaps = snapshots_df[snapshots_df["show_id"].astype(str).str.strip() == show_id].copy()
+        if not show_snaps.empty:
+            show_snaps["inventory_id"] = show_snaps["inventory_id"].astype(str).str.strip()
+            show_snaps["sticker_price"] = _coerce_money_series(show_snaps.get("sticker_price", pd.Series(0.0, index=show_snaps.index)))
+            show_snaps = show_snaps.drop_duplicates(subset=["inventory_id"], keep="last")
+            sticker_map = dict(zip(show_snaps["inventory_id"], show_snaps["sticker_price"]))
+            out["sticker_price"] = out["inventory_id"].map(sticker_map).fillna(0.0)
 
     out_cols = [
         "inventory_id",
@@ -997,10 +1233,10 @@ def _build_pricing_editor_df(show: pd.Series, snapshots_df: pd.DataFrame, inv_df
         "sticker_price",
     ]
     for c in out_cols:
-        if c not in base.columns:
-            base[c] = "" if c not in ["total_cost", "market_value", "sticker_price"] else 0.0
+        if c not in out.columns:
+            out[c] = "" if c not in ["total_cost", "market_value", "sticker_price"] else 0.0
 
-    out = base[out_cols].copy()
+    out = out[out_cols].copy()
     for c in ["total_cost", "market_value", "sticker_price"]:
         out[c] = _coerce_money_series(out[c])
 
@@ -1087,7 +1323,7 @@ def _read_pricing_upload(uploaded_file) -> pd.DataFrame:
 
 
 def build_show_sticker_price_lookup(show: pd.Series | None, snapshots_df: pd.DataFrame, inv_df: pd.DataFrame) -> dict[str, float]:
-    if show is None or snapshots_df.empty or inv_df.empty:
+    if show is None or snapshots_df.empty:
         return {}
 
     show_id = _clean_text(show.get("show_id"))
@@ -1098,12 +1334,7 @@ def build_show_sticker_price_lookup(show: pd.Series | None, snapshots_df: pd.Dat
     if snaps.empty:
         return {}
 
-    active_show_ids = set(get_active_show_inventory(inv_df)["inventory_id"].astype(str).str.strip().tolist())
     snaps["inventory_id"] = snaps["inventory_id"].astype(str).str.strip()
-    snaps = snaps[snaps["inventory_id"].isin(active_show_ids)].copy()
-    if snaps.empty:
-        return {}
-
     snaps["sticker_price"] = _coerce_money_series(snaps.get("sticker_price", pd.Series(0.0, index=snaps.index)))
     snaps = snaps.drop_duplicates(subset=["inventory_id"], keep="last")
 
@@ -1124,16 +1355,19 @@ def sync_show_pricing(show: pd.Series, edited_pricing_df: pd.DataFrame, inv_df: 
 
     pricing = pricing.drop_duplicates(subset=["inventory_id"], keep="last")
 
+    live_show_inv = get_active_show_inventory(inv_df).copy()
+    if live_show_inv.empty:
+        return 0, ["No current Show Inventory rows are available to price."]
+    live_show_inv["inventory_id"] = live_show_inv["inventory_id"].astype(str).str.strip()
+    live_map = {str(r["inventory_id"]): r.to_dict() for _, r in live_show_inv.iterrows()}
+
     spreadsheet_id = st.secrets["spreadsheet_id"]
     snap_ws_name = st.secrets.get("show_snapshots_worksheet", SHOW_SNAPSHOTS_WS_DEFAULT)
     snap_ws = _get_or_create_ws(spreadsheet_id, snap_ws_name, SNAPSHOT_COLUMNS)
     _ensure_headers(snap_ws, SNAPSHOT_COLUMNS)
     snap_values = _with_backoff(lambda: snap_ws.get_all_values())
 
-    if not snap_values or len(snap_values) <= 1:
-        return 0, ["No show snapshot rows exist yet. Create or refresh the show snapshot first."]
-
-    snap_df, _ = _sheet_to_df(snap_values, SNAPSHOT_COLUMNS)
+    snap_df, _ = _sheet_to_df(snap_values, SNAPSHOT_COLUMNS) if snap_values else (pd.DataFrame(columns=SNAPSHOT_COLUMNS), [])
     snap_row_lookup = {}
     show_id = _clean_text(show.get("show_id"))
     for idx, snap_row in snap_df.iterrows():
@@ -1141,28 +1375,47 @@ def sync_show_pricing(show: pd.Series, edited_pricing_df: pd.DataFrame, inv_df: 
         if key[0] and key[1]:
             snap_row_lookup[key] = idx + 2
 
+    show_row = {
+        "show_id": _clean_text(show.get("show_id")),
+        "show_name": _clean_text(show.get("show_name")),
+        "show_date": _date_str(show.get("show_date")),
+    }
+
     updates = []
+    append_rows = []
     warnings = []
 
     for _, price_row in pricing.iterrows():
         inv_id = _clean_text(price_row.get("inventory_id"))
         sticker_price = float(round(_money_float(price_row.get("sticker_price")), 2))
 
-        snap_rownum = snap_row_lookup.get((show_id, inv_id))
-        if not snap_rownum:
-            warnings.append(f"Skipped {inv_id}: no snapshot row found for this show. Refresh the show snapshot first.")
+        live_inv = live_map.get(inv_id)
+        if live_inv is None:
+            warnings.append(f"Skipped {inv_id}: item is not currently in live Show Inventory.")
             continue
 
-        snap_rec = _row_from_sheet_values(snap_values, snap_rownum)
-        snap_rec["sticker_price"] = sticker_price
-        updates.append((snap_rownum, snap_rec))
+        snap_rownum = snap_row_lookup.get((show_id, inv_id))
+        if snap_rownum:
+            snap_rec = _row_from_sheet_values(snap_values, snap_rownum)
+            snap_rec["sticker_price"] = sticker_price
+            # keep snapshot details fresh for cards added after show creation or changed later
+            for k, v in _build_single_snapshot_row(show_row, live_inv, sticker_price=sticker_price).items():
+                if k in SNAPSHOT_COLUMNS:
+                    snap_rec[k] = v
+            updates.append((snap_rownum, snap_rec))
+        else:
+            append_rows.append(_build_single_snapshot_row(show_row, live_inv, sticker_price=sticker_price))
 
-    if not updates:
+    if not updates and not append_rows:
         return 0, warnings or ["No sticker price rows were synced."]
 
-    _batch_update_full_rows(snap_ws_name, SNAPSHOT_COLUMNS, updates)
+    if updates:
+        _batch_update_full_rows(snap_ws_name, SNAPSHOT_COLUMNS, updates)
+    if append_rows:
+        _append_rows(snap_ws_name, SNAPSHOT_COLUMNS, append_rows)
+
     _read_sheet_values_cached.clear()
-    return len(updates), warnings
+    return len(updates) + len(append_rows), warnings
 
 
 def _build_sales_template_bytes(sales_df: pd.DataFrame) -> tuple[bytes, str, str]:
@@ -1883,6 +2136,17 @@ inv_df = load_inventory_df()
 tx_df = load_transactions_df()
 shows_df = load_shows_df()
 snapshots_df = load_snapshots_df()
+
+# Keep snapshots for today/future shows in sync with live Show Inventory.
+# Once a show date passes, its snapshot is left untouched so the historical
+# view stays as-of that show.
+if auto_sync_live_show_snapshots(shows_df, snapshots_df, inv_df):
+    _read_sheet_values_cached.clear()
+    inv_df = load_inventory_df()
+    tx_df = load_transactions_df()
+    shows_df = load_shows_df()
+    snapshots_df = load_snapshots_df()
+
 show_inv_df = get_active_show_inventory(inv_df)
 
 
@@ -1908,7 +2172,7 @@ with tab_summary:
         st.caption("ACTIVE items where Inventory Type = Show Inventory. Sticker columns populate once a show exists and pricing is synced.")
     else:
         st.caption(
-            f"ACTIVE items where Inventory Type = Show Inventory. Sticker columns are pulled from the selected show snapshot: "
+            f"ACTIVE items where Inventory Type = Show Inventory. Sticker columns are pulled from the selected show's snapshot/history: "
             f"{_clean_text(summary_pricing_show.get('show_name'))} ({_date_str(summary_pricing_show.get('show_date'))})."
         )
 
@@ -1922,7 +2186,7 @@ with tab_summary:
     st.markdown("---")
 
     if show_inv_df.empty:
-        st.info("No ACTIVE Show Inventory found. Set items to Inventory Type = Show Inventory in the Inventory page.")
+        st.info("No current Show Inventory found. Set items to Inventory Type = Show Inventory in the Inventory page.")
     else:
         sticker_price_lookup = build_show_sticker_price_lookup(summary_pricing_show, snapshots_df, inv_df)
 
@@ -1998,7 +2262,7 @@ with tab_summary:
 # =========================================================
 with tab_manage:
     st.subheader("Create / Manage Shows")
-    st.caption("Creating a show saves a snapshot of the ACTIVE Show Inventory totals and item-level inventory at that moment.")
+    st.caption("Create the show once. Its snapshot will auto-sync to current Show Inventory while the show is today or in the future, then freeze after the show date passes.")
 
     with st.form("create_show_form", clear_on_submit=True):
         c1, c2, c3 = st.columns([1.5, 1.0, 1.4])
@@ -2010,35 +2274,31 @@ with tab_manage:
             location = st.text_input("Location", placeholder="City / venue")
 
         description = st.text_area("Description / notes", placeholder="Table number, promoter, setup notes, etc.")
-        submitted = st.form_submit_button("Create Show + Snapshot Current Show Inventory", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("Create Show", type="primary", use_container_width=True)
 
     if submitted:
         if not show_name.strip():
             st.error("Show name is required.")
         else:
-            item_count, total_cost, total_market = _snapshot_totals(show_inv_df)
             now_iso = _utc_now_iso()
-            show_id = str(uuid.uuid4())[:8]
             show_row = {
-                "show_id": show_id,
+                "show_id": str(uuid.uuid4())[:8],
                 "show_name": show_name.strip(),
                 "show_date": str(show_date),
                 "location": location.strip(),
                 "description": description.strip(),
                 "status": "Planned",
-                "snapshot_item_count": item_count,
-                "snapshot_total_cost": total_cost,
-                "snapshot_total_market_value": total_market,
-                "snapshot_created_at": now_iso,
+                "snapshot_item_count": 0,
+                "snapshot_total_cost": 0.0,
+                "snapshot_total_market_value": 0.0,
+                "snapshot_created_at": "",
                 "created_at": now_iso,
                 "updated_at": now_iso,
             }
 
-            snap_rows = build_snapshot_rows(show_row, show_inv_df)
             _append_rows(st.secrets.get("shows_worksheet", SHOWS_WS_DEFAULT), SHOW_COLUMNS, [show_row])
-            _append_rows(st.secrets.get("show_snapshots_worksheet", SHOW_SNAPSHOTS_WS_DEFAULT), SNAPSHOT_COLUMNS, snap_rows)
 
-            st.success(f"Created {show_name.strip()} and snapshotted {item_count:,} Show Inventory item(s).")
+            st.success(f"Created {show_name.strip()}. Its show snapshot will auto-sync from current Show Inventory until the show date passes.")
             st.rerun()
 
     st.markdown("---")
@@ -2061,7 +2321,7 @@ with tab_manage:
 
         st.markdown("---")
         st.markdown("### Update an existing show")
-        st.caption("Use this if you add/remove show inventory after creating a show and want the saved snapshot refreshed.")
+        st.caption("Future/today show snapshots auto-sync from current Show Inventory. Use the button below only if you want to force a sync immediately.")
 
         labels = []
         for _, r in show_display.iterrows():
@@ -2080,8 +2340,8 @@ with tab_manage:
             )
             update_status = st.button("Update Show Status", use_container_width=True)
         with c2:
-            replace_snapshot = st.button("Replace Snapshot with Current Show Inventory", type="secondary", use_container_width=True)
-            st.caption("This deletes the old snapshot rows for this show and saves today’s ACTIVE Show Inventory.")
+            replace_snapshot = st.button("Force Sync Snapshot to Current Show Inventory", type="secondary", use_container_width=True)
+            st.caption("For shows today or in the future, this makes the snapshot match current live Show Inventory right now while preserving rows already sold through Show Sales Sync.")
 
         if update_status:
             show_ws_name = st.secrets.get("shows_worksheet", SHOWS_WS_DEFAULT)
@@ -2102,45 +2362,18 @@ with tab_manage:
                 st.rerun()
 
         if replace_snapshot:
-            deleted = _delete_rows_by_filter(
-                st.secrets.get("show_snapshots_worksheet", SHOW_SNAPSHOTS_WS_DEFAULT),
-                SNAPSHOT_COLUMNS,
-                lambda r: _clean_text(r.get("show_id")) == selected_show_id,
-            )
-
-            item_count, total_cost, total_market = _snapshot_totals(show_inv_df)
-            now_iso = _utc_now_iso()
-            refreshed_show_row = selected_show.to_dict()
-            refreshed_show_row["snapshot_item_count"] = item_count
-            refreshed_show_row["snapshot_total_cost"] = total_cost
-            refreshed_show_row["snapshot_total_market_value"] = total_market
-            refreshed_show_row["snapshot_created_at"] = now_iso
-            refreshed_show_row["updated_at"] = now_iso
-
-            snap_rows = build_snapshot_rows(refreshed_show_row, show_inv_df)
-            _append_rows(st.secrets.get("show_snapshots_worksheet", SHOW_SNAPSHOTS_WS_DEFAULT), SNAPSHOT_COLUMNS, snap_rows)
-
-            # Update show totals.
-            show_ws_name = st.secrets.get("shows_worksheet", SHOWS_WS_DEFAULT)
-            spreadsheet_id = st.secrets["spreadsheet_id"]
-            show_ws = _get_or_create_ws(spreadsheet_id, show_ws_name, SHOW_COLUMNS)
-            _ensure_headers(show_ws, SHOW_COLUMNS)
-            values = _with_backoff(lambda: show_ws.get_all_values())
-            rownums = _find_rownums_by_id(values, "show_id", [selected_show_id])
-            rownum = rownums.get(selected_show_id)
-            if rownum:
-                show_rec = _row_from_sheet_values(values, rownum)
-                show_rec.update({
-                    "snapshot_item_count": item_count,
-                    "snapshot_total_cost": total_cost,
-                    "snapshot_total_market_value": total_market,
-                    "snapshot_created_at": now_iso,
-                    "updated_at": now_iso,
-                })
-                _batch_update_full_rows(show_ws_name, SHOW_COLUMNS, [(rownum, show_rec)])
-
-            st.success(f"Snapshot replaced. Deleted {deleted:,} old row(s), saved {item_count:,} current item(s).")
-            st.rerun()
+            target_show = _get_show_by_id(shows_df, selected_show_id)
+            if target_show is None:
+                st.error("Could not find the selected show.")
+            elif not _show_is_live_sync_eligible(target_show):
+                st.warning("This show is in the past or completed/cancelled, so its snapshot is intentionally frozen and will not be force-synced.")
+            else:
+                changed = sync_single_show_snapshot_to_live_inventory(target_show, snapshots_df, inv_df)
+                if changed:
+                    st.success("Snapshot synced to current live Show Inventory.")
+                else:
+                    st.success("Snapshot was already current.")
+                st.rerun()
 
 
 
@@ -2186,13 +2419,13 @@ with tab_pricing:
                 st.subheader(f"Pricing for {show_name}")
                 st.caption(
                     f"Show date: {show_date_text or 'No date'} | Show ID: {show_id}. "
-                    "Sticker prices save to this show's snapshot so pricing stays show-specific."
+                    "The downloadable pricing list comes from your live inventory today. Sticker prices still save to this show's snapshot so pricing stays show-specific."
                 )
 
                 pricing_base = _build_pricing_editor_df(pricing_show, snapshots_df, inv_df)
 
                 if pricing_base.empty:
-                    st.info("No snapshot inventory is available for this show. Create or refresh the show snapshot in Manage Shows first.")
+                    st.info("No current live Show Inventory is available for this show.")
                 else:
                     upload_key = f"uploaded_show_pricing_{show_id}"
                     editor_key = f"show_pricing_editor_{show_id}"
@@ -2317,7 +2550,7 @@ with tab_sales:
         sales_base = _build_sales_editor_df(next_show, snapshots_df, inv_df)
 
         if sales_base.empty:
-            st.info("No ACTIVE Show Inventory is available for this show. If needed, refresh the show snapshot in Manage Shows.")
+            st.info("No current Show Inventory is available for this show. If needed, the pricing list now comes from live inventory, but sales sync may still need the show created in Manage Shows.")
         else:
             upload_key = f"uploaded_sales_prices_{show_id}"
             editor_key = f"show_sales_editor_{show_id}"
