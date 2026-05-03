@@ -1090,15 +1090,13 @@ if not txn.empty:
     else:
         txn["__total_fees"] = (txn["__fees"] + txn["__ship_charged"]).fillna(0.0)
 
-    if tx_net_proceeds_col and tx_net_proceeds_col in txn.columns:
-        txn["__net"] = _to_num(txn[tx_net_proceeds_col])
-    else:
-        txn["__net"] = (txn["__dollar_sales"] - txn["__total_fees"]).fillna(0.0)
+    # Proceeds are always gross sales minus total selling fees/shipping costs.
+    # Do not trust stored net/profit fields here because older migrations wrote
+    # incorrect values for show sales.
+    txn["__net"] = (txn["__dollar_sales"] - txn["__total_fees"]).fillna(0.0)
 
-    if tx_profit_col and tx_profit_col in txn.columns:
-        txn["__profit"] = _to_num(txn[tx_profit_col])
-    else:
-        txn["__profit"] = np.nan
+    # Profit is recalculated after COGS is resolved from inventory/all-in cost.
+    txn["__profit"] = np.nan
 
     if tx_all_in_cost_col and tx_all_in_cost_col in txn.columns:
         txn["__all_in_cost"] = _to_num(txn[tx_all_in_cost_col])
@@ -1183,11 +1181,9 @@ def _build_inventory_sales_ledger(inv_df: pd.DataFrame) -> pd.DataFrame:
 
     d["__dollar_sales"] = d["__sold_price"]
 
-    if inv_net_col and inv_net_col in d.columns:
-        d["__net"] = _to_num(d[inv_net_col])
-        d["__net"] = np.where(d["__net"] != 0, d["__net"], d["__dollar_sales"] - d["__total_fees"])
-    else:
-        d["__net"] = d["__dollar_sales"] - d["__total_fees"]
+    # Proceeds are always gross sales minus fees. Ignore stored net_proceeds
+    # because prior migration versions could write bad values.
+    d["__net"] = (d["__dollar_sales"] - d["__total_fees"]).fillna(0.0)
 
     # COGS: prefer total_cost, otherwise total_price + grading lookup.
     inv_total_cost_col = _pick_col(d, "total_cost", None) or _pick_col(d, "all_in_cost", None)
@@ -1198,11 +1194,9 @@ def _build_inventory_sales_ledger(inv_df: pd.DataFrame) -> pd.DataFrame:
     else:
         d["__all_in_cost"] = _to_num(d[inv_total_col]) if inv_total_col in d.columns else 0.0
 
-    if inv_profit_col and inv_profit_col in d.columns:
-        d["__profit"] = _to_num(d[inv_profit_col])
-        d["__profit"] = np.where(d["__profit"] != 0, d["__profit"], d["__net"] - d["__all_in_cost"])
-    else:
-        d["__profit"] = d["__net"] - d["__all_in_cost"]
+    # Profit is always proceeds minus cost of goods. Do not trust stored profit
+    # fields because show-sale migrations previously wrote sold_price as profit.
+    d["__profit"] = (d["__net"] - d["__all_in_cost"]).fillna(0.0)
 
     d["__sold_month"] = _month_start(d["__sold_dt"])
     d["__txn_card_type"] = d[inv_card_type_col].apply(_normalize_card_type) if inv_card_type_col in d.columns else ""
@@ -1797,14 +1791,10 @@ with tab_bs:
             else:
                 tx["__cogs"] = tx["__inventory_id"].apply(_cogs_for_inv_id)
 
-            if "__profit" in tx.columns:
-                tx["__profit"] = np.where(
-                    pd.notna(tx["__profit"]),
-                    _to_num(tx["__profit"]),
-                    (tx["__net"] - tx["__cogs"]).fillna(0.0)
-                )
-            else:
-                tx["__profit"] = (tx["__net"] - tx["__cogs"]).fillna(0.0)
+            # Recalculate profit from first principles:
+            # Profit = Gross Sales - Total Fees - Cost of Goods.
+            tx["__net"] = (tx["__dollar_sales"] - tx["__total_fees"]).fillna(0.0)
+            tx["__profit"] = (tx["__net"] - tx["__cogs"]).fillna(0.0)
 
             sales_count_total = int(len(tx))
             gross_total = float(tx["__dollar_sales"].sum())
@@ -1874,51 +1864,75 @@ with tab_bs:
         )
         st.dataframe(sty3, use_container_width=True, hide_index=True)
 
-        st.markdown("### Busienss  Summary")
+        st.markdown("### Business Summary")
 
-        if not inv_f.empty:
-            tmp_inv = inv_f.copy()
-            tmp_inv["__inv_id_key"] = tmp_inv[inv_id_col].apply(lambda x: _safe_str(x).strip())
-            tmp_inv["__grading_cost_unsynced"] = tmp_inv["__inv_id_key"].map(grading_cost_by_inv_id).fillna(0.0)
-            tmp_inv["__eff_cost"] = _to_num(tmp_inv[inv_total_col]) + _to_num(tmp_inv["__grading_cost_unsynced"])
-            inv_spend = float(tmp_inv["__eff_cost"].sum())
-        else:
-            inv_spend = 0.0
-
+        # Business summary is accrual-style for the selected sales period:
+        # expenses tied to sold items are COGS + selling fees. Inventory purchases
+        # that are still unsold stay in Assets, not Profit/Loss. Misc expenses are
+        # added separately by expense date.
         misc_spend = float(misc_f["__amount"].sum()) if not misc_f.empty else 0.0
-        total_expenses = inv_spend + misc_spend
 
         summary_rows = []
+        sales_total_summary = 0.0
+        cogs_total_summary = 0.0
+        fees_total_summary = 0.0
+
         for ct in ["Sports", "Pokemon"]:
-            inv_ct = inv_f[inv_f[inv_card_type_col].apply(_normalize_card_type).astype(str).str.upper() == ct.upper()] if not inv_f.empty else pd.DataFrame()
             if not txn_f.empty:
                 tx_tmp = txn_f.copy()
                 tx_tmp["__card_type"] = tx_tmp.apply(_tx_card_type_rowaware, axis=1)
-                tx_ct = tx_tmp[tx_tmp["__card_type"].astype(str).str.upper() == ct.upper()]
+                tx_ct = tx_tmp[tx_tmp["__card_type"].astype(str).str.upper() == ct.upper()].copy()
             else:
                 tx_ct = pd.DataFrame()
 
-            if not inv_ct.empty:
-                inv_ct2 = inv_ct.copy()
-                inv_ct2["__inv_id_key"] = inv_ct2[inv_id_col].apply(lambda x: _safe_str(x).strip())
-                inv_ct2["__grading_cost_unsynced"] = inv_ct2["__inv_id_key"].map(grading_cost_by_inv_id).fillna(0.0)
-                inv_ct2["__eff_cost"] = _to_num(inv_ct2[inv_total_col]) + _to_num(inv_ct2["__grading_cost_unsynced"])
-                exp_ct = float(inv_ct2["__eff_cost"].sum())
-            else:
-                exp_ct = 0.0
-
-            sales_ct = float(tx_ct["__dollar_sales"].sum()) if (not tx_ct.empty and "__dollar_sales" in tx_ct.columns) else 0.0
-            fees_ct = float(tx_ct["__total_fees"].sum()) if (not tx_ct.empty and "__total_fees" in tx_ct.columns) else float(tx_ct.get("__fees", 0.0).sum()) if not tx_ct.empty else 0.0
-            net_ct = float(tx_ct["__net"].sum()) if not tx_ct.empty else 0.0
-
-            if exp_ct == 0.0 and sales_ct == 0.0:
+            if tx_ct.empty:
                 continue
 
-            pl_ct = net_ct - exp_ct
-            summary_rows.append([ct, exp_ct, sales_ct, fees_ct, pl_ct])
+            if "__dollar_sales" not in tx_ct.columns:
+                tx_ct["__dollar_sales"] = _to_num(tx_ct.get("__sold_price", 0.0))
+            if "__total_fees" not in tx_ct.columns:
+                tx_ct["__total_fees"] = _to_num(tx_ct.get("__fees", 0.0)) + _to_num(tx_ct.get("__ship_charged", 0.0))
 
-        totals_pl = (net_total - total_expenses)
-        summary_rows.append(["Totals", total_expenses, net_total, fees_total, totals_pl])
+            def _summary_cogs_for_inv_id(inv_id: str) -> float:
+                k = _safe_str(inv_id).strip()
+                rec = inv_by_id.get(k)
+                if rec is None:
+                    return 0.0
+                cost_col = _pick_col(pd.DataFrame([rec]), "total_cost", None) or _pick_col(pd.DataFrame([rec]), "all_in_cost", None)
+                if cost_col and cost_col in rec:
+                    val = _to_num(rec.get(cost_col, 0.0))
+                    if val > 0:
+                        return float(val)
+                base = _to_num(rec.get(inv_total_col, 0.0))
+                add = float(grading_cost_by_inv_id.get(k, 0.0) or 0.0)
+                return float(base + add)
+
+            if "__all_in_cost" in tx_ct.columns:
+                tx_ct["__cogs"] = _to_num(tx_ct["__all_in_cost"])
+                tx_ct["__cogs"] = np.where(
+                    tx_ct["__cogs"] > 0,
+                    tx_ct["__cogs"],
+                    tx_ct["__inventory_id"].apply(_summary_cogs_for_inv_id),
+                )
+            else:
+                tx_ct["__cogs"] = tx_ct["__inventory_id"].apply(_summary_cogs_for_inv_id)
+
+            sales_ct = float(tx_ct["__dollar_sales"].sum())
+            cogs_ct = float(tx_ct["__cogs"].sum())
+            fees_ct = float(tx_ct["__total_fees"].sum())
+            profit_ct = sales_ct - cogs_ct - fees_ct
+
+            sales_total_summary += sales_ct
+            cogs_total_summary += cogs_ct
+            fees_total_summary += fees_ct
+            summary_rows.append([ct, cogs_ct + fees_ct, sales_ct, fees_ct, profit_ct])
+
+        if misc_spend > 0:
+            summary_rows.append(["Misc / Other", misc_spend, 0.0, 0.0, -misc_spend])
+
+        total_expenses = cogs_total_summary + fees_total_summary + misc_spend
+        totals_pl = sales_total_summary - total_expenses
+        summary_rows.append(["Totals", total_expenses, sales_total_summary, fees_total_summary, totals_pl])
 
         summary_df = pd.DataFrame(summary_rows, columns=["Total", "Total Expenses", "Sales", "Fees/shipping", "Profit/Loss"])
 
@@ -2103,34 +2117,68 @@ with tab_forecast:
         rec = inv_by_id_2.get(k)
         base = 0.0
         if rec is not None:
-            base = _to_num(rec.get(inv_total_col, 0.0))
+            total_cost_col = None
+            if "total_cost" in rec:
+                total_cost_col = "total_cost"
+            elif "all_in_cost" in rec:
+                total_cost_col = "all_in_cost"
+
+            if total_cost_col:
+                base = _to_num(rec.get(total_cost_col, 0.0))
+
+            if base <= 0:
+                base = _to_num(rec.get(inv_total_col, 0.0))
         add = float(grading_cost_by_inv_id.get(k, 0.0) or 0.0)
         return float(base + add)
+
+    def _with_recalculated_sales_math(tx_df: pd.DataFrame) -> pd.DataFrame:
+        """Return a copy with sales, fees, proceeds, COGS, and profit recalculated.
+
+        Stored net/profit values are intentionally ignored because older
+        migration versions could write sold_price as profit for show sales.
+        """
+        if tx_df is None or tx_df.empty:
+            return pd.DataFrame(columns=[
+                "__sold_dt", "__sold_month", "__inventory_id", "__dollar_sales",
+                "__total_fees", "__net", "__cogs", "__profit_calc"
+            ])
+
+        out = tx_df.copy()
+        if "__dollar_sales" not in out.columns:
+            out["__dollar_sales"] = _to_num(out.get("__sold_price", 0.0))
+        else:
+            out["__dollar_sales"] = _to_num(out["__dollar_sales"])
+
+        if "__total_fees" not in out.columns:
+            out["__total_fees"] = _to_num(out.get("__fees", 0.0)) + _to_num(out.get("__ship_charged", 0.0))
+        else:
+            out["__total_fees"] = _to_num(out["__total_fees"])
+
+        if "__inventory_id" not in out.columns:
+            out["__inventory_id"] = ""
+
+        out["__fallback_cogs"] = out["__inventory_id"].apply(_cogs_for_inv_id_2)
+        if "__all_in_cost" in out.columns:
+            out["__all_in_cost_num"] = _to_num(out["__all_in_cost"])
+            out["__cogs"] = np.where(out["__all_in_cost_num"] > 0, out["__all_in_cost_num"], out["__fallback_cogs"])
+        else:
+            out["__cogs"] = out["__fallback_cogs"]
+
+        out["__net"] = (out["__dollar_sales"] - out["__total_fees"]).fillna(0.0)
+        out["__profit_calc"] = (out["__net"] - out["__cogs"]).fillna(0.0)
+        out["__profit"] = out["__profit_calc"]
+        return out
 
     # =========================================================
     # KPIs (Sales-side)
     # =========================================================
-    revenue = float(txn_f2["__dollar_sales"].sum()) if (not txn_f2.empty and "__dollar_sales" in txn_f2.columns) else 0.0
-    proceeds = float(txn_f2["__net"].sum()) if (not txn_f2.empty and "__net" in txn_f2.columns) else 0.0
+    tx_math_f2 = _with_recalculated_sales_math(txn_f2)
 
-    cogs = 0.0
-    net_profit = 0.0
-    items_sold = int(len(txn_f2)) if not txn_f2.empty else 0
-
-    if not txn_f2.empty:
-        tx_tmp = txn_f2.copy()
-        tx_tmp["__fallback_cogs"] = tx_tmp["__inventory_id"].apply(_cogs_for_inv_id_2)
-        if "__all_in_cost" in tx_tmp.columns:
-            tx_tmp["__all_in_cost_num"] = _to_num(tx_tmp["__all_in_cost"])
-            tx_tmp["__cogs"] = np.where(tx_tmp["__all_in_cost_num"] > 0, tx_tmp["__all_in_cost_num"], tx_tmp["__fallback_cogs"])
-        else:
-            tx_tmp["__cogs"] = tx_tmp["__fallback_cogs"]
-        cogs = float(tx_tmp["__cogs"].sum())
-        if "__profit" in tx_tmp.columns:
-            tx_tmp["__profit_num"] = _to_num(tx_tmp["__profit"])
-            net_profit = float(tx_tmp["__profit_num"].sum())
-        else:
-            net_profit = float((tx_tmp["__net"] - tx_tmp["__cogs"]).sum())
+    revenue = float(tx_math_f2["__dollar_sales"].sum()) if not tx_math_f2.empty else 0.0
+    proceeds = float(tx_math_f2["__net"].sum()) if not tx_math_f2.empty else 0.0
+    cogs = float(tx_math_f2["__cogs"].sum()) if not tx_math_f2.empty else 0.0
+    net_profit = float(tx_math_f2["__profit_calc"].sum()) if not tx_math_f2.empty else 0.0
+    items_sold = int(len(tx_math_f2)) if not tx_math_f2.empty else 0
 
     net_margin = (net_profit / revenue) if revenue else 0.0
 
@@ -2156,24 +2204,19 @@ with tab_forecast:
     with top_l:
         st.markdown("### Sales vs Expenses (Monthly)")
 
-        # Monthly Revenue (gross sales) + Monthly Expenses (inv purchases + misc + grading)
-        sales_m = pd.DataFrame(columns=["month", "sales"])
-        if not txn_f2.empty and "__sold_month" in txn_f2.columns:
+        # Monthly sales and expenses are built from sold items, not purchase-date
+        # inventory spend. Expenses here = COGS for sold items + selling fees + misc.
+        sales_m = pd.DataFrame(columns=["month", "sales", "cogs_expense", "fee_expense"])
+        if not tx_math_f2.empty and "__sold_month" in tx_math_f2.columns:
             sales_m = (
-                txn_f2.dropna(subset=["__sold_month"])
-                     .groupby("__sold_month", as_index=False)["__dollar_sales"]
-                     .sum()
-                     .rename(columns={"__sold_month": "month", "__dollar_sales": "sales"})
-            )
-
-        inv_m = pd.DataFrame(columns=["month", "inv_expense"])
-        if not inv_f2.empty and "__purchase_dt" in inv_f2.columns:
-            inv_m = (
-                inv_f2.dropna(subset=["__purchase_dt"])
-                     .assign(month=_month_start(inv_f2["__purchase_dt"]))
-                     .groupby("month", as_index=False)[inv_total_col]
-                     .sum()
-                     .rename(columns={inv_total_col: "inv_expense"})
+                tx_math_f2.dropna(subset=["__sold_month"])
+                          .groupby("__sold_month", as_index=False)
+                          .agg(
+                              sales=("__dollar_sales", "sum"),
+                              cogs_expense=("__cogs", "sum"),
+                              fee_expense=("__total_fees", "sum"),
+                          )
+                          .rename(columns={"__sold_month": "month"})
             )
 
         misc_m = pd.DataFrame(columns=["month", "misc_expense"])
@@ -2184,17 +2227,9 @@ with tab_forecast:
                        .rename(columns={"__month": "month", "__amount": "misc_expense"})
             )
 
-        grd_m = pd.DataFrame(columns=["month", "grading_expense"])
-        if not grd_f2.empty and "__grading_month" in grd_f2.columns:
-            grd_m = (
-                grd_f2.groupby("__grading_month", as_index=False)["__grading_cost"]
-                      .sum()
-                      .rename(columns={"__grading_month": "month", "__grading_cost": "grading_expense"})
-            )
-
         # Build month backbone
         allm = []
-        for s in [sales_m.get("month"), inv_m.get("month"), misc_m.get("month"), grd_m.get("month")]:
+        for s in [sales_m.get("month"), misc_m.get("month")]:
             if isinstance(s, pd.Series) and not s.empty:
                 allm.append(s.dropna())
 
@@ -2207,16 +2242,14 @@ with tab_forecast:
 
         base_m = pd.DataFrame({"month": months})
         base_m = base_m.merge(sales_m, on="month", how="left")
-        base_m = base_m.merge(inv_m, on="month", how="left")
         base_m = base_m.merge(misc_m, on="month", how="left")
-        base_m = base_m.merge(grd_m, on="month", how="left")
 
-        for c in ["sales", "inv_expense", "misc_expense", "grading_expense"]:
+        for c in ["sales", "cogs_expense", "fee_expense", "misc_expense"]:
             if c not in base_m.columns:
                 base_m[c] = 0.0
             base_m[c] = base_m[c].fillna(0.0)
 
-        base_m["expenses"] = base_m["inv_expense"] + base_m["misc_expense"] + base_m["grading_expense"]
+        base_m["expenses"] = base_m["cogs_expense"] + base_m["fee_expense"] + base_m["misc_expense"]
         base_m["diff"] = base_m["sales"] - base_m["expenses"]  # profit/loss for the month
 
         # Add TOTAL row at end
@@ -2322,24 +2355,19 @@ with tab_forecast:
         current_month = pd.Timestamp(date.today().replace(day=1))
         today_norm = pd.Timestamp.today().normalize()
 
-        # --- Reuse monthly sales/expenses logic for cumulative net
-        sales_m2 = pd.DataFrame(columns=["month", "sales"])
-        if not txn_f2.empty and "__sold_month" in txn_f2.columns:
+        # --- Reuse monthly sales/expenses logic for cumulative net.
+        # Net profit is based on sold-item economics: sales - COGS - fees - misc.
+        sales_m2 = pd.DataFrame(columns=["month", "sales", "cogs_expense", "fee_expense"])
+        if not tx_math_f2.empty and "__sold_month" in tx_math_f2.columns:
             sales_m2 = (
-                txn_f2.dropna(subset=["__sold_month"])
-                     .groupby("__sold_month", as_index=False)["__dollar_sales"]
-                     .sum()
-                     .rename(columns={"__sold_month": "month", "__dollar_sales": "sales"})
-            )
-
-        inv_m2 = pd.DataFrame(columns=["month", "inv_expense"])
-        if not inv_f2.empty and "__purchase_dt" in inv_f2.columns:
-            inv_m2 = (
-                inv_f2.dropna(subset=["__purchase_dt"])
-                     .assign(month=_month_start(inv_f2["__purchase_dt"]))
-                     .groupby("month", as_index=False)[inv_total_col]
-                     .sum()
-                     .rename(columns={inv_total_col: "inv_expense"})
+                tx_math_f2.dropna(subset=["__sold_month"])
+                          .groupby("__sold_month", as_index=False)
+                          .agg(
+                              sales=("__dollar_sales", "sum"),
+                              cogs_expense=("__cogs", "sum"),
+                              fee_expense=("__total_fees", "sum"),
+                          )
+                          .rename(columns={"__sold_month": "month"})
             )
 
         misc_m2 = pd.DataFrame(columns=["month", "misc_expense"])
@@ -2348,14 +2376,6 @@ with tab_forecast:
                 misc_f2.groupby("__month", as_index=False)["__amount"]
                        .sum()
                        .rename(columns={"__month": "month", "__amount": "misc_expense"})
-            )
-
-        grd_m2 = pd.DataFrame(columns=["month", "grading_expense"])
-        if not grd_f2.empty and "__grading_month" in grd_f2.columns:
-            grd_m2 = (
-                grd_f2.groupby("__grading_month", as_index=False)["__grading_cost"]
-                      .sum()
-                      .rename(columns={"__grading_month": "month", "__grading_cost": "grading_expense"})
             )
 
         # Forecast market value by est return month (open submissions only)
@@ -2384,7 +2404,7 @@ with tab_forecast:
 
         # Build month backbone for trend (include forecast months)
         allm2 = []
-        for s in [sales_m2.get("month"), inv_m2.get("month"), misc_m2.get("month"), grd_m2.get("month"), mv_up.get("month"), mv_dn.get("month")]:
+        for s in [sales_m2.get("month"), misc_m2.get("month"), mv_up.get("month"), mv_dn.get("month")]:
             if isinstance(s, pd.Series) and not s.empty:
                 allm2.append(s.dropna())
 
@@ -2397,18 +2417,16 @@ with tab_forecast:
 
         trend = pd.DataFrame({"month": months2})
         trend = trend.merge(sales_m2, on="month", how="left")
-        trend = trend.merge(inv_m2, on="month", how="left")
         trend = trend.merge(misc_m2, on="month", how="left")
-        trend = trend.merge(grd_m2, on="month", how="left")
         trend = trend.merge(mv_up, on="month", how="left")
         trend = trend.merge(mv_dn, on="month", how="left")
 
-        for c in ["sales", "inv_expense", "misc_expense", "grading_expense", "mv_up", "mv_dn"]:
+        for c in ["sales", "cogs_expense", "fee_expense", "misc_expense", "mv_up", "mv_dn"]:
             if c not in trend.columns:
                 trend[c] = 0.0
             trend[c] = trend[c].fillna(0.0)
 
-        trend["expenses"] = trend["inv_expense"] + trend["misc_expense"] + trend["grading_expense"]
+        trend["expenses"] = trend["cogs_expense"] + trend["fee_expense"] + trend["misc_expense"]
         trend["net"] = trend["sales"] - trend["expenses"]
 
         # cumulative actual net through current month (future months don't add unknown sales/expenses)
@@ -2556,10 +2574,8 @@ with tab_forecast:
                 txp["__cogs"] = np.where(txp["__all_in_cost_num"] > 0, txp["__all_in_cost_num"], txp["__fallback_cogs"])
             else:
                 txp["__cogs"] = txp["__fallback_cogs"]
-            if "__profit" in txp.columns:
-                txp["__profit"] = _to_num(txp["__profit"])
-            else:
-                txp["__profit"] = (txp["__net"] - txp["__cogs"]).fillna(0.0)
+            txp["__net"] = (txp["__dollar_sales"] - txp["__total_fees"]).fillna(0.0)
+            txp["__profit"] = (txp["__net"] - txp["__cogs"]).fillna(0.0)
             txp["__purchased_from"] = txp["__inventory_id"].apply(lambda x: _safe_str(_inv_get(x, inv_purchased_from_col, "")).strip() or "Unknown")
 
             pf = txp.groupby("__purchased_from", as_index=False)["__profit"].sum().rename(columns={"__purchased_from": "purchased_from", "__profit": "profit"})
@@ -2672,12 +2688,14 @@ with tab_forecast:
         with mright:
             st.markdown("#### Expenses by Type")
 
-            # Inventory expense (purchases in period)
-            inv_cost_total = float(_to_num(inv_f2[inv_total_col]).sum()) if (not inv_f2.empty and inv_total_col in inv_f2.columns) else 0.0
+            # Sales-period expenses from sold items.
+            cogs_expense_total = float(tx_math_f2["__cogs"].sum()) if not tx_math_f2.empty else 0.0
+            selling_fees_total = float(tx_math_f2["__total_fees"].sum()) if not tx_math_f2.empty else 0.0
 
             # Map misc categories into requested buckets
             bucket_order = [
-                "Inventory cost",
+                "Cost of goods sold",
+                "Selling fees / shipping",
                 "Packaging materials",
                 "Card show fees",
                 "Supplies",
@@ -2708,7 +2726,10 @@ with tab_forecast:
                         return k
                 return "Other"
 
-            rows_exp = [{"expense_type": "Inventory cost", "amount": inv_cost_total}]
+            rows_exp = [
+                {"expense_type": "Cost of goods sold", "amount": cogs_expense_total},
+                {"expense_type": "Selling fees / shipping", "amount": selling_fees_total},
+            ]
 
             if not misc_f2.empty and "__category" in misc_f2.columns and "__amount" in misc_f2.columns:
                 mm = misc_f2.copy()

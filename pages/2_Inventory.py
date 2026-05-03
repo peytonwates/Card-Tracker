@@ -98,7 +98,6 @@ DEFAULT_COLUMNS = [
     "total_price",             # purchase + shipping + tax
     "grading_fee",             # sourced from grading sheet when available
     "total_cost",              # total_price + grading_fee
-    "sticker_price",           # current sticker price for show pricing
     "condition",               # raw card condition; sealed="Sealed"; graded="Graded"
     "notes",
     "created_at",
@@ -136,7 +135,6 @@ NUMERIC_COLS = [
     "total_price",
     "grading_fee",
     "total_cost",
-    "sticker_price",
     "market_price",
     "market_value",
     "list_price",
@@ -153,7 +151,6 @@ HEADER_ALIASES = {
     "product_type": ["product_type", "Product Type"],
     "sealed_product_type": ["sealed_product_type", "Sealed Product Type"],
     "inventory_type": ["inventory_type", "Inventory Type"],
-    "sticker_price": ["sticker_price", "Sticker Price"],
     "transaction_type": ["transaction_type", "Transaction Type", "listing_type"],
     "platform": ["platform", "Platform"],
     "list_date": ["list_date", "List Date"],
@@ -2111,6 +2108,23 @@ with tab_list:
             - _coerce_money_series(filtered["total_cost"])
         ).round(2)
 
+        # Recalculate sold math for display. Stored net/profit values may be stale
+        # from earlier migrations, so derive them from first principles.
+        for c in ["sold_price", "fees", "shipping_charged", "fees_total"]:
+            if c not in filtered.columns:
+                filtered[c] = 0.0
+            filtered[c] = _coerce_money_series(filtered[c])
+        filtered["fees_total"] = filtered["fees_total"].where(
+            filtered["fees_total"] > 0,
+            (_coerce_money_series(filtered["fees"]) + _coerce_money_series(filtered["shipping_charged"])).round(2),
+        )
+        filtered["net_proceeds"] = (
+            _coerce_money_series(filtered["sold_price"]) - _coerce_money_series(filtered["fees_total"])
+        ).round(2)
+        filtered["profit"] = (
+            _coerce_money_series(filtered["net_proceeds"]) - _coerce_money_series(filtered["total_cost"])
+        ).round(2)
+
         # enforce condition invariants for display
         filtered = filtered.copy()
         filtered.loc[filtered["product_type"] == "Sealed", "condition"] = "Sealed"
@@ -2312,14 +2326,13 @@ with tab_list:
                 updated_full["fees_total"] > 0,
                 (_coerce_money_series(updated_full["fees"]) + _coerce_money_series(updated_full["shipping_charged"])).round(2),
             )
-            updated_full["net_proceeds"] = updated_full["net_proceeds"].where(
-                updated_full["net_proceeds"] != 0,
-                (_coerce_money_series(updated_full["sold_price"]) - _coerce_money_series(updated_full["fees_total"])).round(2),
-            )
-            updated_full["profit"] = updated_full["profit"].where(
-                updated_full["profit"] != 0,
-                (_coerce_money_series(updated_full["net_proceeds"]) - _coerce_money_series(updated_full["total_cost"])).round(2),
-            )
+            # Always recalculate sold math on save.
+            updated_full["net_proceeds"] = (
+                _coerce_money_series(updated_full["sold_price"]) - _coerce_money_series(updated_full["fees_total"])
+            ).round(2)
+            updated_full["profit"] = (
+                _coerce_money_series(updated_full["net_proceeds"]) - _coerce_money_series(updated_full["total_cost"])
+            ).round(2)
 
             updated_full["condition"] = updated_full["condition"].astype(str)
             updated_full.loc[updated_full["product_type"] == "Sealed", "condition"] = "Sealed"
