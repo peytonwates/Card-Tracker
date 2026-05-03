@@ -257,26 +257,47 @@ def _row_values_from_internal(headers: list[str], record: dict) -> list:
     return vals
 
 
-def clean_blank_duplicate_transaction_headers(tx_ws) -> int:
+def clean_blank_duplicate_transaction_headers(tx_ws) -> tuple[int, list[str]]:
+    """
+    Best-effort cleanup for old duplicate transaction headers.
+
+    This is intentionally NON-BLOCKING. The actual migration does not require
+    transaction columns to be deleted, and Google Sheets can reject column
+    deletion for reasons outside the app's control. If deletion fails, we skip
+    that column and still let the migration continue.
+    """
     values = _with_backoff(lambda: tx_ws.get_all_values())
     if not values or not values[0]:
-        return 0
+        return 0, []
+
     headers = values[0]
     internals = [sheet_header_to_internal(h) for h in headers]
     seen = {}
     delete_cols = []
+
     for idx, internal in enumerate(internals, start=1):
         if not internal:
             continue
+
         if internal in seen:
             has_data = any(str(row[idx - 1]).strip() for row in values[1:] if len(row) >= idx)
             if not has_data:
                 delete_cols.append(idx)
         else:
             seen[internal] = idx
+
+    deleted = 0
+    skipped = []
     for col in sorted(delete_cols, reverse=True):
-        _with_backoff(lambda c=col: tx_ws.delete_columns(c))
-    return len(delete_cols)
+        try:
+            _with_backoff(lambda c=col: tx_ws.delete_columns(c))
+            deleted += 1
+        except Exception as e:
+            header_name = headers[col - 1] if col - 1 < len(headers) else f"Column {col}"
+            skipped.append(f"Skipped deleting duplicate blank column {col} ({header_name}): {type(e).__name__}")
+            continue
+
+    return deleted, skipped
 
 
 def build_migration_plan(overwrite_existing: bool = False) -> tuple[pd.DataFrame, list[str]]:
@@ -393,7 +414,10 @@ def run_migration(plan: pd.DataFrame, clean_tx_headers: bool = True):
     if clean_tx_headers:
         backups.append(backup_ws(tx_ws_name, "backup_transactions_before_sales_migration"))
 
-    deleted_dups = clean_blank_duplicate_transaction_headers(tx_ws) if clean_tx_headers else 0
+    deleted_dups = 0
+    cleanup_warnings = []
+    if clean_tx_headers:
+        deleted_dups, cleanup_warnings = clean_blank_duplicate_transaction_headers(tx_ws)
 
     inv_headers = ensure_inventory_sale_headers(inv_ws)
     inv_values = _with_backoff(lambda: inv_ws.get_all_values())
@@ -424,7 +448,12 @@ def run_migration(plan: pd.DataFrame, clean_tx_headers: bool = True):
     if batch:
         _with_backoff(lambda: inv_ws.batch_update(batch, value_input_option="USER_ENTERED"))
 
-    return {"updated": len(batch), "backups": backups, "deleted_duplicate_tx_cols": deleted_dups}
+    return {
+        "updated": len(batch),
+        "backups": backups,
+        "deleted_duplicate_tx_cols": deleted_dups,
+        "cleanup_warnings": cleanup_warnings,
+    }
 
 
 st.markdown(
@@ -437,7 +466,7 @@ c1, c2 = st.columns(2)
 with c1:
     overwrite = st.checkbox("Overwrite inventory rows that already have sold data", value=False)
 with c2:
-    clean_dupes = st.checkbox("Also remove blank duplicate transaction header columns", value=True)
+    clean_dupes = st.checkbox("Also remove blank duplicate transaction header columns (optional)", value=False)
 
 if st.button("Preview Migration", use_container_width=True):
     plan, warnings = build_migration_plan(overwrite_existing=overwrite)
@@ -472,5 +501,9 @@ if isinstance(plan, pd.DataFrame) and not plan.empty:
                 st.write(f"- {b}")
         if clean_dupes:
             st.write(f"Blank duplicate transaction columns removed: {result['deleted_duplicate_tx_cols']:,}")
+            if result.get("cleanup_warnings"):
+                with st.expander("Duplicate-column cleanup warnings", expanded=False):
+                    for msg in result.get("cleanup_warnings", []):
+                        st.write("- " + msg)
 elif isinstance(plan, pd.DataFrame):
     st.info("Click Preview Migration to see what will change.")
