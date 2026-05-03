@@ -103,6 +103,25 @@ DEFAULT_COLUMNS = [
     "created_at",
     "inventory_status",
     "listed_transaction_id",
+    # ---- sale / disposition fields (inventory is now the source of truth) ----
+    "transaction_type",          # legacy/online: Auction / Buy It Now / Trade In; show sales use sale_channel
+    "platform",                  # eBay / Whatnot / etc.; blank for show sales
+    "list_date",
+    "list_price",
+    "sold_date",
+    "sold_price",
+    "fees",
+    "shipping_charged",
+    "fees_total",
+    "net_proceeds",
+    "profit",
+    "sale_channel",              # Card Show / Online / Trade In / Manual
+    "sale_notes",
+    "show_id",
+    "show_name",
+    "sold_transaction_id",
+    "sold_created_at",
+    "sold_updated_at",
     # ---- cached market pricing ----
     "market_price",
     "market_value",            # alias / compatibility with dashboard
@@ -118,6 +137,13 @@ NUMERIC_COLS = [
     "total_cost",
     "market_price",
     "market_value",
+    "list_price",
+    "sold_price",
+    "fees",
+    "shipping_charged",
+    "fees_total",
+    "net_proceeds",
+    "profit",
 ]
 
 # Support both header styles if sheet was edited manually
@@ -125,6 +151,24 @@ HEADER_ALIASES = {
     "product_type": ["product_type", "Product Type"],
     "sealed_product_type": ["sealed_product_type", "Sealed Product Type"],
     "inventory_type": ["inventory_type", "Inventory Type"],
+    "transaction_type": ["transaction_type", "Transaction Type", "listing_type"],
+    "platform": ["platform", "Platform"],
+    "list_date": ["list_date", "List Date"],
+    "list_price": ["list_price", "List Price", "listed_price"],
+    "sold_date": ["sold_date", "Sold Date", "sale_date"],
+    "sold_price": ["sold_price", "Sold Price", "sale_price", "sell_price"],
+    "fees": ["fees", "Fees", "platform_fees", "fee"],
+    "shipping_charged": ["shipping_charged", "Shipping Charged", "shipping_cost"],
+    "fees_total": ["fees_total", "Fees Total", "total_fees"],
+    "net_proceeds": ["net_proceeds", "Net Proceeds", "net"],
+    "profit": ["profit", "Profit", "Profit/Loss", "profit_loss"],
+    "sale_channel": ["sale_channel", "Sale Channel", "sales_channel"],
+    "sale_notes": ["sale_notes", "Sale Notes"],
+    "show_id": ["show_id", "Show ID"],
+    "show_name": ["show_name", "Show Name"],
+    "sold_transaction_id": ["sold_transaction_id", "Sold Transaction ID", "listed_transaction_id"],
+    "sold_created_at": ["sold_created_at", "Sold Created At"],
+    "sold_updated_at": ["sold_updated_at", "Sold Updated At"],
 }
 
 
@@ -1061,6 +1105,26 @@ def sheets_load_inventory() -> pd.DataFrame:
         _coerce_money_series(df["total_price"])
         + _coerce_money_series(df["grading_fee"])
     ).round(2)
+
+    # normalize sale / disposition fields.  Inventory now owns sold data.
+    for c in ["list_price", "sold_price", "fees", "shipping_charged", "fees_total", "net_proceeds", "profit"]:
+        if c not in df.columns:
+            df[c] = 0.0
+        df[c] = _coerce_money_series(df[c])
+
+    # If fees_total / net / profit are blank but a sold price exists, compute them.
+    df["fees_total"] = df["fees_total"].where(
+        df["fees_total"] > 0,
+        (_coerce_money_series(df["fees"]) + _coerce_money_series(df["shipping_charged"])).round(2),
+    )
+    df["net_proceeds"] = df["net_proceeds"].where(
+        df["net_proceeds"] != 0,
+        (_coerce_money_series(df["sold_price"]) - _coerce_money_series(df["fees_total"])).round(2),
+    )
+    df["profit"] = df["profit"].where(
+        df["profit"] != 0,
+        (_coerce_money_series(df["net_proceeds"]) - _coerce_money_series(df["total_cost"])).round(2),
+    )
 
     # normalize defaults
     df["product_type"] = df["product_type"].replace("", "Card").fillna("Card")
@@ -2016,6 +2080,13 @@ with tab_list:
             "total_cost",
             "market_price",
             "market_value",
+            "list_price",
+            "sold_price",
+            "fees",
+            "shipping_charged",
+            "fees_total",
+            "net_proceeds",
+            "profit",
         ]:
             if c in filtered.columns:
                 filtered[c] = _coerce_money_series(filtered[c])
@@ -2056,6 +2127,12 @@ with tab_list:
             "inventory_status",
             "market_price",
             "est_profit",
+            "sold_date",
+            "sold_price",
+            "net_proceeds",
+            "profit",
+            "sale_channel",
+            "show_name",
         ]
         for c in show_cols:
             if c not in filtered.columns:
@@ -2102,6 +2179,12 @@ with tab_list:
                 "inventory_status": st.column_config.TextColumn("Status"),
                 "market_price": st.column_config.NumberColumn("Market Price", format="$%.2f"),
                 "est_profit": st.column_config.NumberColumn("Est Profit", format="$%.2f", disabled=True),
+                "sold_date": st.column_config.TextColumn("Sold Date"),
+                "sold_price": st.column_config.NumberColumn("Sold Price", format="$%.2f"),
+                "net_proceeds": st.column_config.NumberColumn("Net Proceeds", format="$%.2f", disabled=True),
+                "profit": st.column_config.NumberColumn("Profit", format="$%.2f", disabled=True),
+                "sale_channel": st.column_config.TextColumn("Sale Channel"),
+                "show_name": st.column_config.TextColumn("Show"),
             },
             disabled=["grading_fee", "total_cost", "est_profit"],
         )
@@ -2109,7 +2192,7 @@ with tab_list:
         # ---- Profit / Loss highlighted view ----
         view = edited.drop(columns=["delete"], errors="ignore").copy()
 
-        for c in ["purchase_price", "shipping", "tax", "grading_fee", "total_cost", "market_price", "est_profit"]:
+        for c in ["purchase_price", "shipping", "tax", "grading_fee", "total_cost", "market_price", "est_profit", "sold_price", "net_proceeds", "profit"]:
             if c in view.columns:
                 view[c] = _coerce_money_series(view[c])
 
@@ -2161,7 +2244,7 @@ with tab_list:
             edited_core = edited.drop(columns=["delete"], errors="ignore").copy()
 
             # numeric cleanup on editable columns only
-            for c in ["purchase_price", "shipping", "tax", "market_price"]:
+            for c in ["purchase_price", "shipping", "tax", "market_price", "sold_price"]:
                 if c in edited_core.columns:
                     edited_core[c] = _coerce_money_series(edited_core[c])
 
@@ -2179,6 +2262,10 @@ with tab_list:
                 "condition",
                 "inventory_status",
                 "market_price",
+                "sold_date",
+                "sold_price",
+                "sale_channel",
+                "show_name",
             ]
             updatable_cols = [c for c in updatable_cols if c in edited_core.columns and c in updated_full.columns]
 
@@ -2213,6 +2300,23 @@ with tab_list:
 
             if "market_price" in updated_full.columns and "market_value" in updated_full.columns:
                 updated_full["market_value"] = updated_full["market_price"]
+
+            for c in ["sold_price", "fees", "shipping_charged", "fees_total", "net_proceeds", "profit"]:
+                if c not in updated_full.columns:
+                    updated_full[c] = 0.0
+                updated_full[c] = _coerce_money_series(updated_full[c])
+            updated_full["fees_total"] = updated_full["fees_total"].where(
+                updated_full["fees_total"] > 0,
+                (_coerce_money_series(updated_full["fees"]) + _coerce_money_series(updated_full["shipping_charged"])).round(2),
+            )
+            updated_full["net_proceeds"] = updated_full["net_proceeds"].where(
+                updated_full["net_proceeds"] != 0,
+                (_coerce_money_series(updated_full["sold_price"]) - _coerce_money_series(updated_full["fees_total"])).round(2),
+            )
+            updated_full["profit"] = updated_full["profit"].where(
+                updated_full["profit"] != 0,
+                (_coerce_money_series(updated_full["net_proceeds"]) - _coerce_money_series(updated_full["total_cost"])).round(2),
+            )
 
             updated_full["condition"] = updated_full["condition"].astype(str)
             updated_full.loc[updated_full["product_type"] == "Sealed", "condition"] = "Sealed"

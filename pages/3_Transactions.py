@@ -171,6 +171,25 @@ INV_COLUMNS = [
     "created_at",
     "inventory_status",
     "listed_transaction_id",
+    # Sale / disposition fields stored on inventory
+    "transaction_type",
+    "platform",
+    "list_date",
+    "list_price",
+    "sold_date",
+    "sold_price",
+    "fees",
+    "shipping_charged",
+    "fees_total",
+    "net_proceeds",
+    "profit",
+    "sale_channel",
+    "sale_notes",
+    "show_id",
+    "show_name",
+    "sold_transaction_id",
+    "sold_created_at",
+    "sold_updated_at",
     # Grading + market
     "grading_company",
     "grade",
@@ -255,7 +274,7 @@ GRADING_COLUMNS = [
     "created_at",
 ]
 
-NUMERIC_INV = ["purchase_price", "shipping", "tax", "total_price", "market_price"]
+NUMERIC_INV = ["purchase_price", "shipping", "tax", "total_price", "market_price", "list_price", "sold_price", "fees", "shipping_charged", "fees_total", "net_proceeds", "profit"]
 NUMERIC_TX = [
     "list_price", "sold_price",
     "fees", "shipping_charged", "fees_total",
@@ -277,6 +296,13 @@ HEADER_ALIASES = {
     "image_url": ["image_url", "Image URL", "image", "Image"],
     "inventory_status": ["inventory_status", "Inventory Status", "inventoryStatus"],
     "listed_transaction_id": ["listed_transaction_id", "Listed Transaction ID"],
+    "sold_transaction_id": ["sold_transaction_id", "Sold Transaction ID"],
+    "sale_channel": ["sale_channel", "Sale Channel", "sales_channel"],
+    "sale_notes": ["sale_notes", "Sale Notes"],
+    "show_id": ["show_id", "Show ID"],
+    "show_name": ["show_name", "Show Name"],
+    "sold_created_at": ["sold_created_at", "Sold Created At"],
+    "sold_updated_at": ["sold_updated_at", "Sold Updated At"],
 
     # Inventory grading/market
     "grading_company": ["grading_company", "Grading Company", "grading company", "company"],
@@ -345,8 +371,8 @@ def internal_to_sheet_header(internal: str, existing_headers: list[str]) -> str:
         "grade": "Grade",
         "market_price": "Market Price",
         "market_price_updated_at": "Market Price Updated At",
-        "grading_fee_total": "Grading Fee",
-        "all_in_cost": "All In Cost",
+        "grading_fee_total": "grading_fee_total",
+        "all_in_cost": "all_in_cost",
         "fees_total": "Fees Total",
         "status": "TX Status",
         "inventory_status": "Inventory Status",
@@ -434,7 +460,32 @@ def _ensure_headers(ws, internal_headers: list[str]) -> list[str]:
         return sheet_headers
 
     existing_sheet_headers = first_row
+
+    # Clean up duplicate header columns if the duplicate columns are blank.
+    # This fixes repeated columns such as purchase_total / Grading Fee / All In Cost.
     existing_internal = [sheet_header_to_internal(h) for h in existing_sheet_headers]
+    dup_cols_to_delete = []
+    seen_internal = {}
+    if len(values) > 1:
+        for idx, internal in enumerate(existing_internal, start=1):
+            if not internal:
+                continue
+            if internal in seen_internal:
+                data_has_value = any(str(row[idx - 1]).strip() for row in values[1:] if len(row) >= idx)
+                if not data_has_value:
+                    dup_cols_to_delete.append(idx)
+            else:
+                seen_internal[internal] = idx
+
+    if dup_cols_to_delete:
+        for col_idx in sorted(dup_cols_to_delete, reverse=True):
+            _with_backoff(lambda c=col_idx: ws.delete_columns(c))
+        _read_sheet_values_cached.clear()
+        values = _with_backoff(lambda: ws.get_all_values())
+        first_row = values[0] if values else []
+        existing_sheet_headers = first_row
+        existing_internal = [sheet_header_to_internal(h) for h in existing_sheet_headers]
+
     existing_internal_set = set(existing_internal)
 
     missing_internal = [h for h in internal_headers if h not in existing_internal_set]
@@ -1497,10 +1548,30 @@ with tab_create:
 
                     if tx_type == "Trade In":
                         row_internal["inventory_status"] = STATUS_SOLD
+                        row_internal["sold_transaction_id"] = tx_id
+                        row_internal["transaction_type"] = tx_type
+                        row_internal["platform"] = platform.strip()
+                        row_internal["list_date"] = str(list_date) if list_date else ""
+                        row_internal["list_price"] = float(list_price or 0.0)
+                        row_internal["sold_date"] = str(sold_date) if sold_date else ""
+                        row_internal["sold_price"] = float(sold_price or 0.0)
+                        row_internal["fees"] = float(fees or 0.0)
+                        row_internal["shipping_charged"] = float(shipping_charged or 0.0)
+                        row_internal["fees_total"] = float(fees_total)
+                        row_internal["net_proceeds"] = float(net)
+                        row_internal["profit"] = float(profit)
+                        row_internal["sale_channel"] = "Trade In"
+                        row_internal["sale_notes"] = notes.strip()
+                        row_internal["sold_created_at"] = now_iso
+                        row_internal["sold_updated_at"] = now_iso
+                        row_internal["listed_transaction_id"] = ""
                     else:
                         row_internal["inventory_status"] = STATUS_LISTED
-
-                    row_internal["listed_transaction_id"] = tx_id
+                        row_internal["listed_transaction_id"] = tx_id
+                        row_internal["transaction_type"] = tx_type
+                        row_internal["platform"] = platform.strip()
+                        row_internal["list_date"] = str(list_date) if list_date else ""
+                        row_internal["list_price"] = float(list_price or 0.0)
 
                     if "image_url" in row_internal and (not str(row_internal.get("image_url", "")).strip()):
                         row_internal["image_url"] = img_url_final
@@ -1649,6 +1720,10 @@ with tab_update:
 
                         inv_internal["inventory_status"] = STATUS_ACTIVE
                         inv_internal["listed_transaction_id"] = ""
+                        inv_internal["transaction_type"] = ""
+                        inv_internal["platform"] = ""
+                        inv_internal["list_date"] = ""
+                        inv_internal["list_price"] = 0.0
                         _update_row(inv_ws, inv_sheet_headers, inv_rownum, inv_internal)
 
                     st.session_state.pop("inv_df_cache_tx", None)
@@ -1693,7 +1768,24 @@ with tab_update:
                         inv_internal = _coalesce_duplicate_columns(pd.DataFrame([inv_internal])).iloc[0].to_dict()
 
                         inv_internal["inventory_status"] = STATUS_SOLD
-                        inv_internal["listed_transaction_id"] = tx_id
+                        inv_internal["listed_transaction_id"] = ""
+                        inv_internal["sold_transaction_id"] = tx_id
+                        inv_internal["transaction_type"] = str(tx_internal.get("transaction_type", "")).strip()
+                        inv_internal["platform"] = str(tx_internal.get("platform", "")).strip()
+                        inv_internal["list_date"] = str(tx_internal.get("list_date", "")).strip()
+                        inv_internal["list_price"] = float(_to_float_money(tx_internal.get("list_price", 0.0)))
+                        inv_internal["sold_date"] = str(sold_date)
+                        inv_internal["sold_price"] = float(sold_price)
+                        inv_internal["fees"] = float(fees)
+                        inv_internal["shipping_charged"] = float(shipping_charged)
+                        inv_internal["fees_total"] = float(fees_total)
+                        inv_internal["net_proceeds"] = float(net)
+                        inv_internal["profit"] = float(profit)
+                        inv_internal["sale_channel"] = "Online"
+                        inv_internal["sale_notes"] = notes.strip()
+                        inv_internal["sold_updated_at"] = now_iso
+                        if not str(inv_internal.get("sold_created_at", "")).strip():
+                            inv_internal["sold_created_at"] = now_iso
                         _update_row(inv_ws, inv_sheet_headers, inv_rownum, inv_internal)
 
                     st.session_state.pop("inv_df_cache_tx", None)

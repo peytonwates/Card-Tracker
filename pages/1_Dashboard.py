@@ -974,6 +974,18 @@ if not inv.empty:
     if inv_market_col and inv_market_col in inv.columns:
         inv["__market_price"] = _to_num(inv[inv_market_col])
 
+    # Inventory is now the source of truth for sales. These columns may not
+    # exist on older sheets until the migration or updated pages add them.
+    inv_sold_date_col = _pick_col(inv, "sold_date", None) or _pick_col(inv, "sale_date", None)
+    inv_sold_price_col = _pick_col(inv, "sold_price", None) or _pick_col(inv, "sale_price", None) or _pick_col(inv, "sell_price", None)
+    inv_fees_col = _pick_col(inv, "fees", None)
+    inv_shipping_charged_col = _pick_col(inv, "shipping_charged", None)
+    inv_fees_total_col = _pick_col(inv, "fees_total", None) or _pick_col(inv, "total_fees", None)
+    inv_net_col = _pick_col(inv, "net_proceeds", None) or _pick_col(inv, "net", None)
+    inv_profit_col = _pick_col(inv, "profit", None) or _pick_col(inv, "profit_loss", None)
+    inv_sale_channel_col = _pick_col(inv, "sale_channel", None)
+    inv_show_name_col = _pick_col(inv, "show_name", None)
+
 else:
     inv_id_col = "inventory_id"
     inv_status_col = "inventory_status"
@@ -985,6 +997,16 @@ else:
     inv_company_col = "grading_company"
     inv_condition_col = "condition"
     inv_purchased_from_col = "purchased_from"
+
+    inv_sold_date_col = None
+    inv_sold_price_col = None
+    inv_fees_col = None
+    inv_shipping_charged_col = None
+    inv_fees_total_col = None
+    inv_net_col = None
+    inv_profit_col = None
+    inv_sale_channel_col = None
+    inv_show_name_col = None
 
     inv = pd.DataFrame(columns=[
         inv_id_col, inv_status_col, inv_total_col, inv_purchase_date_col,
@@ -1115,6 +1137,93 @@ else:
         "__txn_card_type",
         "__txn_product_type",
     ])
+
+
+# =========================
+# Inventory-first sales ledger
+# =========================
+def _build_inventory_sales_ledger(inv_df: pd.DataFrame) -> pd.DataFrame:
+    if inv_df is None or inv_df.empty:
+        return pd.DataFrame(columns=[
+            "__sold_dt", "__sold_month", "__inventory_id", "__sold_price", "__fees",
+            "__ship_charged", "__total_fees", "__dollar_sales", "__net", "__profit",
+            "__all_in_cost", "__txn_card_type", "__txn_product_type", "__sale_channel", "__show_name"
+        ])
+
+    d = inv_df.copy()
+    if inv_id_col not in d.columns:
+        return pd.DataFrame()
+
+    d["__inventory_id"] = d[inv_id_col].apply(lambda x: _safe_str(x).strip())
+    status = d[inv_status_col].astype(str).str.upper().str.strip() if inv_status_col in d.columns else pd.Series("", index=d.index)
+
+    if inv_sold_price_col and inv_sold_price_col in d.columns:
+        d["__sold_price"] = _to_num(d[inv_sold_price_col])
+    else:
+        d["__sold_price"] = 0.0
+
+    if inv_sold_date_col and inv_sold_date_col in d.columns:
+        d["__sold_dt"] = _to_dt(d[inv_sold_date_col])
+    else:
+        d["__sold_dt"] = pd.NaT
+
+    # Include rows explicitly marked SOLD with either a sold price or a sold date.
+    d = d[(status.eq("SOLD")) & ((d["__sold_price"] > 0) | d["__sold_dt"].notna())].copy()
+    if d.empty:
+        return pd.DataFrame()
+
+    d["__fees"] = _to_num(d[inv_fees_col]) if inv_fees_col and inv_fees_col in d.columns else 0.0
+    d["__ship_charged"] = _to_num(d[inv_shipping_charged_col]) if inv_shipping_charged_col and inv_shipping_charged_col in d.columns else 0.0
+
+    if inv_fees_total_col and inv_fees_total_col in d.columns:
+        d["__total_fees"] = _to_num(d[inv_fees_total_col])
+        d["__total_fees"] = np.where(d["__total_fees"] > 0, d["__total_fees"], d["__fees"] + d["__ship_charged"])
+    else:
+        d["__total_fees"] = d["__fees"] + d["__ship_charged"]
+
+    d["__dollar_sales"] = d["__sold_price"]
+
+    if inv_net_col and inv_net_col in d.columns:
+        d["__net"] = _to_num(d[inv_net_col])
+        d["__net"] = np.where(d["__net"] != 0, d["__net"], d["__dollar_sales"] - d["__total_fees"])
+    else:
+        d["__net"] = d["__dollar_sales"] - d["__total_fees"]
+
+    # COGS: prefer total_cost, otherwise total_price + grading lookup.
+    inv_total_cost_col = _pick_col(d, "total_cost", None) or _pick_col(d, "all_in_cost", None)
+    if inv_total_cost_col and inv_total_cost_col in d.columns:
+        d["__all_in_cost"] = _to_num(d[inv_total_cost_col])
+        fallback_cost = _to_num(d[inv_total_col]) if inv_total_col in d.columns else 0.0
+        d["__all_in_cost"] = np.where(d["__all_in_cost"] > 0, d["__all_in_cost"], fallback_cost)
+    else:
+        d["__all_in_cost"] = _to_num(d[inv_total_col]) if inv_total_col in d.columns else 0.0
+
+    if inv_profit_col and inv_profit_col in d.columns:
+        d["__profit"] = _to_num(d[inv_profit_col])
+        d["__profit"] = np.where(d["__profit"] != 0, d["__profit"], d["__net"] - d["__all_in_cost"])
+    else:
+        d["__profit"] = d["__net"] - d["__all_in_cost"]
+
+    d["__sold_month"] = _month_start(d["__sold_dt"])
+    d["__txn_card_type"] = d[inv_card_type_col].apply(_normalize_card_type) if inv_card_type_col in d.columns else ""
+    d["__txn_product_type"] = d[inv_product_type_col].astype(str).fillna("") if inv_product_type_col in d.columns else ""
+    d["__sale_channel"] = d[inv_sale_channel_col].astype(str).fillna("") if inv_sale_channel_col and inv_sale_channel_col in d.columns else ""
+    d["__show_name"] = d[inv_show_name_col].astype(str).fillna("") if inv_show_name_col and inv_show_name_col in d.columns else ""
+
+    return d
+
+# Replace transaction-derived sales with inventory-derived sales wherever possible.
+# Legacy transaction rows remain as a fallback only for inventory_ids that do not
+# yet have sold fields populated in inventory.
+_inventory_sales = _build_inventory_sales_ledger(inv)
+if not _inventory_sales.empty:
+    inv_sold_ids = set(_inventory_sales["__inventory_id"].astype(str).str.strip())
+    if not txn.empty and "__inventory_id" in txn.columns:
+        txn_legacy_only = txn[~txn["__inventory_id"].astype(str).str.strip().isin(inv_sold_ids)].copy()
+        txn = pd.concat([_inventory_sales, txn_legacy_only], ignore_index=True, sort=False)
+    else:
+        txn = _inventory_sales.copy()
+
 
 
 # =========================
@@ -2010,9 +2119,18 @@ with tab_forecast:
 
     if not txn_f2.empty:
         tx_tmp = txn_f2.copy()
-        tx_tmp["__cogs"] = tx_tmp["__inventory_id"].apply(_cogs_for_inv_id_2)
+        tx_tmp["__fallback_cogs"] = tx_tmp["__inventory_id"].apply(_cogs_for_inv_id_2)
+        if "__all_in_cost" in tx_tmp.columns:
+            tx_tmp["__all_in_cost_num"] = _to_num(tx_tmp["__all_in_cost"])
+            tx_tmp["__cogs"] = np.where(tx_tmp["__all_in_cost_num"] > 0, tx_tmp["__all_in_cost_num"], tx_tmp["__fallback_cogs"])
+        else:
+            tx_tmp["__cogs"] = tx_tmp["__fallback_cogs"]
         cogs = float(tx_tmp["__cogs"].sum())
-        net_profit = float((tx_tmp["__net"] - tx_tmp["__cogs"]).sum())
+        if "__profit" in tx_tmp.columns:
+            tx_tmp["__profit_num"] = _to_num(tx_tmp["__profit"])
+            net_profit = float(tx_tmp["__profit_num"].sum())
+        else:
+            net_profit = float((tx_tmp["__net"] - tx_tmp["__cogs"]).sum())
 
     net_margin = (net_profit / revenue) if revenue else 0.0
 
@@ -2432,8 +2550,16 @@ with tab_forecast:
             st.info("No sales in the selected filters.")
         else:
             txp = txn_f2.copy()
-            txp["__cogs"] = txp["__inventory_id"].apply(_cogs_for_inv_id_2)
-            txp["__profit"] = (txp["__net"] - txp["__cogs"]).fillna(0.0)
+            txp["__fallback_cogs"] = txp["__inventory_id"].apply(_cogs_for_inv_id_2)
+            if "__all_in_cost" in txp.columns:
+                txp["__all_in_cost_num"] = _to_num(txp["__all_in_cost"])
+                txp["__cogs"] = np.where(txp["__all_in_cost_num"] > 0, txp["__all_in_cost_num"], txp["__fallback_cogs"])
+            else:
+                txp["__cogs"] = txp["__fallback_cogs"]
+            if "__profit" in txp.columns:
+                txp["__profit"] = _to_num(txp["__profit"])
+            else:
+                txp["__profit"] = (txp["__net"] - txp["__cogs"]).fillna(0.0)
             txp["__purchased_from"] = txp["__inventory_id"].apply(lambda x: _safe_str(_inv_get(x, inv_purchased_from_col, "")).strip() or "Unknown")
 
             pf = txp.groupby("__purchased_from", as_index=False)["__profit"].sum().rename(columns={"__purchased_from": "purchased_from", "__profit": "profit"})

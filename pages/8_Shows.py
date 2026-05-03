@@ -95,6 +95,25 @@ INV_COLUMNS = [
     "created_at",
     "inventory_status",
     "listed_transaction_id",
+    # Sale / disposition fields stored on inventory. Show sales update these directly.
+    "transaction_type",
+    "platform",
+    "list_date",
+    "list_price",
+    "sold_date",
+    "sold_price",
+    "fees",
+    "shipping_charged",
+    "fees_total",
+    "net_proceeds",
+    "profit",
+    "sale_channel",
+    "sale_notes",
+    "show_id",
+    "show_name",
+    "sold_transaction_id",
+    "sold_created_at",
+    "sold_updated_at",
     "market_price",
     "market_value",
     "market_price_updated_at",
@@ -206,6 +225,13 @@ NUMERIC_INV = [
     "total_cost",
     "market_price",
     "market_value",
+    "list_price",
+    "sold_price",
+    "fees",
+    "shipping_charged",
+    "fees_total",
+    "net_proceeds",
+    "profit",
 ]
 NUMERIC_TX = [
     "list_price",
@@ -251,6 +277,16 @@ HEADER_ALIASES = {
     "status": ["status", "TX Status", "tx_status", "Status", "Show Status"],
     "inventory_status": ["inventory_status", "Inventory Status", "inventoryStatus"],
     "listed_transaction_id": ["listed_transaction_id", "Listed Transaction ID"],
+    "sold_transaction_id": ["sold_transaction_id", "Sold Transaction ID"],
+    "transaction_type": ["transaction_type", "Transaction Type", "listing_type"],
+    "platform": ["platform", "Platform"],
+    "list_date": ["list_date", "List Date"],
+    "list_price": ["list_price", "List Price", "listed_price"],
+    "sold_date": ["sold_date", "Sold Date", "sale_date"],
+    "sold_created_at": ["sold_created_at", "Sold Created At"],
+    "sold_updated_at": ["sold_updated_at", "Sold Updated At"],
+    "sale_channel": ["sale_channel", "Sale Channel", "sales_channel"],
+    "sale_notes": ["sale_notes", "Sale Notes"],
 
     # Inventory / product fields
     "product_type": ["product_type", "Product Type"],
@@ -1155,7 +1191,7 @@ def _build_sales_editor_df(show: pd.Series, snapshots_df: pd.DataFrame, inv_df: 
     base["current_inventory_type"] = base[type_col].apply(_normalize_inventory_type)
 
     base = base[
-        (base["current_status"] == STATUS_ACTIVE)
+        (base["current_status"].isin(SHOW_READY_STATUSES))
         & (base["current_inventory_type"] == "showinventory")
     ].copy()
 
@@ -1558,6 +1594,11 @@ def _tx_row_from_inventory(inv_rec: dict, show: pd.Series, sell_price: float, tx
 
 
 def sync_show_sales(show: pd.Series, edited_sales_df: pd.DataFrame) -> tuple[int, list[str]]:
+    """
+    Sync show sales directly to the inventory sheet.  The inventory row is now
+    the system of record for sold data, so this no longer depends on appending
+    a transactions row for show sales.
+    """
     if edited_sales_df.empty:
         return 0, ["No sales rows found."]
 
@@ -1574,16 +1615,13 @@ def sync_show_sales(show: pd.Series, edited_sales_df: pd.DataFrame) -> tuple[int
 
     spreadsheet_id = st.secrets["spreadsheet_id"]
     inv_ws_name = st.secrets.get("inventory_worksheet", INVENTORY_WS_DEFAULT)
-    tx_ws_name = st.secrets.get("transactions_worksheet", TRANSACTIONS_WS_DEFAULT)
     snap_ws_name = st.secrets.get("show_snapshots_worksheet", SHOW_SNAPSHOTS_WS_DEFAULT)
 
     inv_ws = _get_or_create_ws(spreadsheet_id, inv_ws_name, INV_COLUMNS)
-    tx_ws = _get_or_create_ws(spreadsheet_id, tx_ws_name, TX_COLUMNS)
     snap_ws = _get_or_create_ws(spreadsheet_id, snap_ws_name, SNAPSHOT_COLUMNS)
 
-    inv_headers = _ensure_headers(inv_ws, INV_COLUMNS)
-    tx_headers = _ensure_headers(tx_ws, TX_COLUMNS)
-    snap_headers = _ensure_headers(snap_ws, SNAPSHOT_COLUMNS)
+    _ensure_headers(inv_ws, INV_COLUMNS)
+    _ensure_headers(snap_ws, SNAPSHOT_COLUMNS)
 
     inv_values = _with_backoff(lambda: inv_ws.get_all_values())
     snap_values = _with_backoff(lambda: snap_ws.get_all_values())
@@ -1591,24 +1629,13 @@ def sync_show_sales(show: pd.Series, edited_sales_df: pd.DataFrame) -> tuple[int
     inv_ids = sales["inventory_id"].tolist()
     inv_rownums = _find_rownums_by_id(inv_values, "inventory_id", inv_ids)
 
-    # Existing transactions safety: skip if already SOLD in transactions.
-    try:
-        tx_df = load_transactions_df()
-        existing_sold_ids = set(
-            tx_df[
-                (tx_df["inventory_id"].astype(str).str.strip().isin(inv_ids))
-                & (tx_df["status"].astype(str).str.upper() == TX_STATUS_SOLD)
-            ]["inventory_id"].astype(str).str.strip().tolist()
-        )
-    except Exception:
-        existing_sold_ids = set()
-
-    tx_rows = []
     inv_updates = []
     snapshot_updates = []
     warnings = []
     now_iso = _utc_now_iso()
     show_id = _clean_text(show.get("show_id"))
+    show_name = _clean_text(show.get("show_name"))
+    show_date = _date_str(show.get("show_date")) or str(date.today())
 
     # Build snapshot row lookup by show_id + inventory_id.
     snap_row_lookup = {}
@@ -1621,11 +1648,7 @@ def sync_show_sales(show: pd.Series, edited_sales_df: pd.DataFrame) -> tuple[int
 
     for _, sale in sales.iterrows():
         inv_id = _clean_text(sale.get("inventory_id"))
-        sell_price = _money_float(sale.get("sell_price"))
-
-        if inv_id in existing_sold_ids:
-            warnings.append(f"Skipped {inv_id}: already has a SOLD transaction.")
-            continue
+        sell_price = round(_money_float(sale.get("sell_price")), 2)
 
         inv_rownum = inv_rownums.get(inv_id)
         if not inv_rownum:
@@ -1636,40 +1659,66 @@ def sync_show_sales(show: pd.Series, edited_sales_df: pd.DataFrame) -> tuple[int
         current_status = _normalize_status(inv_rec.get("inventory_status", STATUS_ACTIVE))
         current_type = _normalize_inventory_type(inv_rec.get("inventory_type"))
 
-        if current_status != STATUS_ACTIVE:
-            warnings.append(f"Skipped {inv_id}: inventory status is {current_status}, not ACTIVE.")
+        if current_status == STATUS_SOLD or _money_float(inv_rec.get("sold_price")) > 0:
+            warnings.append(f"Skipped {inv_id}: inventory is already SOLD.")
+            continue
+        if current_status not in SHOW_READY_STATUSES:
+            warnings.append(f"Skipped {inv_id}: inventory status is {current_status}, not ACTIVE/LISTED.")
             continue
         if current_type != "showinventory":
             warnings.append(f"Skipped {inv_id}: Inventory Type is not Show Inventory.")
             continue
 
         tx_id = str(uuid.uuid4())
-        tx_rows.append(_tx_row_from_inventory(inv_rec, show, sell_price, tx_id))
+        all_in_cost = _money_float(inv_rec.get("total_cost"))
+        if all_in_cost <= 0:
+            all_in_cost = round(_money_float(inv_rec.get("total_price")) + _money_float(inv_rec.get("grading_fee")), 2)
+
+        fees = 0.0
+        shipping_charged = 0.0
+        fees_total = 0.0
+        net_proceeds = round(sell_price - fees_total, 2)
+        profit = round(net_proceeds - all_in_cost, 2)
 
         inv_rec["inventory_status"] = STATUS_SOLD
-        inv_rec["listed_transaction_id"] = tx_id
+        inv_rec["listed_transaction_id"] = ""
+        inv_rec["sold_transaction_id"] = tx_id
+        inv_rec["transaction_type"] = ""
+        inv_rec["platform"] = ""
+        inv_rec["list_date"] = ""
+        inv_rec["list_price"] = 0.0
+        inv_rec["sold_date"] = show_date
+        inv_rec["sold_price"] = sell_price
+        inv_rec["fees"] = fees
+        inv_rec["shipping_charged"] = shipping_charged
+        inv_rec["fees_total"] = fees_total
+        inv_rec["net_proceeds"] = net_proceeds
+        inv_rec["profit"] = profit
+        inv_rec["sale_channel"] = "Card Show"
+        inv_rec["sale_notes"] = f"{show_name} | show_id={show_id}" if show_name else f"show_id={show_id}"
+        inv_rec["show_id"] = show_id
+        inv_rec["show_name"] = show_name
+        inv_rec["sold_created_at"] = now_iso
+        inv_rec["sold_updated_at"] = now_iso
         inv_updates.append((inv_rownum, inv_rec))
 
         snap_rownum = snap_row_lookup.get((show_id, inv_id))
         if snap_rownum:
             snap_rec = _row_from_sheet_values(snap_values, snap_rownum)
-            snap_rec["sold_price"] = float(round(sell_price, 2))
+            snap_rec["sold_price"] = sell_price
             snap_rec["synced_at"] = now_iso
             snap_rec["synced_transaction_id"] = tx_id
             snapshot_updates.append((snap_rownum, snap_rec))
 
-    if not tx_rows:
+    if not inv_updates:
         return 0, warnings or ["No valid sales were synced."]
 
-    # Write transactions first, then inventory updates. If inventory update fails, at least
-    # the transaction row exists and can be manually reconciled.
-    _append_rows(tx_ws_name, TX_COLUMNS, tx_rows)
     _batch_update_full_rows(inv_ws_name, INV_COLUMNS, inv_updates)
     if snapshot_updates:
         _batch_update_full_rows(snap_ws_name, SNAPSHOT_COLUMNS, snapshot_updates)
 
     _read_sheet_values_cached.clear()
-    return len(tx_rows), warnings
+    return len(inv_updates), warnings
 
 
 
