@@ -1573,6 +1573,13 @@ with tab_bs:
     # -------------------------
     left, right = st.columns([1.15, 1.0])
 
+    # These totals are reused in Business Summary. For this app, the business
+    # summary is an operating/cash-investment view, not strict accrual P&L.
+    # Therefore unsold inventory cost remains part of total business spend.
+    asset_item_total = 0
+    asset_cost_total = 0.0
+    asset_market_value_total = 0.0
+
     with left:
         st.markdown("### Assets")
 
@@ -1624,18 +1631,18 @@ with tab_bs:
             assets_df = pd.DataFrame(rows, columns=["Inventory", "# of items", "Cost of Goods", "Market Value"])
 
             if not assets_df.empty:
-                total_items = int(len(inv_asof))
-                total_cost = float(inv_asof["__cost"].sum())
-                total_mv = float(inv_asof["__mv"].sum())
+                asset_item_total = int(len(inv_asof))
+                asset_cost_total = float(inv_asof["__cost"].sum())
+                asset_market_value_total = float(inv_asof["__mv"].sum())
 
                 assets_df = pd.concat(
                     [
                         assets_df,
                         pd.DataFrame([{
                             "Inventory": "Totals",
-                            "# of items": total_items,
-                            "Cost of Goods": total_cost,
-                            "Market Value": total_mv,
+                            "# of items": asset_item_total,
+                            "Cost of Goods": asset_cost_total,
+                            "Market Value": asset_market_value_total,
                         }])
                     ],
                     ignore_index=True
@@ -1866,16 +1873,27 @@ with tab_bs:
 
         st.markdown("### Business Summary")
 
-        # Business summary is accrual-style for the selected sales period:
-        # expenses tied to sold items are COGS + selling fees. Inventory purchases
-        # that are still unsold stay in Assets, not Profit/Loss. Misc expenses are
-        # added separately by expense date.
+        # Business summary is an operating/cash-investment view for the selected
+        # period/as-of date. It intentionally includes both:
+        #   1) inventory still held as an asset, and
+        #   2) cost of goods for items sold in the selected sales period.
+        # This matches how the business owner wants to see total money tied up
+        # or spent by the business: inventory cost + grading cost + fees + misc.
         misc_spend = float(misc_f["__amount"].sum()) if not misc_f.empty else 0.0
 
         summary_rows = []
         sales_total_summary = 0.0
         cogs_total_summary = 0.0
         fees_total_summary = 0.0
+
+        if asset_cost_total > 0 or asset_item_total > 0:
+            summary_rows.append([
+                "Inventory Held / Assets",
+                asset_cost_total,
+                0.0,
+                0.0,
+                -asset_cost_total,
+            ])
 
         for ct in ["Sports", "Pokemon"]:
             if not txn_f.empty:
@@ -1925,12 +1943,12 @@ with tab_bs:
             sales_total_summary += sales_ct
             cogs_total_summary += cogs_ct
             fees_total_summary += fees_ct
-            summary_rows.append([ct, cogs_ct + fees_ct, sales_ct, fees_ct, profit_ct])
+            summary_rows.append([f"Sold COGS + Fees — {ct}", cogs_ct + fees_ct, sales_ct, fees_ct, profit_ct])
 
         if misc_spend > 0:
             summary_rows.append(["Misc / Other", misc_spend, 0.0, 0.0, -misc_spend])
 
-        total_expenses = cogs_total_summary + fees_total_summary + misc_spend
+        total_expenses = asset_cost_total + cogs_total_summary + fees_total_summary + misc_spend
         totals_pl = sales_total_summary - total_expenses
         summary_rows.append(["Totals", total_expenses, sales_total_summary, fees_total_summary, totals_pl])
 
