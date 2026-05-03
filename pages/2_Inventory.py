@@ -98,6 +98,7 @@ DEFAULT_COLUMNS = [
     "total_price",             # purchase + shipping + tax
     "grading_fee",             # sourced from grading sheet when available
     "total_cost",              # total_price + grading_fee
+    "sticker_price",           # current sticker price for show pricing
     "condition",               # raw card condition; sealed="Sealed"; graded="Graded"
     "notes",
     "created_at",
@@ -135,6 +136,7 @@ NUMERIC_COLS = [
     "total_price",
     "grading_fee",
     "total_cost",
+    "sticker_price",
     "market_price",
     "market_value",
     "list_price",
@@ -151,6 +153,7 @@ HEADER_ALIASES = {
     "product_type": ["product_type", "Product Type"],
     "sealed_product_type": ["sealed_product_type", "Sealed Product Type"],
     "inventory_type": ["inventory_type", "Inventory Type"],
+    "sticker_price": ["sticker_price", "Sticker Price"],
     "transaction_type": ["transaction_type", "Transaction Type", "listing_type"],
     "platform": ["platform", "Platform"],
     "list_date": ["list_date", "List Date"],
