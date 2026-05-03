@@ -388,6 +388,7 @@ def build_transaction_migration_plan(overwrite_existing: bool = False) -> tuple[
 
         plan_rows.append({
             "source": "transactions",
+            "update_type": "sale",
             "inventory_id": inv_id,
             "sheet_row": int(inv_by_id[inv_id] + 2),
             "transaction_id": _clean(tx.get("transaction_id")),
@@ -412,7 +413,13 @@ def build_transaction_migration_plan(overwrite_existing: bool = False) -> tuple[
     return pd.DataFrame(plan_rows), warnings
 
 
-def build_snapshot_sales_migration_plan(overwrite_existing: bool = False, sold_date_source: str = "synced_at") -> tuple[pd.DataFrame, list[str]]:
+def build_snapshot_sales_migration_plan(
+    overwrite_existing: bool = False,
+    sold_date_source: str = "synced_at",
+    manual_show_name: str = "",
+    manual_show_id: str = "",
+    manual_sold_date: str = "",
+) -> tuple[pd.DataFrame, list[str]]:
     inv_ws_name = st.secrets.get("inventory_worksheet", INVENTORY_WS_DEFAULT)
     snap_ws_name = st.secrets.get("show_snapshots_worksheet", SHOW_SNAPSHOTS_WS_DEFAULT)
 
@@ -467,12 +474,19 @@ def build_snapshot_sales_migration_plan(overwrite_existing: bool = False, sold_d
         net = sp
         profit = net - total_cost
 
-        sold_date = _date_str(snap.get("synced_at")) if sold_date_source == "synced_at" else _date_str(snap.get("show_date"))
-        if not sold_date:
-            sold_date = _date_str(snap.get("show_date")) or _date_str(snap.get("synced_at"))
+        if manual_sold_date:
+            sold_date = _date_str(manual_sold_date)
+        else:
+            sold_date = _date_str(snap.get("synced_at")) if sold_date_source == "synced_at" else _date_str(snap.get("show_date"))
+            if not sold_date:
+                sold_date = _date_str(snap.get("show_date")) or _date_str(snap.get("synced_at"))
+
+        final_show_id = _clean(manual_show_id) or _clean(snap.get("show_id"))
+        final_show_name = _clean(manual_show_name) or _clean(snap.get("show_name"))
 
         plan_rows.append({
             "source": "show_inventory_snapshots",
+            "update_type": "sale",
             "inventory_id": inv_id,
             "sheet_row": int(inv_by_id[inv_id] + 2),
             "transaction_id": _clean(snap.get("synced_transaction_id")) or _clean(snap.get("snapshot_id")),
@@ -489,43 +503,176 @@ def build_snapshot_sales_migration_plan(overwrite_existing: bool = False, sold_d
             "profit": profit,
             "sale_channel": "Card Show",
             "sale_notes": "Migrated from show_inventory_snapshots",
-            "show_id": _clean(snap.get("show_id")),
-            "show_name": _clean(snap.get("show_name")),
+            "show_id": final_show_id,
+            "show_name": final_show_name,
             "sticker_price": _money(snap.get("sticker_price")) if "sticker_price" in snap.index else "",
         })
 
     return pd.DataFrame(plan_rows), warnings
 
 
-def build_combined_plan(*, include_transactions: bool, include_snapshots: bool, overwrite_existing: bool, snapshot_sold_date_source: str) -> tuple[pd.DataFrame, list[str]]:
-    plans = []
+
+
+def build_snapshot_sticker_price_plan(overwrite_existing_sticker: bool = False) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Copy non-zero sticker prices from the old show_inventory_snapshots worksheet
+    into inventory.sticker_price. This is intentionally separate from sold-row
+    migration because many unsold rows still have valid sticker prices.
+    """
+    inv_ws_name = st.secrets.get("inventory_worksheet", INVENTORY_WS_DEFAULT)
+    snap_ws_name = st.secrets.get("show_snapshots_worksheet", SHOW_SNAPSHOTS_WS_DEFAULT)
+
+    inv_ws = get_ws(inv_ws_name)
+    snap_ws = get_ws_optional(snap_ws_name)
+    ensure_inventory_sale_headers(inv_ws)
+
+    warnings = []
+    if snap_ws is None:
+        return pd.DataFrame(), [f"Snapshot worksheet '{snap_ws_name}' was not found."]
+
+    inv_df, _ = _values_to_df(_with_backoff(lambda: inv_ws.get_all_values()))
+    snap_df, _ = _values_to_df(_with_backoff(lambda: snap_ws.get_all_values()))
+
+    if inv_df.empty:
+        return pd.DataFrame(), ["Inventory sheet is empty."]
+    if snap_df.empty:
+        return pd.DataFrame(), ["Snapshot sheet is empty."]
+    if "inventory_id" not in inv_df.columns:
+        return pd.DataFrame(), ["Inventory sheet does not have inventory_id."]
+    if "inventory_id" not in snap_df.columns:
+        return pd.DataFrame(), ["Snapshot sheet does not have inventory_id."]
+    if "sticker_price" not in snap_df.columns:
+        return pd.DataFrame(), ["Snapshot sheet does not have sticker_price."]
+
+    snap_df["inventory_id"] = snap_df["inventory_id"].astype(str).str.strip()
+    snap_df["sticker_price_num"] = snap_df["sticker_price"].apply(_money)
+    snap_df = snap_df[(snap_df["inventory_id"] != "") & (snap_df["sticker_price_num"] > 0)].copy()
+    if snap_df.empty:
+        return pd.DataFrame(), ["No snapshot rows with sticker_price > 0 were found."]
+
+    # Pick the newest non-zero sticker price per inventory_id. Zero/blank rows from
+    # a later auto-generated snapshot will not wipe out real sticker prices.
+    snap_df["__snapshot_dt"] = pd.to_datetime(snap_df.get("snapshot_created_at", ""), errors="coerce")
+    snap_df["__show_dt"] = pd.to_datetime(snap_df.get("show_date", ""), errors="coerce")
+    snap_df["__row_order"] = range(len(snap_df))
+    snap_df = (
+        snap_df.sort_values(["inventory_id", "__snapshot_dt", "__show_dt", "__row_order"], na_position="last")
+        .drop_duplicates("inventory_id", keep="last")
+    )
+
+    inv_by_id = _inventory_lookup(inv_df)
+    plan_rows = []
+    for _, snap in snap_df.iterrows():
+        inv_id = _clean(snap.get("inventory_id"))
+        if inv_id not in inv_by_id:
+            warnings.append(f"Skipped sticker price for {inv_id}: no matching inventory row.")
+            continue
+
+        inv_row = inv_df.loc[inv_by_id[inv_id]]
+        existing = _money(inv_row.get("sticker_price"))
+        new_price = _money(snap.get("sticker_price"))
+        if existing > 0 and not overwrite_existing_sticker:
+            warnings.append(f"Skipped sticker price for {inv_id}: inventory already has sticker_price {existing:,.2f}.")
+            continue
+
+        plan_rows.append({
+            "source": "show_inventory_snapshots_sticker_prices",
+            "update_type": "sticker_price",
+            "inventory_id": inv_id,
+            "sheet_row": int(inv_by_id[inv_id] + 2),
+            "transaction_id": "",
+            "transaction_type": "",
+            "platform": "",
+            "list_date": "",
+            "list_price": "",
+            "sold_date": "",
+            "sold_price": "",
+            "fees": "",
+            "shipping_charged": "",
+            "fees_total": "",
+            "net_proceeds": "",
+            "profit": "",
+            "sale_channel": "",
+            "sale_notes": "Migrated sticker_price from show_inventory_snapshots",
+            "show_id": _clean(snap.get("show_id")),
+            "show_name": _clean(snap.get("show_name")),
+            "sticker_price": new_price,
+        })
+
+    return pd.DataFrame(plan_rows), warnings
+
+
+def build_combined_plan(
+    *,
+    include_transactions: bool,
+    include_snapshots: bool,
+    include_sticker_prices: bool,
+    overwrite_existing: bool,
+    overwrite_existing_sticker: bool,
+    snapshot_sold_date_source: str,
+    manual_show_name: str = "",
+    manual_show_id: str = "",
+    manual_sold_date: str = "",
+) -> tuple[pd.DataFrame, list[str]]:
+    sale_plans = []
+    sticker_plan = pd.DataFrame()
     warnings = []
 
     if include_transactions:
         p, w = build_transaction_migration_plan(overwrite_existing=overwrite_existing)
         if not p.empty:
-            plans.append(p)
+            sale_plans.append(p)
         warnings.extend(w)
 
     if include_snapshots:
-        p, w = build_snapshot_sales_migration_plan(overwrite_existing=overwrite_existing, sold_date_source=snapshot_sold_date_source)
+        p, w = build_snapshot_sales_migration_plan(
+            overwrite_existing=overwrite_existing,
+            sold_date_source=snapshot_sold_date_source,
+            manual_show_name=manual_show_name,
+            manual_show_id=manual_show_id,
+            manual_sold_date=manual_sold_date,
+        )
         if not p.empty:
-            plans.append(p)
+            sale_plans.append(p)
         warnings.extend(w)
+
+    if include_sticker_prices:
+        sticker_plan, w = build_snapshot_sticker_price_plan(overwrite_existing_sticker=overwrite_existing_sticker)
+        warnings.extend(w)
+
+    combined_sales = pd.DataFrame()
+    if sale_plans:
+        combined_sales = pd.concat(sale_plans, ignore_index=True)
+        # Avoid writing two sale sources to the same inventory row in one run.
+        # Prefer snapshot rows for card-show sales, then transactions.
+        priority = {"show_inventory_snapshots": 1, "transactions": 2}
+        combined_sales["__priority"] = combined_sales["source"].map(priority).fillna(9)
+        combined_sales = combined_sales.sort_values(["inventory_id", "__priority"]).drop_duplicates("inventory_id", keep="first")
+        combined_sales = combined_sales.drop(columns=["__priority"])
+
+    # If an inventory row has both a sale migration and a sticker migration, merge
+    # the non-zero sticker price into the sale row so we only update the row once.
+    if not combined_sales.empty and not sticker_plan.empty:
+        sticker_map = dict(zip(sticker_plan["inventory_id"].astype(str), sticker_plan["sticker_price"]))
+        combined_sales["sticker_price"] = combined_sales.apply(
+            lambda r: sticker_map.get(str(r.get("inventory_id", "")), r.get("sticker_price", ""))
+            if _money(sticker_map.get(str(r.get("inventory_id", "")), 0)) > 0
+            else r.get("sticker_price", ""),
+            axis=1,
+        )
+        used_ids = set(combined_sales["inventory_id"].astype(str))
+        sticker_plan = sticker_plan[~sticker_plan["inventory_id"].astype(str).isin(used_ids)].copy()
+
+    plans = []
+    if not combined_sales.empty:
+        plans.append(combined_sales)
+    if not sticker_plan.empty:
+        plans.append(sticker_plan)
 
     if not plans:
         return pd.DataFrame(), warnings
 
-    combined = pd.concat(plans, ignore_index=True)
-
-    # Avoid writing two sources to the same inventory row in one run.
-    # Prefer snapshot rows for card-show sales, then transactions.
-    priority = {"show_inventory_snapshots": 1, "transactions": 2}
-    combined["__priority"] = combined["source"].map(priority).fillna(9)
-    combined = combined.sort_values(["inventory_id", "__priority"]).drop_duplicates("inventory_id", keep="first")
-    combined = combined.drop(columns=["__priority"])
-    return combined, warnings
-
+    return pd.concat(plans, ignore_index=True), warnings
 
 def run_migration(plan: pd.DataFrame, *, backup_transactions: bool = False, backup_snapshots: bool = True, clean_tx_headers: bool = False):
     if plan.empty:
@@ -540,7 +687,7 @@ def run_migration(plan: pd.DataFrame, *, backup_transactions: bool = False, back
 
     if backup_transactions and "transactions" in set(plan["source"]):
         backups.append(backup_ws(tx_ws_name, "backup_transactions_before_sales_migration"))
-    if backup_snapshots and "show_inventory_snapshots" in set(plan["source"]):
+    if backup_snapshots and any(str(x).startswith("show_inventory_snapshots") for x in set(plan["source"])):
         snap_ws = get_ws_optional(snap_ws_name)
         if snap_ws is not None:
             backups.append(backup_ws(snap_ws_name, "backup_snapshots_before_inventory_migration"))
@@ -561,20 +708,28 @@ def run_migration(plan: pd.DataFrame, *, backup_transactions: bool = False, back
         rownum = int(r["sheet_row"])
         raw_vals = inv_values[rownum - 1] if len(inv_values) >= rownum else []
         rec = _row_to_internal(inv_headers, raw_vals)
-        rec["inventory_status"] = STATUS_SOLD
-        rec["sold_transaction_id"] = _clean(r.get("transaction_id"))
-        for col in [
-            "transaction_type", "platform", "list_date", "list_price", "sold_date", "sold_price",
-            "fees", "shipping_charged", "fees_total", "net_proceeds", "profit", "sale_channel",
-            "sale_notes", "show_id", "show_name", "sticker_price",
-        ]:
-            val = r.get(col, "")
-            if col == "sticker_price" and (val == "" or _money(val) <= 0):
+        update_type = _clean(r.get("update_type")) or "sale"
+
+        if update_type == "sticker_price":
+            sticker_val = _money(r.get("sticker_price"))
+            if sticker_val <= 0:
                 continue
-            rec[col] = val
-        rec["sold_updated_at"] = now_iso
-        if not _clean(rec.get("sold_created_at")):
-            rec["sold_created_at"] = now_iso
+            rec["sticker_price"] = sticker_val
+        else:
+            rec["inventory_status"] = STATUS_SOLD
+            rec["sold_transaction_id"] = _clean(r.get("transaction_id"))
+            for col in [
+                "transaction_type", "platform", "list_date", "list_price", "sold_date", "sold_price",
+                "fees", "shipping_charged", "fees_total", "net_proceeds", "profit", "sale_channel",
+                "sale_notes", "show_id", "show_name", "sticker_price",
+            ]:
+                val = r.get(col, "")
+                if col == "sticker_price" and (val == "" or _money(val) <= 0):
+                    continue
+                rec[col] = val
+            rec["sold_updated_at"] = now_iso
+            if not _clean(rec.get("sold_created_at")):
+                rec["sold_created_at"] = now_iso
 
         batch.append({
             "range": f"A{rownum}:{last_col}{rownum}",
@@ -615,26 +770,48 @@ with st.expander("Migration options", expanded=True):
     c1, c2 = st.columns(2)
     with c1:
         include_snapshots = st.checkbox("Migrate show sales from show_inventory_snapshots", value=True)
+        include_sticker_prices = st.checkbox("Migrate non-zero sticker prices from show_inventory_snapshots", value=True)
         include_transactions = st.checkbox("Also migrate SOLD rows from transactions", value=False)
         overwrite = st.checkbox("Overwrite inventory rows that already have sold data", value=False)
+        overwrite_stickers = st.checkbox("Overwrite inventory rows that already have sticker_price", value=True)
     with c2:
         sold_date_choice = st.selectbox(
             "For snapshot show sales, write sold_date from",
             options=[
-                "synced_at date (recommended if the old show_date was wrong)",
-                "show_date",
+                "manual show date override",
+                "synced_at date",
+                "show_date from old snapshot",
             ],
             index=0,
         )
         snapshot_sold_date_source = "synced_at" if sold_date_choice.startswith("synced_at") else "show_date"
         clean_dupes = st.checkbox("Also remove blank duplicate transaction header columns (optional)", value=False)
 
+    st.markdown("#### Manual correction for bad snapshot show assignment")
+    st.caption("Use this when old snapshot rows show the wrong event, like Sand Mountain on 2026-05-09 when the sales were actually from the 2026-05-02 show.")
+    oc1, oc2, oc3 = st.columns([2.5, 1.2, 1.2])
+    with oc1:
+        manual_show_name = st.text_input("Correct show name for migrated snapshot sales", value="TCTC Monthly Trading & Sports Card Showcase")
+    with oc2:
+        manual_sold_date_val = st.date_input("Correct sold/show date", value=pd.to_datetime("2026-05-02").date())
+    with oc3:
+        manual_show_id = st.text_input("Correct show_id (optional)", value="")
+
+    manual_sold_date = str(manual_sold_date_val) if sold_date_choice.startswith("manual") else ""
+    manual_show_name_to_use = manual_show_name.strip() if manual_show_name.strip() else ""
+    manual_show_id_to_use = manual_show_id.strip() if manual_show_id.strip() else ""
+
 if st.button("Preview Migration", use_container_width=True):
     plan, warnings = build_combined_plan(
         include_transactions=include_transactions,
         include_snapshots=include_snapshots,
+        include_sticker_prices=include_sticker_prices,
         overwrite_existing=overwrite,
+        overwrite_existing_sticker=overwrite_stickers,
         snapshot_sold_date_source=snapshot_sold_date_source,
+        manual_show_name=manual_show_name_to_use if include_snapshots else "",
+        manual_show_id=manual_show_id_to_use if include_snapshots else "",
+        manual_sold_date=manual_sold_date if include_snapshots else "",
     )
     st.session_state["migration_plan"] = plan
     st.session_state["migration_warnings"] = warnings
@@ -656,7 +833,7 @@ if isinstance(plan, pd.DataFrame) and not plan.empty:
         if c in preview.columns:
             preview[c] = preview[c].apply(lambda x: f"${float(_money(x)):,.2f}" if _clean(x) != "" else "")
     display_cols = [
-        "source", "inventory_id", "sold_date", "sold_price", "sale_channel", "show_name",
+        "source", "update_type", "inventory_id", "sold_date", "sold_price", "sale_channel", "show_name",
         "show_id", "profit", "sticker_price", "sheet_row", "transaction_id",
     ]
     display_cols = [c for c in display_cols if c in preview.columns]
