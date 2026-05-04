@@ -283,24 +283,49 @@ def get_grading_worksheet():
     return None
 
 
+def _default_sheet_headers() -> list[str]:
+    sheet_headers = []
+    for internal in DEFAULT_COLUMNS:
+        if internal == "product_type":
+            sheet_headers.append("Product Type")
+        elif internal == "sealed_product_type":
+            sheet_headers.append("Sealed Product Type")
+        elif internal == "inventory_type":
+            sheet_headers.append("Inventory Type")
+        else:
+            sheet_headers.append(internal)
+    return sheet_headers
+
+
+def _dedupe_headers_for_dataframe(headers: list[str]) -> list[str]:
+    """Return unique dataframe-safe headers while preserving the original names as much as possible.
+
+    Google Sheets itself can contain duplicate headers, but gspread.get_all_records()
+    refuses to read sheets with duplicate headers.  The Inventory page therefore
+    reads raw values and applies temporary __dup suffixes only inside pandas.
+    """
+    counts = {}
+    out = []
+    for i, h in enumerate(headers, start=1):
+        base = str(h or "").strip() or f"unnamed_col_{i}"
+        counts[base] = counts.get(base, 0) + 1
+        out.append(base if counts[base] == 1 else f"{base}__dup{counts[base]}")
+    return out
+
+
+def _strip_dup_suffix(h: str) -> str:
+    return re.sub(r"__dup\d+$", "", str(h or "").strip())
+
+
 def ensure_headers(ws):
     first_row = ws.row_values(1)
     if not first_row:
-        sheet_headers = []
-        for internal in DEFAULT_COLUMNS:
-            if internal == "product_type":
-                sheet_headers.append("Product Type")
-            elif internal == "sealed_product_type":
-                sheet_headers.append("Sealed Product Type")
-            elif internal == "inventory_type":
-                sheet_headers.append("Inventory Type")
-            else:
-                sheet_headers.append(internal)
+        sheet_headers = _default_sheet_headers()
         ws.append_row(sheet_headers)
         return sheet_headers
 
-    existing = first_row
-    existing_internal = set(sheet_header_to_internal(h) for h in existing)
+    existing = [str(h or "").strip() for h in first_row]
+    existing_internal = set(sheet_header_to_internal(_strip_dup_suffix(h)) for h in existing if str(h).strip())
 
     missing_internal = [h for h in DEFAULT_COLUMNS if h not in existing_internal]
     if missing_internal:
@@ -1026,18 +1051,63 @@ def compute_market_price_for_row(reference_link: str, product_type: str, grade: 
 # SHEETS LOAD/SAVE
 # =========================================================
 
+def _read_inventory_values_as_df(ws) -> pd.DataFrame:
+    """Read inventory without gspread.get_all_records().
+
+    get_all_records() crashes when the sheet has duplicate headers.  Your sheet can
+    get duplicate headers after schema migrations, so this raw-value reader makes
+    headers unique temporarily, renames them to internal names, and coalesces
+    duplicate internal columns by taking the first nonblank value across duplicates.
+    """
+    values = ws.get_all_values()
+    if not values or not values[0]:
+        return pd.DataFrame(columns=DEFAULT_COLUMNS)
+
+    raw_headers = [str(h or "").strip() for h in values[0]]
+    safe_headers = _dedupe_headers_for_dataframe(raw_headers)
+    rows = []
+    for row in values[1:]:
+        if len(row) < len(safe_headers):
+            row = row + [""] * (len(safe_headers) - len(row))
+        elif len(row) > len(safe_headers):
+            row = row[:len(safe_headers)]
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=DEFAULT_COLUMNS)
+
+    df = pd.DataFrame(rows, columns=safe_headers)
+    df = df.rename(columns={c: sheet_header_to_internal(_strip_dup_suffix(c)) for c in df.columns})
+
+    # Coalesce duplicate internal columns safely. This handles repeated headers like
+    # sale_notes, sold_transaction_id, sold_updated_at, listed_transaction_id, etc.
+    if df.columns.duplicated().any():
+        new_df = pd.DataFrame(index=df.index)
+        for col in pd.unique(df.columns):
+            same = df.loc[:, df.columns == col]
+            if same.shape[1] == 1:
+                new_df[col] = same.iloc[:, 0]
+            else:
+                combined = same.iloc[:, 0].astype(str)
+                combined = combined.where(combined.str.strip() != "", "")
+                for i in range(1, same.shape[1]):
+                    s = same.iloc[:, i].astype(str)
+                    s = s.where(s.str.strip() != "", "")
+                    combined = combined.where(combined.str.strip() != "", s)
+                new_df[col] = combined
+        df = new_df
+
+    return df
+
+
 def sheets_load_inventory() -> pd.DataFrame:
     ws = get_worksheet()
     ensure_headers(ws)
 
-    records = ws.get_all_records()
-    df = pd.DataFrame(records)
+    df = _read_inventory_values_as_df(ws)
 
     if df.empty:
         df = pd.DataFrame(columns=DEFAULT_COLUMNS)
-
-    # rename sheet headers -> internal names
-    df = df.rename(columns={c: sheet_header_to_internal(c) for c in df.columns})
 
     # ensure expected columns exist
     for col in DEFAULT_COLUMNS:
@@ -1112,19 +1182,12 @@ def sheets_load_inventory() -> pd.DataFrame:
             df[c] = 0.0
         df[c] = _coerce_money_series(df[c])
 
-    # If fees_total / net / profit are blank but a sold price exists, compute them.
-    df["fees_total"] = df["fees_total"].where(
-        df["fees_total"] > 0,
-        (_coerce_money_series(df["fees"]) + _coerce_money_series(df["shipping_charged"])).round(2),
-    )
-    df["net_proceeds"] = df["net_proceeds"].where(
-        df["net_proceeds"] != 0,
-        (_coerce_money_series(df["sold_price"]) - _coerce_money_series(df["fees_total"])).round(2),
-    )
-    df["profit"] = df["profit"].where(
-        df["profit"] != 0,
-        (_coerce_money_series(df["net_proceeds"]) - _coerce_money_series(df["total_cost"])).round(2),
-    )
+    # Always compute the displayed sale math from the source fields.  Older
+    # migrations wrote profit equal to sold_price for show sales, so do not trust
+    # stored net/profit values when loading inventory.
+    df["fees_total"] = (_coerce_money_series(df["fees"]) + _coerce_money_series(df["shipping_charged"])).round(2)
+    df["net_proceeds"] = (_coerce_money_series(df["sold_price"]) - _coerce_money_series(df["fees_total"])).round(2)
+    df["profit"] = (df["net_proceeds"] - _coerce_money_series(df["total_cost"])).round(2)
 
     # normalize defaults
     df["product_type"] = df["product_type"].replace("", "Card").fillna("Card")
@@ -2108,23 +2171,6 @@ with tab_list:
             - _coerce_money_series(filtered["total_cost"])
         ).round(2)
 
-        # Recalculate sold math for display. Stored net/profit values may be stale
-        # from earlier migrations, so derive them from first principles.
-        for c in ["sold_price", "fees", "shipping_charged", "fees_total"]:
-            if c not in filtered.columns:
-                filtered[c] = 0.0
-            filtered[c] = _coerce_money_series(filtered[c])
-        filtered["fees_total"] = filtered["fees_total"].where(
-            filtered["fees_total"] > 0,
-            (_coerce_money_series(filtered["fees"]) + _coerce_money_series(filtered["shipping_charged"])).round(2),
-        )
-        filtered["net_proceeds"] = (
-            _coerce_money_series(filtered["sold_price"]) - _coerce_money_series(filtered["fees_total"])
-        ).round(2)
-        filtered["profit"] = (
-            _coerce_money_series(filtered["net_proceeds"]) - _coerce_money_series(filtered["total_cost"])
-        ).round(2)
-
         # enforce condition invariants for display
         filtered = filtered.copy()
         filtered.loc[filtered["product_type"] == "Sealed", "condition"] = "Sealed"
@@ -2326,13 +2372,14 @@ with tab_list:
                 updated_full["fees_total"] > 0,
                 (_coerce_money_series(updated_full["fees"]) + _coerce_money_series(updated_full["shipping_charged"])).round(2),
             )
-            # Always recalculate sold math on save.
-            updated_full["net_proceeds"] = (
-                _coerce_money_series(updated_full["sold_price"]) - _coerce_money_series(updated_full["fees_total"])
-            ).round(2)
-            updated_full["profit"] = (
-                _coerce_money_series(updated_full["net_proceeds"]) - _coerce_money_series(updated_full["total_cost"])
-            ).round(2)
+            updated_full["net_proceeds"] = updated_full["net_proceeds"].where(
+                updated_full["net_proceeds"] != 0,
+                (_coerce_money_series(updated_full["sold_price"]) - _coerce_money_series(updated_full["fees_total"])).round(2),
+            )
+            updated_full["profit"] = updated_full["profit"].where(
+                updated_full["profit"] != 0,
+                (_coerce_money_series(updated_full["net_proceeds"]) - _coerce_money_series(updated_full["total_cost"])).round(2),
+            )
 
             updated_full["condition"] = updated_full["condition"].astype(str)
             updated_full.loc[updated_full["product_type"] == "Sealed", "condition"] = "Sealed"
