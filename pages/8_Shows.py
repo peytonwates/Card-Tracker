@@ -305,58 +305,10 @@ def _normalize_channel(x) -> str:
 
 
 def _normalize_show_key(x) -> str:
-    """Stable show-name matcher: lower-case, remove punctuation, collapse spaces."""
+    """Stable comparison key for show names. Keeps words separated so similar names do not accidentally collide."""
     s = _clean_text(x).lower()
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def _money_col(df: pd.DataFrame, col: str) -> pd.Series:
-    """Return a numeric money Series even when the column is missing."""
-    if col in df.columns:
-        return _coerce_money_series(df[col])
-    return pd.Series(0.0, index=df.index, dtype=float)
-
-
-def _add_sale_calc_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add calculated sale columns and DO NOT trust the stored profit column.
-
-    The inventory sheet can have old/migrated profit values. For show reporting,
-    always calculate from current sale fields:
-      sales = sold_price
-      fees = fees_total if populated, otherwise fees
-      cost = total_cost if populated, otherwise total_price + grading_fee
-      profit = sales - fees - cost
-    """
-    out = df.copy()
-    if out.empty:
-        for c in ["sold_price_calc", "fees_calc", "net_proceeds_calc", "cost_calc", "profit_calc"]:
-            out[c] = pd.Series(dtype=float)
-        return out
-
-    sold_price = _money_col(out, "sold_price")
-    fees_total = _money_col(out, "fees_total")
-    fees = _money_col(out, "fees")
-    fees_calc = fees_total.where(fees_total > 0, fees)
-
-    purchase_price = _money_col(out, "purchase_price")
-    shipping = _money_col(out, "shipping")
-    tax = _money_col(out, "tax")
-    total_price = _money_col(out, "total_price")
-    grading_fee = _money_col(out, "grading_fee")
-    total_cost = _money_col(out, "total_cost")
-
-    total_price_calc = total_price.where(total_price > 0, purchase_price + shipping + tax)
-    cost_calc = total_cost.where(total_cost > 0, total_price_calc + grading_fee)
-    net_calc = sold_price - fees_calc
-
-    out["sold_price_calc"] = sold_price.round(2)
-    out["fees_calc"] = fees_calc.round(2)
-    out["net_proceeds_calc"] = net_calc.round(2)
-    out["cost_calc"] = cost_calc.round(2)
-    out["profit_calc"] = (net_calc - cost_calc).round(2)
-    return out
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 # =========================================================
@@ -534,15 +486,23 @@ def load_inventory_df() -> pd.DataFrame:
     df["inventory_status"] = df["inventory_status"].replace("", STATUS_ACTIVE).fillna(STATUS_ACTIVE)
     df["inventory_type"] = df["inventory_type"].astype(str).str.strip()
 
-    df["total_price"] = (
+    # IMPORTANT:
+    # Do NOT overwrite the sheet's Total Cost when it already exists.
+    # The Show Performance tab should use the inventory row's Total Cost as the cost basis.
+    existing_total_price = _coerce_money_series(df["total_price"])
+    calculated_total_price = (
         _coerce_money_series(df["purchase_price"])
         + _coerce_money_series(df["shipping"])
         + _coerce_money_series(df["tax"])
     ).round(2)
-    df["total_cost"] = (
+    df["total_price"] = existing_total_price.where(existing_total_price > 0, calculated_total_price).round(2)
+
+    existing_total_cost = _coerce_money_series(df["total_cost"])
+    calculated_total_cost = (
         _coerce_money_series(df["total_price"])
         + _coerce_money_series(df["grading_fee"])
     ).round(2)
+    df["total_cost"] = existing_total_cost.where(existing_total_cost > 0, calculated_total_cost).round(2)
 
     df["market_value_resolved"] = _coerce_money_series(df["market_value"])
     fallback_market = _coerce_money_series(df["market_price"])
@@ -722,17 +682,38 @@ def get_unsold_inventory_for_show(show: pd.Series | dict, inv_df: pd.DataFrame) 
     ].copy()
 
 
+def _add_calculated_sale_metrics(sales_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add report-only calculated sales fields.
+
+    Show Performance should NOT trust the stored profit/net_proceeds columns because
+    old migrated/synced rows can contain stale values. For show performance:
+      total_sales = sum(sold_price)
+      cost_sold   = sum(total_cost)
+      profit      = total_sales - cost_sold
+    """
+    if sales_df.empty:
+        return sales_df.copy()
+
+    df = sales_df.copy()
+    for c in ["sold_price", "total_cost"]:
+        if c not in df.columns:
+            df[c] = 0.0
+
+    df["sold_price_num"] = _coerce_money_series(df["sold_price"])
+    df["total_cost_num"] = _coerce_money_series(df["total_cost"])
+    df["calculated_profit"] = (df["sold_price_num"] - df["total_cost_num"]).round(2)
+    return df
+
+
 def get_sales_for_show(show: pd.Series | dict, inv_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Return sale rows for one show.
+    Return ONLY the inventory rows sold for the selected show.
 
-    Important fix:
-    - Match by show_id OR by (show_name + show_date).
-    - Only use date/channel fallback for truly unassigned migrated rows where
-      show_id and show_name are blank.
-
-    This prevents a later show from accidentally pulling prior show sales just
-    because those rows share the same sold_date or sale_channel.
+    Matching rules are intentionally strict to prevent one show's sales from rolling into another:
+    1) If the inventory sale row has show_id, it must equal this show's show_id.
+    2) Older rows with blank show_id may match by exact show_name + sold_date = show_date.
+    3) No date-only fallback. Date-only matching caused cross-show totals.
     """
     if inv_df.empty or show is None:
         return pd.DataFrame(columns=INV_COLUMNS)
@@ -746,39 +727,28 @@ def get_sales_for_show(show: pd.Series | dict, inv_df: pd.DataFrame) -> pd.DataF
     df["sold_date_norm"] = df["sold_date"].apply(_date_str)
     df["show_id_norm"] = df["show_id"].astype(str).str.strip()
     df["show_name_key"] = df["show_name"].apply(_normalize_show_key)
-    df["channel_norm"] = df["sale_channel"].apply(_normalize_channel)
 
     sold = df[df["sold_price_num"] > 0].copy()
     if sold.empty:
-        return _add_sale_calc_columns(sold)
+        return _add_calculated_sale_metrics(sold)
 
-    id_mask = pd.Series(False, index=sold.index)
+    match = pd.Series(False, index=sold.index)
+
     if show_id:
-        id_mask = sold["show_id_norm"] == show_id
+        match = match | sold["show_id_norm"].eq(show_id)
 
-    name_date_mask = pd.Series(False, index=sold.index)
-    if show_name_key:
-        name_date_mask = sold["show_name_key"] == show_name_key
-        # Avoid mixing recurring shows with the same name on different dates.
-        if show_date:
-            name_date_mask = name_date_mask & (sold["sold_date_norm"] == show_date)
+    # Fallback only for older/migrated sales rows where show_id was not written.
+    # Require show_name AND sold_date to match so recurring shows do not get combined.
+    if show_name_key and show_date:
+        legacy_name_date_match = (
+            sold["show_id_norm"].eq("")
+            & sold["show_name_key"].eq(show_name_key)
+            & sold["sold_date_norm"].eq(show_date)
+        )
+        match = match | legacy_name_date_match
 
-    matched = sold[id_mask | name_date_mask].copy()
-    if not matched.empty:
-        return _add_sale_calc_columns(matched)
+    return _add_calculated_sale_metrics(sold[match].copy())
 
-    # Last-resort fallback only for migrated rows that have no show identity.
-    # Do NOT pull rows already assigned to another show by id/name.
-    if show_date:
-        fallback = sold[
-            (sold["show_id_norm"] == "")
-            & (sold["show_name_key"] == "")
-            & (sold["channel_norm"].str.contains("cardshow|show", regex=True))
-            & (sold["sold_date_norm"] == show_date)
-        ].copy()
-        return _add_sale_calc_columns(fallback)
-
-    return _add_sale_calc_columns(pd.DataFrame(columns=INV_COLUMNS))
 
 def _build_show_select_labels(shows_df: pd.DataFrame, *, exclude_cancelled: bool = True) -> tuple[list[str], dict[str, str]]:
     if shows_df.empty:
@@ -986,21 +956,34 @@ def _show_sales_all(inv_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_show_summary(shows_df: pd.DataFrame, inv_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build one summary row per show.
+
+    Show sales math is intentionally simple:
+      total_sales = sum(inventory.sold_price for that show)
+      cost_sold   = sum(inventory.total_cost for those sold rows)
+      profit      = total_sales - cost_sold
+    """
     rows = []
+    if shows_df.empty:
+        return pd.DataFrame(rows)
 
     for _, show in shows_df.iterrows():
         inv_at_show = get_inventory_at_show(show, inv_df)
         sales = get_sales_for_show(show, inv_df)
-        sales = _add_sale_calc_columns(sales)
 
-        total_cost_start = float(round(_coerce_money_series(inv_at_show.get("total_cost", pd.Series(dtype=float))).sum(), 2)) if not inv_at_show.empty else 0.0
-        market_start = float(round(_coerce_money_series(inv_at_show.get("market_value_resolved", inv_at_show.get("market_value", pd.Series(dtype=float)))).sum(), 2)) if not inv_at_show.empty else 0.0
+        total_cost_start = (
+            float(round(_coerce_money_series(inv_at_show.get("total_cost", pd.Series(dtype=float))).sum(), 2))
+            if not inv_at_show.empty else 0.0
+        )
+        market_start = (
+            float(round(_coerce_money_series(inv_at_show.get("market_value_resolved", inv_at_show.get("market_value", pd.Series(dtype=float)))).sum(), 2))
+            if not inv_at_show.empty else 0.0
+        )
 
-        sales_total = float(round(sales["sold_price_calc"].sum(), 2)) if not sales.empty else 0.0
-        cost_sold = float(round(sales["cost_calc"].sum(), 2)) if not sales.empty else 0.0
-        fees_total = float(round(sales["fees_calc"].sum(), 2)) if not sales.empty else 0.0
-        net_proceeds = float(round(sales["net_proceeds_calc"].sum(), 2)) if not sales.empty else 0.0
-        profit = float(round(sales["profit_calc"].sum(), 2)) if not sales.empty else 0.0
+        sales_total = float(round(sales["sold_price_num"].sum(), 2)) if not sales.empty else 0.0
+        cost_sold = float(round(sales["total_cost_num"].sum(), 2)) if not sales.empty else 0.0
+        profit = float(round(sales_total - cost_sold, 2))
 
         count_start = int(len(inv_at_show))
         count_sold = int(len(sales))
@@ -1016,81 +999,14 @@ def build_show_summary(shows_df: pd.DataFrame, inv_df: pd.DataFrame) -> pd.DataF
             "market_value_at_show": market_start,
             "cards_sold": count_sold,
             "total_sales": sales_total,
-            "fees_total": fees_total,
-            "net_proceeds": net_proceeds,
             "cost_sold": cost_sold,
             "profit": profit,
             "profit_margin": (profit / sales_total) if sales_total else 0.0,
             "sell_through_count": (count_sold / count_start) if count_start else 0.0,
         })
 
-    # Add orphan show sales only when they do not match an existing show by id
-    # or by (show name + sold date). This avoids duplicate rows when show_id was
-    # changed but show_name/date still clearly point to an existing show.
-    known_show_ids = set(shows_df["show_id"].astype(str).str.strip()) if not shows_df.empty else set()
-    known_show_pairs = set()
-    if not shows_df.empty:
-        tmp = shows_df.copy()
-        tmp["show_name_key"] = tmp["show_name"].apply(_normalize_show_key)
-        tmp["show_date_norm"] = tmp["show_date"].apply(_date_str)
-        known_show_pairs = set(
-            zip(
-                tmp["show_name_key"],
-                tmp["show_date_norm"],
-            )
-        )
-
-    sales_all = _show_sales_all(inv_df)
-    if not sales_all.empty:
-        sales_all = _add_sale_calc_columns(sales_all)
-        sales_all["show_id_clean"] = sales_all["show_id"].astype(str).str.strip()
-        sales_all["show_name_key"] = sales_all["show_name"].apply(_normalize_show_key)
-        sales_all["sold_date_norm"] = sales_all["sold_date"].apply(_date_str)
-        sales_all["known_pair"] = list(zip(sales_all["show_name_key"], sales_all["sold_date_norm"]))
-
-        orphans = sales_all[
-            ~sales_all["show_id_clean"].isin(known_show_ids)
-            & ~sales_all["known_pair"].isin(known_show_pairs)
-        ].copy()
-
-        if not orphans.empty:
-            orphans["show_key"] = orphans["show_id_clean"].where(
-                orphans["show_id_clean"] != "",
-                orphans["show_name"].astype(str).str.strip().where(
-                    orphans["show_name"].astype(str).str.strip() != "",
-                    orphans["sold_date_norm"],
-                ),
-            )
-            for key, g in orphans.groupby("show_key", dropna=False):
-                if not str(key).strip():
-                    continue
-
-                sales_total = float(round(g["sold_price_calc"].sum(), 2))
-                cost_sold = float(round(g["cost_calc"].sum(), 2))
-                fees_total = float(round(g["fees_calc"].sum(), 2))
-                net_proceeds = float(round(g["net_proceeds_calc"].sum(), 2))
-                profit = float(round(g["profit_calc"].sum(), 2))
-
-                rows.append({
-                    "show_id": _clean_text(g["show_id"].iloc[0]),
-                    "show_name": _clean_text(g["show_name"].iloc[0]) or str(key),
-                    "show_date": _date_str(g["sold_date"].iloc[0]),
-                    "location": "",
-                    "status": "Migrated sale only",
-                    "items_at_show": 0,
-                    "cost_at_show": 0.0,
-                    "market_value_at_show": 0.0,
-                    "cards_sold": int(len(g)),
-                    "total_sales": sales_total,
-                    "fees_total": fees_total,
-                    "net_proceeds": net_proceeds,
-                    "cost_sold": cost_sold,
-                    "profit": profit,
-                    "profit_margin": (profit / sales_total) if sales_total else 0.0,
-                    "sell_through_count": 0.0,
-                })
-
     return pd.DataFrame(rows)
+
 
 # =========================================================
 # LOAD DATA
@@ -1391,22 +1307,17 @@ with tab_sales:
 
 with tab_performance:
     st.subheader("Show Performance")
-    st.caption("All numbers are derived from inventory rows. Profit is recalculated as sold_price - fees - total_cost; the stored Profit column is not trusted for reporting.")
+    st.caption("All numbers are derived from inventory rows. No show_inventory_snapshots sheet is used.")
 
     summary = build_show_summary(shows_df, inv_df)
     if summary.empty:
         st.info("No show data yet.")
     else:
         summary_view = summary.copy().sort_values("show_date", ascending=False)
-
-        # Keep these hidden if you do not want them in the table, but they are
-        # useful for checking the math.
-        money_cols = [c for c in ["cost_at_show", "market_value_at_show", "total_sales", "fees_total", "net_proceeds", "cost_sold", "profit"] if c in summary_view.columns]
-        for c in money_cols:
+        for c in ["cost_at_show", "market_value_at_show", "total_sales", "cost_sold", "profit"]:
             summary_view[c] = summary_view[c].apply(_money_display)
         for c in ["profit_margin", "sell_through_count"]:
-            if c in summary_view.columns:
-                summary_view[c] = summary_view[c].apply(lambda x: f"{float(x or 0):.1%}")
+            summary_view[c] = summary_view[c].apply(lambda x: f"{float(x or 0):.1%}")
         st.dataframe(summary_view, use_container_width=True, hide_index=True)
 
         labels, label_to_id = _build_show_select_labels(shows_df, exclude_cancelled=False)
@@ -1414,44 +1325,32 @@ with tab_performance:
             label = st.selectbox("Detail show", labels, key="perf_show_select")
             show = _get_show_by_id(shows_df, label_to_id[label])
             sales = get_sales_for_show(show, inv_df)
-            sales = _add_sale_calc_columns(sales)
 
             st.markdown("### Sales Detail")
             if sales.empty:
                 st.info("No sales recorded for this show yet.")
             else:
-                sales_total = float(round(sales["sold_price_calc"].sum(), 2))
-                cost_sold = float(round(sales["cost_calc"].sum(), 2))
-                fees_total = float(round(sales["fees_calc"].sum(), 2))
-                profit = float(round(sales["profit_calc"].sum(), 2))
-                st.caption(
-                    f"Selected show totals: Sales {_money_display(sales_total)} | "
-                    f"Fees {_money_display(fees_total)} | Cost Sold {_money_display(cost_sold)} | "
-                    f"Profit {_money_display(profit)}"
-                )
-
-                base_cols = ["inventory_id", "card_name", "set_name", "variant", "card_number", "sold_date"]
-                detail_cols = [c for c in base_cols if c in sales.columns]
-                detail = sales[detail_cols].copy()
-                detail["sold_price"] = sales["sold_price_calc"].values
-                detail["fees_total"] = sales["fees_calc"].values
-                detail["total_cost"] = sales["cost_calc"].values
-                detail["profit"] = sales["profit_calc"].values
-
-                for c in ["sold_price", "fees_total", "total_cost", "profit"]:
-                    detail[c] = detail[c].apply(_money_display)
+                sales_calc = _add_calculated_sale_metrics(sales)
+                detail_cols = ["inventory_id", "card_name", "set_name", "variant", "card_number", "sold_date", "sold_price", "total_cost", "calculated_profit"]
+                detail_cols = [c for c in detail_cols if c in sales_calc.columns]
+                detail = sales_calc[detail_cols].copy()
+                detail = detail.rename(columns={"calculated_profit": "profit"})
+                for c in ["sold_price", "total_cost", "profit"]:
+                    if c in detail.columns:
+                        detail[c] = detail[c].apply(_money_display)
                 st.dataframe(detail, use_container_width=True, hide_index=True)
 
                 bucket_edges = [0, 10, 25, 50, 100, 250, 500, 1000, float("inf")]
                 bucket_labels = ["$1-$10", "$10-$25", "$25-$50", "$50-$100", "$100-$250", "$250-$500", "$500-$1000", "$1000+"]
-                sales2 = sales.copy()
-                sales2["bucket"] = pd.cut(sales2["sold_price_calc"], bins=bucket_edges, labels=bucket_labels, include_lowest=True, right=True)
-
+                sales2 = _add_calculated_sale_metrics(sales)
+                sales2["profit_num"] = sales2["calculated_profit"]
+                sales2["cost_num"] = sales2["total_cost_num"]
+                sales2["bucket"] = pd.cut(sales2["sold_price_num"], bins=bucket_edges, labels=bucket_labels, include_lowest=False, right=True)
                 buckets = sales2.groupby("bucket", observed=False).agg(
                     cards_sold=("inventory_id", "count"),
-                    total_sales=("sold_price_calc", "sum"),
-                    total_cost=("cost_calc", "sum"),
-                    profit=("profit_calc", "sum"),
+                    total_sales=("sold_price_num", "sum"),
+                    total_cost=("cost_num", "sum"),
+                    profit=("profit_num", "sum"),
                 ).reset_index()
                 buckets["profit_margin"] = buckets.apply(lambda r: (r["profit"] / r["total_sales"]) if r["total_sales"] else 0.0, axis=1)
                 for c in ["total_sales", "total_cost", "profit"]:
@@ -1462,10 +1361,9 @@ with tab_performance:
 
                 set_summary = sales2.groupby("set_name", dropna=False).agg(
                     cards_sold=("inventory_id", "count"),
-                    total_sales=("sold_price_calc", "sum"),
-                    profit=("profit_calc", "sum"),
+                    total_sales=("sold_price_num", "sum"),
+                    profit=("profit_num", "sum"),
                 ).reset_index().sort_values("total_sales", ascending=False)
-                set_summary["set_name"] = set_summary["set_name"].replace("", "(Blank)").fillna("(Blank)")
                 for c in ["total_sales", "profit"]:
                     set_summary[c] = set_summary[c].apply(_money_display)
                 st.markdown("### Sales by Set")
