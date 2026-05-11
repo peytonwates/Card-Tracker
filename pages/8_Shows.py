@@ -708,47 +708,39 @@ def _add_calculated_sale_metrics(sales_df: pd.DataFrame) -> pd.DataFrame:
 
 def get_sales_for_show(show: pd.Series | dict, inv_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Return ONLY the inventory rows sold for the selected show.
+    Return ONLY the inventory rows sold for this show by matching show_name.
 
-    Matching rules are intentionally strict to prevent one show's sales from rolling into another:
-    1) If the inventory sale row has show_id, it must equal this show's show_id.
-    2) Older rows with blank show_id may match by exact show_name + sold_date = show_date.
-    3) No date-only fallback. Date-only matching caused cross-show totals.
+    Important: do NOT use show_id or sold_date for the Show Performance table.
+    In your sheet, show_id can be unreliable after sync/migration. The clean
+    source for assigning a sale to a show is the inventory row's show_name.
+
+    Show Performance sales math:
+      total_sales = sum(sold_price)
+      cost_sold   = sum(total_cost)
+      profit      = total_sales - cost_sold
     """
     if inv_df.empty or show is None:
         return pd.DataFrame(columns=INV_COLUMNS)
 
-    show_id = _clean_text(show.get("show_id"))
     show_name_key = _normalize_show_key(show.get("show_name"))
-    show_date = _date_str(show.get("show_date"))
+    if not show_name_key:
+        return pd.DataFrame(columns=INV_COLUMNS)
 
     df = inv_df.copy()
+    if "show_name" not in df.columns:
+        df["show_name"] = ""
+    if "sold_price" not in df.columns:
+        df["sold_price"] = 0.0
+
     df["sold_price_num"] = _coerce_money_series(df["sold_price"])
-    df["sold_date_norm"] = df["sold_date"].apply(_date_str)
-    df["show_id_norm"] = df["show_id"].astype(str).str.strip()
     df["show_name_key"] = df["show_name"].apply(_normalize_show_key)
 
-    sold = df[df["sold_price_num"] > 0].copy()
-    if sold.empty:
-        return _add_calculated_sale_metrics(sold)
+    sales = df[
+        (df["sold_price_num"] > 0)
+        & (df["show_name_key"] == show_name_key)
+    ].copy()
 
-    match = pd.Series(False, index=sold.index)
-
-    if show_id:
-        match = match | sold["show_id_norm"].eq(show_id)
-
-    # Fallback only for older/migrated sales rows where show_id was not written.
-    # Require show_name AND sold_date to match so recurring shows do not get combined.
-    if show_name_key and show_date:
-        legacy_name_date_match = (
-            sold["show_id_norm"].eq("")
-            & sold["show_name_key"].eq(show_name_key)
-            & sold["sold_date_norm"].eq(show_date)
-        )
-        match = match | legacy_name_date_match
-
-    return _add_calculated_sale_metrics(sold[match].copy())
-
+    return _add_calculated_sale_metrics(sales)
 
 def _build_show_select_labels(shows_df: pd.DataFrame, *, exclude_cancelled: bool = True) -> tuple[list[str], dict[str, str]]:
     if shows_df.empty:
@@ -1307,7 +1299,7 @@ with tab_sales:
 
 with tab_performance:
     st.subheader("Show Performance")
-    st.caption("All numbers are derived from inventory rows. No show_inventory_snapshots sheet is used.")
+    st.caption("All numbers are derived from inventory rows. Sales are matched by inventory show_name only. No show_inventory_snapshots sheet is used.")
 
     summary = build_show_summary(shows_df, inv_df)
     if summary.empty:
