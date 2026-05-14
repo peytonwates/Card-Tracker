@@ -34,7 +34,8 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 import gspread
-from gspread.exceptions import APIError
+from gspread.exceptions import APIError, WorksheetNotFound
+from gspread.http_client import BackOffHTTPClient
 from google.oauth2.service_account import Credentials
 
 
@@ -239,8 +240,14 @@ def _unique_sale_key(link: str, base_sale_key: str) -> str:
 # =========================
 # Google Sheets auth
 # =========================
-@st.cache_resource
+@st.cache_resource(ttl=3600)
 def get_gspread_client():
+    """
+    Create one cached gspread client and use gspread's BackOffHTTPClient.
+
+    This helps prevent the Grading page from crashing during Streamlit reruns
+    when Google briefly rate-limits metadata/read requests.
+    """
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -250,12 +257,12 @@ def get_gspread_client():
         sa = st.secrets["gcp_service_account"]
         sa_info = {k: sa[k] for k in sa.keys()}
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-        return gspread.authorize(creds)
+        return gspread.authorize(creds, http_client=BackOffHTTPClient)
 
     if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], str):
         sa_info = json.loads(st.secrets["gcp_service_account"])
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-        return gspread.authorize(creds)
+        return gspread.authorize(creds, http_client=BackOffHTTPClient)
 
     if "service_account_json_path" in st.secrets:
         sa_rel = st.secrets["service_account_json_path"]
@@ -266,18 +273,26 @@ def get_gspread_client():
             raise FileNotFoundError(f"Service account JSON not found at: {p}")
         sa_info = json.loads(p.read_text(encoding="utf-8"))
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-        return gspread.authorize(creds)
+        return gspread.authorize(creds, http_client=BackOffHTTPClient)
 
     raise KeyError('Missing secrets: add "gcp_service_account" (Cloud) or "service_account_json_path" (local).')
 
 
-def _is_gs_quota_error(e: Exception) -> bool:
+def _is_gs_transient_error(e: Exception) -> bool:
+    """Return True for retryable Google Sheets API errors."""
     msg = str(e)
     return (
         "429" in msg
+        or "500" in msg
+        or "502" in msg
+        or "503" in msg
+        or "504" in msg
         or "Quota exceeded" in msg
+        or "RESOURCE_EXHAUSTED" in msg
         or "Read requests per minute per user" in msg
         or "Write requests per minute per user" in msg
+        or "Internal error encountered" in msg
+        or "The service is currently unavailable" in msg
     )
 
 
@@ -289,7 +304,7 @@ def _gs_api_retry(fn, *args, **kwargs):
         try:
             return fn(*args, **kwargs)
         except APIError as e:
-            if _is_gs_quota_error(e):
+            if _is_gs_transient_error(e):
                 time.sleep(base_sleep * (2 ** (attempt - 1)))
                 continue
             raise
@@ -305,14 +320,46 @@ def _gs_read_retry(fn, *args, **kwargs):
     return _gs_api_retry(fn, *args, **kwargs)
 
 
-@st.cache_resource
+@st.cache_resource(ttl=3600)
 def get_sheet():
     client = get_gspread_client()
-    return client.open_by_key(st.secrets["spreadsheet_id"])
+    return _gs_read_retry(client.open_by_key, st.secrets["spreadsheet_id"])
 
 
-def get_ws(sheet, ws_name: str):
-    return sheet.worksheet(ws_name)
+@st.cache_resource(ttl=300)
+def get_ws_cached(spreadsheet_id: str, ws_name: str):
+    """
+    Cache worksheet lookup so Streamlit reruns do not repeatedly call
+    sheet.worksheet(), which fetches spreadsheet metadata.
+    """
+    client = get_gspread_client()
+    sh = _gs_read_retry(client.open_by_key, spreadsheet_id)
+    return _gs_read_retry(sh.worksheet, ws_name)
+
+
+def get_ws(sheet, ws_name: str, create_if_missing: bool = False, rows: int = 1000, cols: int = 30):
+    """
+    Safer worksheet getter with retry/backoff + cached worksheet lookup.
+
+    The original version directly called sheet.worksheet(ws_name). That can
+    trigger Google Sheets metadata calls on every Streamlit rerun and cause
+    gspread.exceptions.APIError at fetch_sheet_metadata().
+    """
+    spreadsheet_id = sheet.id
+
+    try:
+        return get_ws_cached(spreadsheet_id, ws_name)
+    except WorksheetNotFound:
+        if not create_if_missing:
+            raise
+
+        ws = _gs_write_retry(sheet.add_worksheet, title=ws_name, rows=rows, cols=cols)
+        get_ws_cached.clear()
+        return ws
+    except APIError:
+        # One cache-bypassing retry in case the cached resource got stale.
+        get_ws_cached.clear()
+        return get_ws_cached(spreadsheet_id, ws_name)
 
 
 def read_ws_df(ws) -> pd.DataFrame:
@@ -1137,6 +1184,7 @@ def load_gemrates_df():
 
 
 def clear_watchlist_market_caches():
+    get_ws_cached.clear()
     load_watchlist_df.clear()
     load_sales_history_df.clear()
     load_gemrates_df.clear()
@@ -1420,6 +1468,7 @@ def load_grading_df():
 
 
 def refresh_all_grading():
+    get_ws_cached.clear()
     load_inventory_df.clear()
     load_grading_df.clear()
     fetch_pricecharting_prices.clear()
