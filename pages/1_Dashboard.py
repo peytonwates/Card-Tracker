@@ -202,92 +202,6 @@ def _pick_col(df: pd.DataFrame, name: str, fallback: str = None):
     m = _col_lookup(df)
     return m.get(_norm_key(name), fallback)
 
-def _build_unique_inventory_lookup(inv_df: pd.DataFrame, id_col: str, context_label: str = "Inventory lookup") -> dict:
-    """
-    Build a safe inventory_id -> row dictionary.
-
-    Pandas requires the index to be unique for to_dict("index").
-    The Google Sheet can contain blank IDs or duplicate IDs, so normalize,
-    show a warning, and keep one row per inventory_id instead of crashing.
-    """
-    if inv_df is None or inv_df.empty or id_col not in inv_df.columns:
-        return {}
-
-    d = inv_df.copy()
-    d[id_col] = (
-        d[id_col]
-        .apply(lambda x: _safe_str(x).strip())
-        .replace({"nan": "", "None": "", "<NA>": ""})
-    )
-
-    blank_count = int((d[id_col] == "").sum())
-    if blank_count > 0:
-        st.warning(
-            f"{context_label}: found {blank_count} inventory row(s) with blank inventory_id. "
-            "Those rows were ignored for lookup calculations."
-        )
-        d = d[d[id_col] != ""].copy()
-
-    if d.empty:
-        return {}
-
-    dup_mask = d.duplicated(subset=[id_col], keep=False)
-    dup_df = d[dup_mask].copy()
-
-    if not dup_df.empty:
-        dup_count = int(dup_df[id_col].nunique())
-
-        st.warning(
-            f"{context_label}: found {dup_count} duplicate inventory_id value(s). "
-            "The dashboard kept the latest row for each ID so the page can load."
-        )
-
-        debug_cols = [
-            c for c in [
-                id_col,
-                "card_name",
-                "set_name",
-                "inventory_status",
-                "purchase_date",
-                "total_price",
-                "total_cost",
-                "market_value",
-                "sold_price",
-                "sold_date",
-                "updated_at_utc",
-                "updated_at",
-                "created_at",
-            ]
-            if c in dup_df.columns
-        ]
-
-        if debug_cols:
-            with st.expander(f"{context_label} — duplicate inventory IDs"):
-                st.dataframe(
-                    dup_df[debug_cols].sort_values(id_col),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-    # Prefer the newest-looking row when duplicate IDs exist.
-    # If no timestamp columns exist, keep='last' preserves the bottom-most sheet row.
-    sort_candidates = [c for c in ["updated_at_utc", "updated_at", "modified_at", "created_at", "purchase_date"] if c in d.columns]
-    if sort_candidates:
-        sort_cols = [id_col]
-        temp_cols = []
-        for c in sort_candidates:
-            tmp = f"__sort_{c}"
-            d[tmp] = pd.to_datetime(d[c], errors="coerce")
-            sort_cols.append(tmp)
-            temp_cols.append(tmp)
-
-        d = d.sort_values(sort_cols, na_position="first").copy()
-        d = d.drop(columns=temp_cols, errors="ignore")
-
-    d = d.drop_duplicates(subset=[id_col], keep="last").copy()
-
-    return d.set_index(id_col, drop=False).to_dict("index")
-
 def _apply_period_filter(df: pd.DataFrame, dt_col: str, year_choice: str, month_choice: str) -> pd.DataFrame:
     if df is None or df.empty or dt_col not in df.columns:
         return df
@@ -1543,11 +1457,11 @@ with tab_bs:
         if not txn_f.empty and "__inventory_id" in txn_f.columns:
             txn_f = txn_f[txn_f["__inventory_id"].astype(str).str.strip().isin(allowed_ids)].copy()
 
-    inv_by_id = _build_unique_inventory_lookup(
-        inv,
-        inv_id_col,
-        context_label="Balance Sheet inventory lookup",
-    ) if not inv.empty else {}
+    inv_by_id = {}
+    if not inv.empty:
+        inv_keyed = inv.copy()
+        inv_keyed[inv_id_col] = inv_keyed[inv_id_col].apply(lambda x: _safe_str(x).strip())
+        inv_by_id = inv_keyed.set_index(inv_id_col, drop=False).to_dict("index")
 
     grading_cost_by_inv_id = {}
     if not grd.empty:
@@ -2203,11 +2117,12 @@ with tab_forecast:
         open_grading_2 = pd.DataFrame()
 
     # Build inv_by_id (used for mapping dwell + purchased_from + product_type)
-    inv_by_id_2 = _build_unique_inventory_lookup(
-        _ensure_unique_columns(inv.copy()) if not inv.empty else inv,
-        inv_id_col,
-        context_label="Business Dashboard inventory lookup",
-    ) if not inv.empty else {}
+    inv_by_id_2 = {}
+    if not inv.empty:
+        inv_keyed_2 = inv.copy()
+        inv_keyed_2 = _ensure_unique_columns(inv_keyed_2)
+        inv_keyed_2[inv_id_col] = inv_keyed_2[inv_id_col].apply(lambda x: _safe_str(x).strip())
+        inv_by_id_2 = inv_keyed_2.set_index(inv_id_col, drop=False).to_dict("index")
 
     def _inv_get(inv_id: str, col: str, default=""):
         rec = inv_by_id_2.get(_safe_str(inv_id).strip())
