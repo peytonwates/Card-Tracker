@@ -1357,28 +1357,142 @@ def fetch_pricecharting_prices(reference_link: str) -> dict:
 # =========================================================
 # LOADERS (Grading submission screens)
 # =========================================================
+INVENTORY_REQUIRED_COLS = [
+    "inventory_id",
+    "inventory_status",
+    "reference_link",
+    "card_name",
+    "set_name",
+    "year",
+    "total_price",
+    "purchase_date",
+    "purchased_from",
+    "product_type",
+    "card_number",
+    "variant",
+    "card_subtype",
+    "grading_company",
+    "grade",
+    "market_price",
+    "market_value",
+    "listed_transaction_id",
+]
+
+
+def _clean_header_name(h: str) -> str:
+    """Normalize a Sheet header for loose matching without changing the Sheet itself."""
+    return re.sub(r"[^a-z0-9]+", "_", safe_str(h).strip().lower()).strip("_")
+
+
+def _strip_dup_suffix(h: str) -> str:
+    return re.sub(r"__dup\d+$", "", safe_str(h).strip())
+
+
+def _coalesce_duplicate_base_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    If ensure_headers_canon had to rename duplicate columns as name__dup2,
+    merge nonblank duplicate values back into the base column.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    base_to_cols: dict[str, list[str]] = {}
+    for c in out.columns:
+        base_to_cols.setdefault(_strip_dup_suffix(c), []).append(c)
+
+    for base, cols in base_to_cols.items():
+        if not cols:
+            continue
+        if base not in out.columns:
+            out[base] = ""
+
+        merged = out[cols[0]].astype(str)
+        for c in cols[1:]:
+            nxt = out[c].astype(str)
+            merged = merged.where(merged.str.strip() != "", nxt)
+        out[base] = merged
+
+    return out.loc[:, ~out.columns.duplicated()].copy()
+
+
+def _apply_inventory_column_aliases(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make load_inventory_df resilient to header casing/spacing differences,
+    e.g. Inventory ID vs inventory_id or Total Price vs total_price.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    norm_to_actual = {_clean_header_name(c): c for c in out.columns}
+
+    aliases = {
+        "inventory_id": ["inventory_id", "inventory id", "id"],
+        "inventory_status": ["inventory_status", "inventory status", "status"],
+        "reference_link": ["reference_link", "reference link", "link", "pricecharting link"],
+        "card_name": ["card_name", "card name", "name"],
+        "set_name": ["set_name", "set name", "set"],
+        "year": ["year"],
+        "total_price": ["total_price", "total price", "purchase_total", "purchase total", "purchase price", "cost", "all in cost"],
+        "purchase_date": ["purchase_date", "purchase date", "date purchased"],
+        "purchased_from": ["purchased_from", "purchased from", "source", "vendor"],
+        "product_type": ["product_type", "product type", "type"],
+        "card_number": ["card_number", "card number", "card #", "card no", "number"],
+        "variant": ["variant"],
+        "card_subtype": ["card_subtype", "card subtype", "subtype"],
+        "grading_company": ["grading_company", "grading company"],
+        "grade": ["grade"],
+        "market_price": ["market_price", "market price"],
+        "market_value": ["market_value", "market value"],
+        "listed_transaction_id": ["listed_transaction_id", "listed transaction id", "transaction_id", "transaction id"],
+    }
+
+    for canon, possible_headers in aliases.items():
+        if canon in out.columns:
+            continue
+        for h in possible_headers:
+            actual = norm_to_actual.get(_clean_header_name(h))
+            if actual is not None:
+                out[canon] = out[actual]
+                break
+
+    return out
+
+
 @st.cache_data(ttl=30)
 def load_inventory_df():
     sh = get_sheet()
     ws = get_ws(sh, INVENTORY_WS_NAME)
-    records = _gs_read_retry(ws.get_all_records)
-    df = pd.DataFrame(records)
+
+    # IMPORTANT:
+    # Do not use ws.get_all_records() here. gspread raises GSpreadException
+    # when the inventory sheet has duplicate/blank headers. Loading raw values
+    # lets us normalize safely and keeps the Grading page from crashing.
+    ensure_headers_canon(ws, INVENTORY_REQUIRED_COLS)
+    df = read_ws_df(ws)
+
     if df.empty:
-        return df
+        return pd.DataFrame(columns=INVENTORY_REQUIRED_COLS)
 
-    if "inventory_status" not in df.columns:
-        df["inventory_status"] = STATUS_ACTIVE
-    df["inventory_status"] = df["inventory_status"].astype(str).replace("", STATUS_ACTIVE)
+    df = _coalesce_duplicate_base_columns(df)
+    df = _apply_inventory_column_aliases(df)
 
-    for c in [
-        "inventory_id", "reference_link", "card_name", "set_name", "year", "total_price",
-        "purchase_date", "purchased_from", "product_type", "card_number", "variant",
-        "card_subtype", "grading_company", "grade", "market_price", "market_value"
-    ]:
+    for c in INVENTORY_REQUIRED_COLS:
         if c not in df.columns:
             df[c] = ""
 
-    df["inventory_id"] = df["inventory_id"].astype(str)
+    if "inventory_status" not in df.columns:
+        df["inventory_status"] = STATUS_ACTIVE
+    df["inventory_status"] = (
+        df["inventory_status"]
+        .astype(str)
+        .replace({"": STATUS_ACTIVE, "nan": STATUS_ACTIVE, "None": STATUS_ACTIVE, "<NA>": STATUS_ACTIVE})
+        .str.strip()
+    )
+    df.loc[df["inventory_status"] == "", "inventory_status"] = STATUS_ACTIVE
+
+    df["inventory_id"] = df["inventory_id"].astype(str).str.strip()
 
     df["year"] = (
         df["year"]
@@ -1387,7 +1501,9 @@ def load_inventory_df():
         .str.strip()
     )
 
-    df["total_price"] = pd.to_numeric(df["total_price"], errors="coerce").fillna(0.0)
+    df["total_price"] = df["total_price"].apply(lambda v: safe_float(v, 0.0))
+    df["market_price"] = df["market_price"].apply(lambda v: safe_float(v, 0.0))
+    df["market_value"] = df["market_value"].apply(lambda v: safe_float(v, 0.0))
     df["product_type"] = df["product_type"].astype(str)
 
     return df
