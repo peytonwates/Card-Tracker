@@ -1398,7 +1398,7 @@ year_opts, month_opts_all = _build_year_month_options()
 # =========================
 # Tabs
 # =========================
-tab_bs, tab_forecast = st.tabs(["Balance Sheet", "Expenses + Forecast"])
+tab_bs, tab_forecast = st.tabs(["Balance Sheet", "Monthly Summary"])
 
 
 # =========================================================
@@ -1970,191 +1970,63 @@ with tab_bs:
 
 
 # =========================================================
-# TAB 2: Expenses + Forecast (REPLACED)
+# TAB 2: Monthly Summary
 # =========================================================
 with tab_forecast:
-    st.subheader("Business Dashboard")
+    st.subheader("Monthly Business Summary")
+    st.caption(
+        "This is the owner view: realized profit from sold items, other business expenses, "
+        "month-end inventory, and conservative business value using 70% of market value as liquidity value."
+    )
 
-    # -------------------------
-    # Filters (apply across this tab)
-    # -------------------------
-    f1, f2, f3, f4, f5 = st.columns([1, 1, 2, 1.4, 1.2])
+    LIQUIDITY_RATE = 0.70
 
+    f1, f2 = st.columns([1, 4])
     with f1:
-        year_choice_2 = st.selectbox("Year", options=year_opts, index=0, key="dash_year")
-
-    with f2:
-        if year_choice_2 != "All":
-            try:
-                y = int(year_choice_2)
-                month_opts_2 = ["All"] + [m for m in month_opts_all[1:] if m.startswith(f"{y}-")]
-            except Exception:
-                month_opts_2 = month_opts_all
-        else:
-            month_opts_2 = month_opts_all
-
-        month_choice_2 = st.selectbox("Month", options=month_opts_2, index=0, key="dash_month")
-
-    # Purchased From options (from inventory) -> use "All" like Year/Month
-    purchased_from_opts_2 = []
-    if not inv.empty and inv_purchased_from_col in inv.columns:
-        purchased_from_opts_2 = sorted({
-            _safe_str(x).strip()
-            for x in inv[inv_purchased_from_col].dropna().tolist()
-            if _safe_str(x).strip()
-        })
-    purchased_from_opts_2 = ["All"] + purchased_from_opts_2
-
-    with f3:
-        purchased_from_choice_2 = st.selectbox(
-            "Purchased From",
-            options=purchased_from_opts_2,
-            index=0,
-            key="dash_purchased_from",
-        )
-
-    # Product type options (from inventory) -> use "All"
-    product_type_opts_2 = []
-    if not inv.empty and inv_product_type_col in inv.columns:
-        product_type_opts_2 = sorted({
-            _safe_str(x).strip()
-            for x in inv[inv_product_type_col].dropna().tolist()
-            if _safe_str(x).strip()
-        })
-    product_type_opts_2 = ["All"] + product_type_opts_2
-
-    with f4:
-        product_type_choice_2 = st.selectbox(
-            "Product Type",
-            options=product_type_opts_2,
-            index=0,
-            key="dash_product_type",
-        )
-
-    # Card type -> use "All"
-    card_type_opts_2 = ["All", "Pokemon", "Sports"]
-    with f5:
-        card_type_choice_2 = st.selectbox(
-            "Card Type",
-            options=card_type_opts_2,
-            index=0,
-            key="dash_card_type",
-        )
+        year_choice_2 = st.selectbox("Year", options=year_opts, index=0, key="monthly_summary_year")
 
     # -------------------------
-    # Apply time filters first (date-based)
+    # Inventory lookup helpers
     # -------------------------
-    inv_f2 = _apply_period_filter(inv, "__purchase_dt", year_choice_2, month_choice_2) if not inv.empty else inv
-    txn_f2 = _apply_period_filter(txn, "__sold_dt", year_choice_2, month_choice_2) if not txn.empty else txn
-    grd_f2 = _apply_period_filter(grd, "__grading_dt", year_choice_2, month_choice_2) if not grd.empty else grd
-    misc_f2 = _apply_period_filter(misc, "__dt", year_choice_2, month_choice_2) if not misc.empty else misc
+    inv_monthly = _ensure_unique_columns(inv.copy()) if not inv.empty else pd.DataFrame()
 
-    today_norm_2 = pd.Timestamp.today().normalize()
+    inv_records = {}
+    if not inv_monthly.empty and inv_id_col in inv_monthly.columns:
+        inv_monthly[inv_id_col] = inv_monthly[inv_id_col].apply(lambda x: _safe_str(x).strip())
+        # Duplicates should not break the dashboard. Keep the last populated row for lookup purposes.
+        inv_lookup = inv_monthly[inv_monthly[inv_id_col].astype(str).str.strip() != ""].copy()
+        inv_lookup = inv_lookup.drop_duplicates(subset=[inv_id_col], keep="last")
+        inv_records = inv_lookup.set_index(inv_id_col, drop=False).to_dict("index")
 
-    # -------------------------
-    # Apply dimension filters (Purchased From, Product Type, Card Type)
-    # - Inventory is filtered directly
-    # - Transactions + Grading are filtered via inventory_id linkage to inventory
-    # -------------------------
-    if not inv_f2.empty:
-        # Purchased From filter
-        if purchased_from_choice_2 != "All" and inv_purchased_from_col in inv_f2.columns:
-            inv_f2 = inv_f2[inv_f2[inv_purchased_from_col].astype(str).str.strip() == purchased_from_choice_2].copy()
+    inv_total_cost_col_m = _pick_col(inv_monthly, "total_cost", None) or _pick_col(inv_monthly, "all_in_cost", None)
+    inv_market_col_m = (
+        _pick_col(inv_monthly, "market_value", None)
+        or _pick_col(inv_monthly, "market_price", None)
+        or "__market_price"
+    )
 
-        # Product type filter
-        if product_type_choice_2 != "All" and inv_product_type_col in inv_f2.columns:
-            inv_f2 = inv_f2[inv_f2[inv_product_type_col].astype(str).str.strip() == product_type_choice_2].copy()
-
-        # Card type filter
-        if card_type_choice_2 != "All" and inv_card_type_col in inv_f2.columns:
-            inv_f2["__ct"] = inv_f2[inv_card_type_col].apply(_normalize_card_type)
-            inv_f2 = inv_f2[inv_f2["__ct"] == card_type_choice_2].copy()
-
-    # Allowed inventory ids for other tables
-    allowed_ids_2 = set()
-    if not inv.empty and inv_id_col in inv.columns:
-        inv_all_tmp = inv.copy()
-        inv_all_tmp[inv_id_col] = inv_all_tmp[inv_id_col].apply(lambda x: _safe_str(x).strip())
-
-        # Build allowed IDs from the UNFILTERED inv, but apply the SAME dimension filters (not date)
-        mask = pd.Series(True, index=inv_all_tmp.index)
-
-        if purchased_from_choice_2 != "All" and inv_purchased_from_col in inv_all_tmp.columns:
-            mask &= inv_all_tmp[inv_purchased_from_col].astype(str).str.strip() == purchased_from_choice_2
-
-        if product_type_choice_2 != "All" and inv_product_type_col in inv_all_tmp.columns:
-            mask &= inv_all_tmp[inv_product_type_col].astype(str).str.strip() == product_type_choice_2
-
-        if card_type_choice_2 != "All" and inv_card_type_col in inv_all_tmp.columns:
-            mask &= inv_all_tmp[inv_card_type_col].apply(_normalize_card_type) == card_type_choice_2
-
-        allowed_ids_2 = set(inv_all_tmp.loc[mask, inv_id_col].astype(str).str.strip().tolist())
-
-    if not txn_f2.empty and "__inventory_id" in txn_f2.columns and allowed_ids_2:
-        txn_f2 = txn_f2[txn_f2["__inventory_id"].astype(str).str.strip().isin(allowed_ids_2)].copy()
-
-    if not grd.empty:
-        # grade/forecast should filter by inventory_id linkage too
-        gtmp = grd.copy()
-        gtmp = _ensure_unique_columns(gtmp)
-        gid_col = _pick_col(gtmp, "inventory_id", "inventory_id")
-        gtmp["__inv_id"] = gtmp[gid_col].apply(lambda x: _safe_str(x).strip())
-        if allowed_ids_2:
-            gtmp = gtmp[gtmp["__inv_id"].isin(allowed_ids_2)].copy()
-
-        # Apply date filter for "expenses" view from grading_dt
-        grd_f2 = _apply_period_filter(gtmp, "__grading_dt", year_choice_2, month_choice_2) if "__grading_dt" in gtmp.columns else gtmp
-
-        # Open grading for forecast (future/current-month returns still pending)
-        # IMPORTANT: use actual estimated_return_date >= today so current-month returns still show up
-        open_grading_2 = gtmp[gtmp["__status"].isin(["SUBMITTED", "IN_GRADING", "SENT", "IN_TRANSIT"])].copy() if "__status" in gtmp.columns else pd.DataFrame()
-        if not open_grading_2.empty and "__est_return_dt" in open_grading_2.columns:
-            open_grading_2 = open_grading_2[
-                open_grading_2["__est_return_dt"].notna()
-                & (open_grading_2["__est_return_dt"] >= today_norm_2)
-            ].copy()
-    else:
-        open_grading_2 = pd.DataFrame()
-
-    # Build inv_by_id (used for mapping dwell + purchased_from + product_type)
-    inv_by_id_2 = {}
-    if not inv.empty:
-        inv_keyed_2 = inv.copy()
-        inv_keyed_2 = _ensure_unique_columns(inv_keyed_2)
-        inv_keyed_2[inv_id_col] = inv_keyed_2[inv_id_col].apply(lambda x: _safe_str(x).strip())
-        inv_by_id_2 = inv_keyed_2.set_index(inv_id_col, drop=False).to_dict("index")
-
-    def _inv_get(inv_id: str, col: str, default=""):
-        rec = inv_by_id_2.get(_safe_str(inv_id).strip())
-        if rec is None:
-            return default
-        return rec.get(col, default)
-
-    def _cogs_for_inv_id_2(inv_id: str) -> float:
+    def _inv_cost_monthly(inv_id: str) -> float:
         k = _safe_str(inv_id).strip()
-        rec = inv_by_id_2.get(k)
-        base = 0.0
-        if rec is not None:
-            total_cost_col = None
-            if "total_cost" in rec:
-                total_cost_col = "total_cost"
-            elif "all_in_cost" in rec:
-                total_cost_col = "all_in_cost"
+        rec = inv_records.get(k)
+        if rec is None:
+            return 0.0
 
-            if total_cost_col:
-                base = _to_num(rec.get(total_cost_col, 0.0))
+        total_cost = 0.0
+        if inv_total_cost_col_m and inv_total_cost_col_m in rec:
+            total_cost = _to_num(rec.get(inv_total_cost_col_m, 0.0))
 
-            if base <= 0:
-                base = _to_num(rec.get(inv_total_col, 0.0))
-        add = float(grading_cost_by_inv_id.get(k, 0.0) or 0.0)
-        return float(base + add)
+        if total_cost <= 0:
+            total_cost = _to_num(rec.get(inv_total_col, 0.0))
+            status = _safe_str(rec.get(inv_status_col, "")).strip().upper()
+            if status == "GRADING":
+                total_cost += float(grading_cost_by_inv_id.get(k, 0.0) or 0.0)
 
-    def _with_recalculated_sales_math(tx_df: pd.DataFrame) -> pd.DataFrame:
-        """Return a copy with sales, fees, proceeds, COGS, and profit recalculated.
+        return float(total_cost or 0.0)
 
-        Stored net/profit values are intentionally ignored because older
-        migration versions could write sold_price as profit for show sales.
-        """
+    # -------------------------
+    # Recalculate sales from first principles
+    # -------------------------
+    def _monthly_sales_math(tx_df: pd.DataFrame) -> pd.DataFrame:
         if tx_df is None or tx_df.empty:
             return pd.DataFrame(columns=[
                 "__sold_dt", "__sold_month", "__inventory_id", "__dollar_sales",
@@ -2162,6 +2034,15 @@ with tab_forecast:
             ])
 
         out = tx_df.copy()
+        if "__inventory_id" not in out.columns:
+            out["__inventory_id"] = ""
+        out["__inventory_id"] = out["__inventory_id"].apply(lambda x: _safe_str(x).strip())
+
+        if "__sold_dt" not in out.columns:
+            out["__sold_dt"] = pd.NaT
+        out["__sold_dt"] = _to_dt(out["__sold_dt"])
+        out = out[out["__sold_dt"].notna()].copy()
+
         if "__dollar_sales" not in out.columns:
             out["__dollar_sales"] = _to_num(out.get("__sold_price", 0.0))
         else:
@@ -2172,611 +2053,402 @@ with tab_forecast:
         else:
             out["__total_fees"] = _to_num(out["__total_fees"])
 
-        if "__inventory_id" not in out.columns:
-            out["__inventory_id"] = ""
-
-        out["__fallback_cogs"] = out["__inventory_id"].apply(_cogs_for_inv_id_2)
+        fallback_cogs = out["__inventory_id"].apply(_inv_cost_monthly)
         if "__all_in_cost" in out.columns:
-            out["__all_in_cost_num"] = _to_num(out["__all_in_cost"])
-            out["__cogs"] = np.where(out["__all_in_cost_num"] > 0, out["__all_in_cost_num"], out["__fallback_cogs"])
+            all_in = _to_num(out["__all_in_cost"])
+            out["__cogs"] = np.where(all_in > 0, all_in, fallback_cogs)
         else:
-            out["__cogs"] = out["__fallback_cogs"]
+            out["__cogs"] = fallback_cogs
 
         out["__net"] = (out["__dollar_sales"] - out["__total_fees"]).fillna(0.0)
         out["__profit_calc"] = (out["__net"] - out["__cogs"]).fillna(0.0)
-        out["__profit"] = out["__profit_calc"]
+        out["__sold_month"] = _month_start(out["__sold_dt"])
         return out
 
-    # =========================================================
-    # KPIs (Sales-side)
-    # =========================================================
-    tx_math_f2 = _with_recalculated_sales_math(txn_f2)
+    tx_math_all = _monthly_sales_math(txn)
 
-    revenue = float(tx_math_f2["__dollar_sales"].sum()) if not tx_math_f2.empty else 0.0
-    proceeds = float(tx_math_f2["__net"].sum()) if not tx_math_f2.empty else 0.0
-    cogs = float(tx_math_f2["__cogs"].sum()) if not tx_math_f2.empty else 0.0
-    net_profit = float(tx_math_f2["__profit_calc"].sum()) if not tx_math_f2.empty else 0.0
-    items_sold = int(len(tx_math_f2)) if not tx_math_f2.empty else 0
+    # Sold-date lookup lets month-end inventory include items that were held in old months but sold later.
+    sold_date_by_inv_id = {}
+    if not tx_math_all.empty and "__inventory_id" in tx_math_all.columns:
+        sold_date_by_inv_id = (
+            tx_math_all.dropna(subset=["__sold_dt"])
+                       .groupby("__inventory_id")["__sold_dt"]
+                       .min()
+                       .to_dict()
+        )
 
-    net_margin = (net_profit / revenue) if revenue else 0.0
+    # -------------------------
+    # Monthly sales, expenses, purchases, and misc
+    # -------------------------
+    if not tx_math_all.empty:
+        sales_m = (
+            tx_math_all.dropna(subset=["__sold_month"])
+                       .groupby("__sold_month", as_index=False)
+                       .agg(
+                           sales=("__dollar_sales", "sum"),
+                           cogs_sold=("__cogs", "sum"),
+                           selling_fees=("__total_fees", "sum"),
+                           proceeds=("__net", "sum"),
+                           realized_profit_before_misc=("__profit_calc", "sum"),
+                           items_sold=("__inventory_id", "count"),
+                       )
+                       .rename(columns={"__sold_month": "month"})
+        )
+    else:
+        sales_m = pd.DataFrame(columns=[
+            "month", "sales", "cogs_sold", "selling_fees", "proceeds",
+            "realized_profit_before_misc", "items_sold"
+        ])
+
+    if not misc.empty and "__month" in misc.columns:
+        misc_m = (
+            misc.dropna(subset=["__month"])
+                .groupby("__month", as_index=False)["__amount"]
+                .sum()
+                .rename(columns={"__month": "month", "__amount": "other_expenses"})
+        )
+    else:
+        misc_m = pd.DataFrame(columns=["month", "other_expenses"])
+
+    if not inv_monthly.empty and "__purchase_dt" in inv_monthly.columns:
+        inv_monthly["__purchase_month"] = _month_start(inv_monthly["__purchase_dt"])
+        inv_monthly["__inventory_cost"] = inv_monthly[inv_id_col].apply(_inv_cost_monthly)
+        purchases_m = (
+            inv_monthly.dropna(subset=["__purchase_month"])
+                       .groupby("__purchase_month", as_index=False)
+                       .agg(
+                           items_bought=(inv_id_col, "count"),
+                           inventory_spend=("__inventory_cost", "sum"),
+                       )
+                       .rename(columns={"__purchase_month": "month"})
+        )
+    else:
+        purchases_m = pd.DataFrame(columns=["month", "items_bought", "inventory_spend"])
+
+    if not grd.empty and "__grading_month" in grd.columns and "__grading_cost" in grd.columns:
+        grading_m = (
+            grd.dropna(subset=["__grading_month"])
+               .groupby("__grading_month", as_index=False)["__grading_cost"]
+               .sum()
+               .rename(columns={"__grading_month": "month", "__grading_cost": "grading_spend"})
+        )
+    else:
+        grading_m = pd.DataFrame(columns=["month", "grading_spend"])
+
+    # -------------------------
+    # Month backbone
+    # -------------------------
+    month_sources = []
+    for s in [
+        sales_m.get("month"),
+        misc_m.get("month"),
+        purchases_m.get("month"),
+        grading_m.get("month"),
+    ]:
+        if isinstance(s, pd.Series) and not s.empty:
+            month_sources.append(s.dropna())
+
+    if month_sources:
+        min_month = min([s.min() for s in month_sources])
+        max_month = max([s.max() for s in month_sources])
+        months = pd.date_range(min_month, max_month, freq="MS")
+    else:
+        months = pd.date_range(pd.Timestamp(date.today().replace(day=1)), periods=1, freq="MS")
+
+    monthly = pd.DataFrame({"month": months})
+    for df_m in [sales_m, misc_m, purchases_m, grading_m]:
+        monthly = monthly.merge(df_m, on="month", how="left")
+
+    for c in [
+        "sales", "cogs_sold", "selling_fees", "proceeds", "realized_profit_before_misc",
+        "items_sold", "other_expenses", "items_bought", "inventory_spend", "grading_spend"
+    ]:
+        if c not in monthly.columns:
+            monthly[c] = 0.0
+        monthly[c] = monthly[c].fillna(0.0)
+
+    # -------------------------
+    # Inventory held at each month end
+    # -------------------------
+    inventory_rows = []
+    if not inv_monthly.empty and "__purchase_dt" in inv_monthly.columns:
+        inv_asof_base = inv_monthly.copy()
+        inv_asof_base["__purchase_dt"] = _to_dt(inv_asof_base["__purchase_dt"])
+        inv_asof_base["__inv_id_key"] = inv_asof_base[inv_id_col].apply(lambda x: _safe_str(x).strip())
+
+        if inv_sold_date_col and inv_sold_date_col in inv_asof_base.columns:
+            inv_asof_base["__sold_dt_monthly"] = _to_dt(inv_asof_base[inv_sold_date_col])
+        else:
+            inv_asof_base["__sold_dt_monthly"] = pd.NaT
+
+        mapped_sold_dt = inv_asof_base["__inv_id_key"].map(sold_date_by_inv_id)
+        inv_asof_base["__sold_dt_monthly"] = inv_asof_base["__sold_dt_monthly"].combine_first(_to_dt(mapped_sold_dt))
+        inv_asof_base["__status_upper"] = inv_asof_base[inv_status_col].astype(str).str.upper().str.strip()
+        inv_asof_base["__held_cost"] = inv_asof_base["__inv_id_key"].apply(_inv_cost_monthly)
+
+        if inv_market_col_m in inv_asof_base.columns:
+            inv_asof_base["__held_market_value"] = _to_num(inv_asof_base[inv_market_col_m])
+        elif "__market_price" in inv_asof_base.columns:
+            inv_asof_base["__held_market_value"] = _to_num(inv_asof_base["__market_price"])
+        else:
+            inv_asof_base["__held_market_value"] = 0.0
+
+        for m in months:
+            month_end = (pd.Timestamp(m) + pd.offsets.MonthEnd(0)) + pd.Timedelta(hours=23, minutes=59, seconds=59)
+            purchased_by_end = inv_asof_base["__purchase_dt"].notna() & (inv_asof_base["__purchase_dt"] <= month_end)
+
+            # Held as of month end:
+            # 1) sold later than this month, OR
+            # 2) not sold yet and currently ACTIVE/LISTED/GRADING.
+            sold_after_month = inv_asof_base["__sold_dt_monthly"].notna() & (inv_asof_base["__sold_dt_monthly"] > month_end)
+            still_active_now = inv_asof_base["__sold_dt_monthly"].isna() & inv_asof_base["__status_upper"].isin(["ACTIVE", "LISTED", "GRADING"])
+
+            held = inv_asof_base[purchased_by_end & (sold_after_month | still_active_now)].copy()
+
+            inv_cost = float(held["__held_cost"].sum()) if not held.empty else 0.0
+            market_value = float(held["__held_market_value"].sum()) if not held.empty else 0.0
+            liquidity_value = market_value * LIQUIDITY_RATE
+
+            inventory_rows.append({
+                "month": pd.Timestamp(m),
+                "inventory_items": int(len(held)),
+                "inventory_cost": inv_cost,
+                "inventory_market_value": market_value,
+                "inventory_liquidity_value": liquidity_value,
+                "inventory_equity": liquidity_value - inv_cost,
+            })
+
+    inventory_m = pd.DataFrame(inventory_rows)
+    if inventory_m.empty:
+        inventory_m = pd.DataFrame({
+            "month": months,
+            "inventory_items": 0,
+            "inventory_cost": 0.0,
+            "inventory_market_value": 0.0,
+            "inventory_liquidity_value": 0.0,
+            "inventory_equity": 0.0,
+        })
+
+    monthly = monthly.merge(inventory_m, on="month", how="left")
+    for c in ["inventory_items", "inventory_cost", "inventory_market_value", "inventory_liquidity_value", "inventory_equity"]:
+        monthly[c] = monthly[c].fillna(0.0)
+
+    # -------------------------
+    # Owner/business-health calculations
+    # -------------------------
+    monthly = monthly.sort_values("month").copy()
+    monthly["realized_expenses"] = monthly["cogs_sold"] + monthly["selling_fees"] + monthly["other_expenses"]
+    monthly["realized_profit"] = monthly["sales"] - monthly["realized_expenses"]
+    monthly["cumulative_realized_profit"] = monthly["realized_profit"].cumsum()
+
+    # Business value = banked/cumulative profit + liquidation value of inventory on hand.
+    monthly["business_value"] = monthly["cumulative_realized_profit"] + monthly["inventory_liquidity_value"]
+
+    # Value created is stricter: cumulative realized profit + conservative unrealized inventory equity.
+    monthly["conservative_value_created"] = monthly["cumulative_realized_profit"] + monthly["inventory_equity"]
+
+    monthly["mom_business_value_growth"] = monthly["business_value"].diff().fillna(monthly["business_value"])
+    monthly["mom_business_value_growth_pct"] = np.where(
+        monthly["business_value"].shift(1).abs() > 0,
+        monthly["mom_business_value_growth"] / monthly["business_value"].shift(1).abs(),
+        0.0,
+    )
+    monthly["sales_growth_pct"] = np.where(
+        monthly["sales"].shift(1).abs() > 0,
+        (monthly["sales"] - monthly["sales"].shift(1)) / monthly["sales"].shift(1).abs(),
+        0.0,
+    )
+    monthly["net_margin"] = np.where(monthly["sales"] > 0, monthly["realized_profit"] / monthly["sales"], 0.0)
+    monthly["inventory_roi_liquid"] = np.where(
+        monthly["inventory_cost"] > 0,
+        monthly["inventory_equity"] / monthly["inventory_cost"],
+        0.0,
+    )
+
+    monthly_view = monthly.copy()
+    if year_choice_2 != "All":
+        try:
+            y = int(year_choice_2)
+            monthly_view = monthly_view[monthly_view["month"].dt.year == y].copy()
+        except Exception:
+            pass
+
+    if monthly_view.empty:
+        st.info("No monthly data found for the selected year.")
+        st.stop()
+
+    latest = monthly_view.iloc[-1]
+    prev = monthly_view.iloc[-2] if len(monthly_view) >= 2 else None
+
+    business_delta = float(latest["business_value"] - prev["business_value"]) if prev is not None else float(latest["business_value"])
+    business_delta_pct = (business_delta / abs(float(prev["business_value"]))) if prev is not None and float(prev["business_value"]) != 0 else 0.0
 
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Revenue", _fmt_money(revenue))
-    k2.metric("COGS", _fmt_money(cogs))
-    k3.metric("Net Profit", _fmt_money(net_profit))
-    k4.metric("Net Margin", f"{net_margin*100:,.1f}%")
-    k5.metric("# Items Sold", f"{items_sold:,}")
+    k1.metric("Business Value", _fmt_money(latest["business_value"]), delta=f"{business_delta:+,.0f} / {business_delta_pct*100:+.1f}%")
+    k2.metric("Cumulative Realized Profit", _fmt_money(latest["cumulative_realized_profit"]))
+    k3.metric("Inventory Liquidity Value", _fmt_money(latest["inventory_liquidity_value"]), help="70% of current market value")
+    k4.metric("Conservative Value Created", _fmt_money(latest["conservative_value_created"]))
+    k5.metric("Latest Month Profit", _fmt_money(latest["realized_profit"]), delta=f"Margin {latest['net_margin']*100:,.1f}%")
 
     st.markdown("---")
 
-    # =========================================================
-    # Top Row Charts
-    # =========================================================
-    top_l, top_r = st.columns([1.25, 1.0])
-
     # -------------------------
-    # Chart 1: Sales vs Expenses by Month (+ TOTAL)
-    #   - dotted profit/loss shaded area between sales & expenses (profit=green, loss=red)
-    #   - labels on bars + shaded diff label
+    # Charts
     # -------------------------
-    with top_l:
-        st.markdown("### Sales vs Expenses (Monthly)")
+    c1, c2 = st.columns([1.25, 1.0])
 
-        # Monthly sales and expenses are built from sold items, not purchase-date
-        # inventory spend. Expenses here = COGS for sold items + selling fees + misc.
-        sales_m = pd.DataFrame(columns=["month", "sales", "cogs_expense", "fee_expense"])
-        if not tx_math_f2.empty and "__sold_month" in tx_math_f2.columns:
-            sales_m = (
-                tx_math_f2.dropna(subset=["__sold_month"])
-                          .groupby("__sold_month", as_index=False)
-                          .agg(
-                              sales=("__dollar_sales", "sum"),
-                              cogs_expense=("__cogs", "sum"),
-                              fee_expense=("__total_fees", "sum"),
-                          )
-                          .rename(columns={"__sold_month": "month"})
-            )
-
-        misc_m = pd.DataFrame(columns=["month", "misc_expense"])
-        if not misc_f2.empty and "__month" in misc_f2.columns:
-            misc_m = (
-                misc_f2.groupby("__month", as_index=False)["__amount"]
-                       .sum()
-                       .rename(columns={"__month": "month", "__amount": "misc_expense"})
-            )
-
-        # Build month backbone
-        allm = []
-        for s in [sales_m.get("month"), misc_m.get("month")]:
-            if isinstance(s, pd.Series) and not s.empty:
-                allm.append(s.dropna())
-
-        if allm:
-            min_m = min([x.min() for x in allm])
-            max_m = max([x.max() for x in allm])
-            months = pd.date_range(min_m, max_m, freq="MS")
-        else:
-            months = pd.date_range(pd.Timestamp(date.today().replace(day=1)), pd.Timestamp(date.today().replace(day=1)), freq="MS")
-
-        base_m = pd.DataFrame({"month": months})
-        base_m = base_m.merge(sales_m, on="month", how="left")
-        base_m = base_m.merge(misc_m, on="month", how="left")
-
-        for c in ["sales", "cogs_expense", "fee_expense", "misc_expense"]:
-            if c not in base_m.columns:
-                base_m[c] = 0.0
-            base_m[c] = base_m[c].fillna(0.0)
-
-        base_m["expenses"] = base_m["cogs_expense"] + base_m["fee_expense"] + base_m["misc_expense"]
-        base_m["diff"] = base_m["sales"] - base_m["expenses"]  # profit/loss for the month
-
-        # Add TOTAL row at end
-        total_row = pd.DataFrame([{
-            "month": pd.NaT,
-            "sales": float(base_m["sales"].sum()),
-            "expenses": float(base_m["expenses"].sum()),
-            "diff": float(base_m["diff"].sum()),
-            "__label": "TOTAL"
-        }])
-
-        plot_m = base_m[["month", "sales", "expenses", "diff"]].copy()
-        plot_m["__label"] = plot_m["month"].dt.strftime("%Y-%m")
-        plot_m = pd.concat([plot_m, total_row], ignore_index=True)
-
-        # long for grouped bars
-        plot_long = plot_m.melt(
-            id_vars=["__label", "diff"],
-            value_vars=["sales", "expenses"],
-            var_name="series",
+    with c1:
+        st.markdown("### Business Value Trend")
+        trend = monthly_view[[
+            "month", "business_value", "cumulative_realized_profit", "inventory_liquidity_value", "conservative_value_created"
+        ]].copy()
+        trend_long = trend.melt(
+            id_vars=["month"],
+            value_vars=["business_value", "cumulative_realized_profit", "inventory_liquidity_value", "conservative_value_created"],
+            var_name="metric",
             value_name="value",
         )
-        plot_long["series"] = plot_long["series"].map({"sales": "Sales", "expenses": "Expenses"})
+        trend_long["metric"] = trend_long["metric"].map({
+            "business_value": "Business Value",
+            "cumulative_realized_profit": "Cum. Realized Profit",
+            "inventory_liquidity_value": "Inventory Liquidity Value",
+            "conservative_value_created": "Conservative Value Created",
+        })
 
-        # dotted shaded box between bars (profit/loss area)
-        rect_df = plot_m.copy()
-        rect_df["y1"] = rect_df[["sales", "expenses"]].min(axis=1)
-        rect_df["y2"] = rect_df[["sales", "expenses"]].max(axis=1)
-        rect_df["mid"] = (rect_df["y1"] + rect_df["y2"]) / 2.0
-        rect_df["pl_sign"] = np.where(rect_df["diff"] >= 0, "Profit", "Loss")
-        rect_df["__diff_label"] = rect_df["diff"].apply(lambda v: f"{v:+,.0f}")
-
-        # Bars
-        bar = alt.Chart(plot_long).mark_bar().encode(
-            x=alt.X("__label:N", sort=None, title="Month"),
+        line = alt.Chart(trend_long).mark_line(point=True, strokeWidth=3).encode(
+            x=alt.X("month:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
             y=alt.Y("value:Q", title="$"),
-            xOffset="series:N",
-            color=alt.Color(
-                "series:N",
-                scale=alt.Scale(domain=["Sales", "Expenses"], range=["#2563eb", "#22c55e"]),
-                legend=alt.Legend(title=""),
-            ),
-            tooltip=[
-                alt.Tooltip("__label:N", title="Month"),
-                alt.Tooltip("series:N", title="Series"),
-                alt.Tooltip("value:Q", title="Value", format=",.2f"),
-            ],
-        )
-
-        # Data labels on bars
-        bar_labels = alt.Chart(plot_long).mark_text(dy=-8, fontSize=11).encode(
-            x=alt.X("__label:N", sort=None),
-            y="value:Q",
-            xOffset="series:N",
-            text=alt.Text("value:Q", format=",.0f"),
-            color=alt.value("#0f172a"),
-        )
-
-        # Dotted shaded area (green if profit, red if loss)
-        rect = alt.Chart(rect_df).mark_rect(
-            opacity=0.18,
-            strokeWidth=2,
-            strokeDash=[6, 6],
-        ).encode(
-            x=alt.X("__label:N", sort=None),
-            y=alt.Y("y1:Q"),
-            y2=alt.Y2("y2:Q"),
-            color=alt.Color(
-                "pl_sign:N",
-                scale=alt.Scale(domain=["Profit", "Loss"], range=["#22c55e", "#ef4444"]),
-                legend=None,
-            ),
-            tooltip=[
-                alt.Tooltip("__label:N", title="Month"),
-                alt.Tooltip("diff:Q", title="Sales - Expenses", format=",.2f"),
-            ],
-        )
-
-        # Diff label centered in the shaded area (green if profit, red if loss)
-        rect_label = alt.Chart(rect_df).mark_text(fontSize=12, fontWeight="bold").encode(
-            x=alt.X("__label:N", sort=None),
-            y=alt.Y("mid:Q"),
-            text=alt.Text("__diff_label:N"),
-            color=alt.Color(
-                "pl_sign:N",
-                scale=alt.Scale(domain=["Profit", "Loss"], range=["#15803d", "#b91c1c"]),
-                legend=None,
-            ),
-        )
-
-        final = alt.layer(bar, rect, bar_labels, rect_label).resolve_scale(color="independent").properties(height=340).interactive()
-        st.altair_chart(final, use_container_width=True)
-
-    # -------------------------
-    # Chart 2: Net Profit Trend (CUMULATIVE actual through current month + dotted upside/downside)
-    #   - cumulative = cumulative(Sales - Expenses) up to current month
-    #   - dotted forecasts = cumulative + cumulative(market value of open grading by est return month)
-    #   - IMPORTANT: include current-month grading returns if estimated_return_date >= today
-    # -------------------------
-    with top_r:
-        st.markdown("### Net Profit Trend")
-
-        current_month = pd.Timestamp(date.today().replace(day=1))
-        today_norm = pd.Timestamp.today().normalize()
-
-        # --- Reuse monthly sales/expenses logic for cumulative net.
-        # Net profit is based on sold-item economics: sales - COGS - fees - misc.
-        sales_m2 = pd.DataFrame(columns=["month", "sales", "cogs_expense", "fee_expense"])
-        if not tx_math_f2.empty and "__sold_month" in tx_math_f2.columns:
-            sales_m2 = (
-                tx_math_f2.dropna(subset=["__sold_month"])
-                          .groupby("__sold_month", as_index=False)
-                          .agg(
-                              sales=("__dollar_sales", "sum"),
-                              cogs_expense=("__cogs", "sum"),
-                              fee_expense=("__total_fees", "sum"),
-                          )
-                          .rename(columns={"__sold_month": "month"})
-            )
-
-        misc_m2 = pd.DataFrame(columns=["month", "misc_expense"])
-        if not misc_f2.empty and "__month" in misc_f2.columns:
-            misc_m2 = (
-                misc_f2.groupby("__month", as_index=False)["__amount"]
-                       .sum()
-                       .rename(columns={"__month": "month", "__amount": "misc_expense"})
-            )
-
-        # Forecast market value by est return month (open submissions only)
-        mv_up = pd.DataFrame(columns=["month", "mv_up"])
-        mv_dn = pd.DataFrame(columns=["month", "mv_dn"])
-
-        if not open_grading_2.empty and "__est_return_month" in open_grading_2.columns:
-            og = open_grading_2.dropna(subset=["__est_return_month"]).copy()
-
-            # Keep only submissions that are still pending return as of today
-            if "__est_return_dt" in og.columns:
-                og = og[
-                    og["__est_return_dt"].notna()
-                    & (og["__est_return_dt"] >= today_norm)
-                ].copy()
-
-            og["__mv_up"] = _to_num(og.get("__psa10", 0.0)).fillna(0.0)  # market value upside
-            og["__mv_dn"] = _to_num(og.get("__psa9", 0.0)).fillna(0.0)   # market value downside
-
-            mv_up = og.groupby("__est_return_month", as_index=False)["__mv_up"].sum().rename(
-                columns={"__est_return_month": "month", "__mv_up": "mv_up"}
-            )
-            mv_dn = og.groupby("__est_return_month", as_index=False)["__mv_dn"].sum().rename(
-                columns={"__est_return_month": "month", "__mv_dn": "mv_dn"}
-            )
-
-        # Build month backbone for trend (include forecast months)
-        allm2 = []
-        for s in [sales_m2.get("month"), misc_m2.get("month"), mv_up.get("month"), mv_dn.get("month")]:
-            if isinstance(s, pd.Series) and not s.empty:
-                allm2.append(s.dropna())
-
-        if allm2:
-            min_m2 = min([x.min() for x in allm2])
-            max_m2 = max([x.max() for x in allm2])
-            months2 = pd.date_range(min_m2, max_m2, freq="MS")
-        else:
-            months2 = pd.date_range(current_month, current_month, freq="MS")
-
-        trend = pd.DataFrame({"month": months2})
-        trend = trend.merge(sales_m2, on="month", how="left")
-        trend = trend.merge(misc_m2, on="month", how="left")
-        trend = trend.merge(mv_up, on="month", how="left")
-        trend = trend.merge(mv_dn, on="month", how="left")
-
-        for c in ["sales", "cogs_expense", "fee_expense", "misc_expense", "mv_up", "mv_dn"]:
-            if c not in trend.columns:
-                trend[c] = 0.0
-            trend[c] = trend[c].fillna(0.0)
-
-        trend["expenses"] = trend["cogs_expense"] + trend["fee_expense"] + trend["misc_expense"]
-        trend["net"] = trend["sales"] - trend["expenses"]
-
-        # cumulative actual net through current month (future months don't add unknown sales/expenses)
-        trend = trend.sort_values("month").copy()
-        trend["net_actual_piece"] = np.where(trend["month"] <= current_month, trend["net"], 0.0)
-        trend["cum_actual"] = trend["net_actual_piece"].cumsum()
-
-        # anchor (value at current month)
-        cum_at_current = float(trend.loc[trend["month"] == current_month, "cum_actual"].iloc[0]) if (trend["month"] == current_month).any() else float(trend["cum_actual"].iloc[-1])
-
-        # Forecast cumulative (market value adds on return months)
-        # IMPORTANT: include CURRENT MONTH if estimated return date is still ahead of today
-        trend["mv_up_piece"] = np.where(trend["month"] >= current_month, trend["mv_up"], 0.0)
-        trend["mv_dn_piece"] = np.where(trend["month"] >= current_month, trend["mv_dn"], 0.0)
-
-        trend["cum_up"] = cum_at_current + trend["mv_up_piece"].cumsum()
-        trend["cum_dn"] = cum_at_current + trend["mv_dn_piece"].cumsum()
-
-        # ---- Build ACTUAL segmented line (green if >=0, red if <0), stops after current month
-        actual_pts = trend[trend["month"] <= current_month].copy()
-        actual_pts = actual_pts[actual_pts["month"].notna()].sort_values("month")
-        actual_pts["value"] = actual_pts["cum_actual"]
-        actual_pts["sign"] = np.where(actual_pts["value"] >= 0, "Profit", "Loss")
-        actual_pts["__lbl"] = actual_pts["value"].apply(lambda v: f"{v:,.0f}")
-
-        segs = []
-        if len(actual_pts) >= 2:
-            for i in range(1, len(actual_pts)):
-                a = actual_pts.iloc[i - 1]
-                b = actual_pts.iloc[i]
-                segs.append({
-                    "x1": a["month"], "y1": float(a["value"]),
-                    "x2": b["month"], "y2": float(b["value"]),
-                    "sign": "Profit" if float(b["value"]) >= 0 else "Loss",
-                })
-        seg_df = pd.DataFrame(segs)
-
-        seg_line = alt.Chart(seg_df).mark_rule(strokeWidth=3).encode(
-            x=alt.X("x1:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
-            x2="x2:T",
-            y=alt.Y("y1:Q", title="$"),
-            y2="y2:Q",
-            color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#22c55e", "#ef4444"]), legend=None),
-            tooltip=[
-                alt.Tooltip("x2:T", title="Month", format="%Y-%m"),
-                alt.Tooltip("y2:Q", title="Cumulative Net", format=",.2f"),
-            ],
-        )
-
-        actual_points = alt.Chart(actual_pts).mark_point(size=70, filled=True).encode(
-            x="month:T",
-            y="value:Q",
-            color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#22c55e", "#ef4444"]), legend=None),
+            color=alt.Color("metric:N", legend=alt.Legend(title="")),
             tooltip=[
                 alt.Tooltip("month:T", title="Month", format="%Y-%m"),
-                alt.Tooltip("value:Q", title="Cumulative Net", format=",.2f"),
+                alt.Tooltip("metric:N", title="Metric"),
+                alt.Tooltip("value:Q", title="Value", format=",.2f"),
             ],
+        ).properties(height=340).interactive()
+        st.altair_chart(line, use_container_width=True)
+
+    with c2:
+        st.markdown("### Monthly Sales, Expenses, and Profit")
+        bars = monthly_view[["month", "sales", "realized_expenses", "realized_profit"]].copy()
+        bars_long = bars.melt(
+            id_vars=["month"],
+            value_vars=["sales", "realized_expenses", "realized_profit"],
+            var_name="metric",
+            value_name="value",
         )
+        bars_long["metric"] = bars_long["metric"].map({
+            "sales": "Sales",
+            "realized_expenses": "Expenses",
+            "realized_profit": "Profit",
+        })
 
-        actual_labels = alt.Chart(actual_pts).mark_text(dy=-10, fontSize=11, fontWeight="bold").encode(
-            x="month:T",
-            y="value:Q",
-            text=alt.Text("__lbl:N"),
-            color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#15803d", "#b91c1c"]), legend=None),
+        bar_chart = alt.Chart(bars_long).mark_bar().encode(
+            x=alt.X("month:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
+            y=alt.Y("value:Q", title="$"),
+            color=alt.Color("metric:N", legend=alt.Legend(title="")),
+            xOffset="metric:N",
+            tooltip=[
+                alt.Tooltip("month:T", title="Month", format="%Y-%m"),
+                alt.Tooltip("metric:N", title="Metric"),
+                alt.Tooltip("value:Q", title="Value", format=",.2f"),
+            ],
+        ).properties(height=340).interactive()
+        st.altair_chart(bar_chart, use_container_width=True)
+
+    # -------------------------
+    # Monthly summary table
+    # -------------------------
+    st.markdown("### Monthly Summary Table")
+    st.caption(
+        "Business Value = cumulative realized profit + 70% inventory market value. "
+        "Conservative Value Created = cumulative realized profit + (70% inventory market value - inventory cost)."
+    )
+
+    table = monthly_view.copy()
+    table["Month"] = table["month"].dt.strftime("%Y-%m")
+    table = table[[
+        "Month",
+        "sales",
+        "cogs_sold",
+        "selling_fees",
+        "other_expenses",
+        "realized_profit",
+        "cumulative_realized_profit",
+        "items_bought",
+        "inventory_spend",
+        "grading_spend",
+        "items_sold",
+        "inventory_items",
+        "inventory_cost",
+        "inventory_market_value",
+        "inventory_liquidity_value",
+        "inventory_equity",
+        "business_value",
+        "conservative_value_created",
+        "mom_business_value_growth",
+        "mom_business_value_growth_pct",
+        "sales_growth_pct",
+        "net_margin",
+        "inventory_roi_liquid",
+    ]].rename(columns={
+        "sales": "Sales",
+        "cogs_sold": "COGS Sold",
+        "selling_fees": "Selling Fees / Shipping",
+        "other_expenses": "Other Expenses",
+        "realized_profit": "Realized Profit",
+        "cumulative_realized_profit": "Cum. Realized Profit",
+        "items_bought": "Items Bought",
+        "inventory_spend": "Inventory Spend",
+        "grading_spend": "Grading Spend",
+        "items_sold": "Items Sold",
+        "inventory_items": "Inventory Items Held",
+        "inventory_cost": "Inventory Cost Held",
+        "inventory_market_value": "Inventory Market Value",
+        "inventory_liquidity_value": "Liquidity Value @ 70%",
+        "inventory_equity": "Inventory Equity @ 70%",
+        "business_value": "Business Value",
+        "conservative_value_created": "Conservative Value Created",
+        "mom_business_value_growth": "MoM Business Value Growth",
+        "mom_business_value_growth_pct": "MoM Growth %",
+        "sales_growth_pct": "Sales Growth %",
+        "net_margin": "Net Margin",
+        "inventory_roi_liquid": "Inventory ROI @ 70%",
+    })
+
+    money_cols = [
+        "Sales", "COGS Sold", "Selling Fees / Shipping", "Other Expenses", "Realized Profit",
+        "Cum. Realized Profit", "Inventory Spend", "Grading Spend", "Inventory Cost Held",
+        "Inventory Market Value", "Liquidity Value @ 70%", "Inventory Equity @ 70%",
+        "Business Value", "Conservative Value Created", "MoM Business Value Growth",
+    ]
+    pct_cols = ["MoM Growth %", "Sales Growth %", "Net Margin", "Inventory ROI @ 70%"]
+
+    fmt = {c: "${:,.2f}" for c in money_cols}
+    fmt.update({c: "{:.1%}" for c in pct_cols})
+    fmt.update({
+        "Items Bought": "{:,.0f}",
+        "Items Sold": "{:,.0f}",
+        "Inventory Items Held": "{:,.0f}",
+    })
+
+    sty_monthly = (
+        table.style
+             .format(fmt)
+             .map(_style_red_green, subset=[
+                 "Realized Profit", "Cum. Realized Profit", "Inventory Equity @ 70%",
+                 "Business Value", "Conservative Value Created", "MoM Business Value Growth"
+             ])
+             .set_table_styles(_styler_table_header())
+    )
+    st.dataframe(sty_monthly, use_container_width=True, hide_index=True)
+
+    with st.expander("How to read this"):
+        st.markdown(
+            f"""
+            - **Realized Profit** = Sales - COGS Sold - Selling Fees / Shipping - Other Expenses.
+            - **Liquidity Value @ 70%** = Inventory Market Value × {LIQUIDITY_RATE:.0%}. This is the conservative value you could likely turn into cash faster.
+            - **Business Value** = Cumulative Realized Profit + Liquidity Value @ 70%.
+            - **Conservative Value Created** = Cumulative Realized Profit + Inventory Equity @ 70%. This is stricter because it subtracts the cost still tied up in inventory.
+            - **MoM Growth %** tracks whether business value is compounding month over month.
+            """
         )
-
-        # ---- Forecast dotted lines (Upside/Downside) with sign-based coloring
-        def _forecast_segments_from_col(colname: str, label_name: str):
-            # include current month anchor point + future months
-            pts = trend[trend["month"] >= current_month].copy()
-            pts["value"] = pts[colname]
-            pts = pts.sort_values("month")
-            pts["sign"] = np.where(pts["value"] >= 0, "Profit", "Loss")
-            pts["__lbl"] = pts["value"].apply(lambda v: f"{v:,.0f}")
-
-            # segments
-            segs_local = []
-            if len(pts) >= 2:
-                for i in range(1, len(pts)):
-                    a = pts.iloc[i - 1]
-                    b = pts.iloc[i]
-                    segs_local.append({
-                        "x1": a["month"], "y1": float(a["value"]),
-                        "x2": b["month"], "y2": float(b["value"]),
-                        "sign": "Profit" if float(b["value"]) >= 0 else "Loss",
-                    })
-            seg_df_local = pd.DataFrame(segs_local)
-
-            seg_layer = alt.Chart(seg_df_local).mark_rule(strokeWidth=2, strokeDash=[6, 6]).encode(
-                x="x1:T",
-                x2="x2:T",
-                y="y1:Q",
-                y2="y2:Q",
-                color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#22c55e", "#ef4444"]), legend=None),
-                tooltip=[
-                    alt.Tooltip("x2:T", title="Month", format="%Y-%m"),
-                    alt.Tooltip("y2:Q", title=label_name, format=",.2f"),
-                ],
-            )
-
-            # INCLUDE current month point/label too, so current-month return bumps are visible
-            pts_only = pts[pts["month"] >= current_month].copy()
-
-            pts_layer = alt.Chart(pts_only).mark_point(size=55, filled=True).encode(
-                x="month:T",
-                y="value:Q",
-                color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#22c55e", "#ef4444"]), legend=None),
-            )
-
-            labels_layer = alt.Chart(pts_only).mark_text(dy=-10, fontSize=10).encode(
-                x="month:T",
-                y="value:Q",
-                text=alt.Text("__lbl:N"),
-                color=alt.Color("sign:N", scale=alt.Scale(domain=["Profit", "Loss"], range=["#15803d", "#b91c1c"]), legend=None),
-            )
-
-            return seg_layer + pts_layer + labels_layer
-
-        forecast_up_layer = _forecast_segments_from_col("cum_up", "Upside (Market Value)")
-        forecast_dn_layer = _forecast_segments_from_col("cum_dn", "Downside (Market Value)")
-
-        chart = (seg_line + actual_points + actual_labels + forecast_up_layer + forecast_dn_layer).properties(height=340).interactive()
-        st.altair_chart(chart, use_container_width=True)
-
-    st.markdown("---")
-
-    # =========================================================
-    # Bottom Row: Profit by Purchased From + Market KPIs + Expense Breakdown
-    # =========================================================
-    b1, b2 = st.columns([1.0, 1.4])
-
-    # -------------------------
-    # Bottom Left: Profit by Purchased From (with data labels)
-    # -------------------------
-    with b1:
-        st.markdown("### Profit by Purchased From")
-
-        if txn_f2.empty:
-            st.info("No sales in the selected filters.")
-        else:
-            txp = txn_f2.copy()
-            txp["__fallback_cogs"] = txp["__inventory_id"].apply(_cogs_for_inv_id_2)
-            if "__all_in_cost" in txp.columns:
-                txp["__all_in_cost_num"] = _to_num(txp["__all_in_cost"])
-                txp["__cogs"] = np.where(txp["__all_in_cost_num"] > 0, txp["__all_in_cost_num"], txp["__fallback_cogs"])
-            else:
-                txp["__cogs"] = txp["__fallback_cogs"]
-            txp["__net"] = (txp["__dollar_sales"] - txp["__total_fees"]).fillna(0.0)
-            txp["__profit"] = (txp["__net"] - txp["__cogs"]).fillna(0.0)
-            txp["__purchased_from"] = txp["__inventory_id"].apply(lambda x: _safe_str(_inv_get(x, inv_purchased_from_col, "")).strip() or "Unknown")
-
-            pf = txp.groupby("__purchased_from", as_index=False)["__profit"].sum().rename(columns={"__purchased_from": "purchased_from", "__profit": "profit"})
-            pf = pf.sort_values("profit", ascending=False)
-
-            chart_pf = alt.Chart(pf).mark_bar().encode(
-                x=alt.X("profit:Q", title="Profit ($)"),
-                y=alt.Y("purchased_from:N", sort="-x", title="Purchased From"),
-                tooltip=[
-                    alt.Tooltip("purchased_from:N", title="Purchased From"),
-                    alt.Tooltip("profit:Q", title="Profit", format=",.2f"),
-                ],
-            ).properties(height=320)
-
-            pf_labels = alt.Chart(pf).mark_text(dx=6, align="left", fontSize=11, fontWeight="bold").encode(
-                x="profit:Q",
-                y=alt.Y("purchased_from:N", sort="-x"),
-                text=alt.Text("profit:Q", format=",.0f"),
-                color=alt.condition(alt.datum.profit >= 0, alt.value("#15803d"), alt.value("#b91c1c")),
-            )
-
-            st.altair_chart(chart_pf + pf_labels, use_container_width=True)
-
-    # -------------------------
-    # Bottom Right: Market KPIs + Expense Breakdown (with data labels)
-    #   - metrics turn green when meeting target, red when not
-    # -------------------------
-    with b2:
-        st.markdown("### Operating Metrics")
-
-        mleft, mright = st.columns([1.0, 1.0])
-
-        # ---- KPI block (left)
-        with mleft:
-            # Avg dwell (Cards only) — target 14 days (lower is better)
-            avg_dwell = None
-            if not txn_f2.empty:
-                t = txn_f2.copy()
-                t["__sold_dt"] = _to_dt(t["__sold_dt"])
-                t["__purchase_dt"] = t["__inventory_id"].apply(lambda x: _to_dt(_inv_get(x, "__purchase_dt", pd.NaT)))
-                t["__product_type"] = t["__inventory_id"].apply(lambda x: _safe_str(_inv_get(x, inv_product_type_col, "")).strip().lower())
-                # cards only (exclude sealed)
-                t = t[~t["__product_type"].str.contains("sealed", na=False)].copy()
-                t["__dwell_days"] = (t["__sold_dt"] - t["__purchase_dt"]).dt.days
-                t = t[t["__dwell_days"].notna() & (t["__dwell_days"] >= 0)]
-                if not t.empty:
-                    avg_dwell = float(t["__dwell_days"].mean())
-
-            target_dwell = 14.0
-            dwell_str = f"{avg_dwell:,.1f} days" if avg_dwell is not None else "—"
-
-            if avg_dwell is None:
-                st.metric("Avg Dwell (Cards Only)", dwell_str)
-            else:
-                dwell_delta_val = avg_dwell - target_dwell  # <= 0 is good
-                st.metric(
-                    "Avg Dwell (Cards Only)",
-                    dwell_str,
-                    delta=f"{dwell_delta_val:+.1f} vs target",
-                    delta_color="inverse",  # ✅ negative is green, positive is red
-                )
-
-            # Pokemon gradable rate = # sent in / # purchased (Pokemon cards only) target 50% (higher is better)
-            pokemon_purchased = 0
-            pokemon_sent = 0
-
-            if not inv_f2.empty:
-                inv_cards = inv_f2.copy()
-                inv_cards["__ct"] = inv_cards[inv_card_type_col].apply(_normalize_card_type)
-                inv_cards["__pt"] = inv_cards[inv_product_type_col].astype(str).str.lower()
-                inv_cards = inv_cards[(inv_cards["__ct"] == "Pokemon") & (~inv_cards["__pt"].str.contains("sealed", na=False))].copy()
-                pokemon_purchased = int(len(inv_cards))
-                pokemon_ids = set(inv_cards[inv_id_col].astype(str).str.strip().tolist())
-            else:
-                pokemon_ids = set()
-
-            if not open_grading_2.empty:
-                g = open_grading_2.copy()
-                g["__inv_id"] = g.get("__inv_id", g.get("inventory_id", "")).astype(str).str.strip()
-                if pokemon_ids:
-                    pokemon_sent = int(g[g["__inv_id"].isin(pokemon_ids)]["__inv_id"].nunique())
-
-            grade_rate = (pokemon_sent / pokemon_purchased) if pokemon_purchased else 0.0
-            target_grade = 0.50
-            grade_delta_val = grade_rate - target_grade
-            st.metric(
-                "Pokemon Grade Rate (Sent / Purchased)",
-                f"{grade_rate*100:,.1f}%",
-                delta=f"{grade_delta_val*100:+.1f} pts vs target",
-                delta_color="normal",
-            )
-
-            # Avg purchase margin vs market (Cards only): (total_cost - market_price) / market_price
-            avg_buy_margin = None
-            if not inv_f2.empty and "__market_price" in inv_f2.columns:
-                inv_cards2 = inv_f2.copy()
-                inv_cards2["__pt"] = inv_cards2[inv_product_type_col].astype(str).str.lower()
-                inv_cards2 = inv_cards2[~inv_cards2["__pt"].str.contains("sealed", na=False)].copy()
-                inv_cards2["__mp"] = _to_num(inv_cards2["__market_price"])
-                inv_cards2["__cost"] = _to_num(inv_cards2[inv_total_col])
-                inv_cards2 = inv_cards2[inv_cards2["__mp"] > 0].copy()
-                if not inv_cards2.empty:
-                    inv_cards2["__margin"] = (inv_cards2["__cost"] - inv_cards2["__mp"]) / inv_cards2["__mp"]
-                    avg_buy_margin = float(inv_cards2["__margin"].mean())
-
-            buy_margin_str = f"{avg_buy_margin*100:,.1f}%" if avg_buy_margin is not None else "—"
-            st.metric("Avg Purchase Margin vs Market (Cards)", buy_margin_str)
-
-        # ---- Expense breakdown (right)
-        with mright:
-            st.markdown("#### Expenses by Type")
-
-            # Sales-period expenses from sold items.
-            cogs_expense_total = float(tx_math_f2["__cogs"].sum()) if not tx_math_f2.empty else 0.0
-            selling_fees_total = float(tx_math_f2["__total_fees"].sum()) if not tx_math_f2.empty else 0.0
-
-            # Map misc categories into requested buckets
-            bucket_order = [
-                "Cost of goods sold",
-                "Selling fees / shipping",
-                "Packaging materials",
-                "Card show fees",
-                "Supplies",
-                "Shipping supplies",
-                "Subscriptions",
-                "Mileage/Travel",
-                "Other",
-            ]
-
-            def _map_misc_cat(c: str) -> str:
-                s = _safe_str(c).strip().lower()
-                if "pack" in s:
-                    return "Packaging materials"
-                if "card show" in s or ("show" in s and "card" in s):
-                    return "Card show fees"
-                if "ship" in s:
-                    return "Shipping supplies"
-                if "sub" in s:
-                    return "Subscriptions"
-                if "mile" in s or "travel" in s or "gas" in s or "uber" in s or "hotel" in s:
-                    return "Mileage/Travel"
-                if "suppl" in s:
-                    return "Supplies"
-                if s in {"other", ""}:
-                    return "Other"
-                for k in bucket_order:
-                    if s == k.lower():
-                        return k
-                return "Other"
-
-            rows_exp = [
-                {"expense_type": "Cost of goods sold", "amount": cogs_expense_total},
-                {"expense_type": "Selling fees / shipping", "amount": selling_fees_total},
-            ]
-
-            if not misc_f2.empty and "__category" in misc_f2.columns and "__amount" in misc_f2.columns:
-                mm = misc_f2.copy()
-                mm["expense_type"] = mm["__category"].apply(_map_misc_cat)
-                mm2 = mm.groupby("expense_type", as_index=False)["__amount"].sum().rename(columns={"__amount": "amount"})
-                rows_exp += mm2.to_dict("records")
-
-            exp_df = pd.DataFrame(rows_exp)
-            if not exp_df.empty:
-                exp_df = exp_df.groupby("expense_type", as_index=False)["amount"].sum()
-                exp_df["expense_type"] = pd.Categorical(exp_df["expense_type"], categories=bucket_order, ordered=True)
-                exp_df = exp_df.sort_values("expense_type")
-
-                chart_exp = alt.Chart(exp_df).mark_bar().encode(
-                    x=alt.X("expense_type:N", title="", sort=bucket_order),
-                    y=alt.Y("amount:Q", title="$"),
-                    tooltip=[
-                        alt.Tooltip("expense_type:N", title="Type"),
-                        alt.Tooltip("amount:Q", title="Amount", format=",.2f"),
-                    ],
-                ).properties(height=320)
-
-                exp_labels = alt.Chart(exp_df).mark_text(dy=-8, fontSize=11, fontWeight="bold").encode(
-                    x=alt.X("expense_type:N", sort=bucket_order),
-                    y="amount:Q",
-                    text=alt.Text("amount:Q", format=",.0f"),
-                    color=alt.value("#0f172a"),
-                )
-
-                st.altair_chart(chart_exp + exp_labels, use_container_width=True)
-            else:
-                st.info("No expenses found for the selected filters.")
