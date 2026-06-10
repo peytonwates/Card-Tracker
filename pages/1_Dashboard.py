@@ -2418,18 +2418,33 @@ with tab_forecast:
         st.info("No monthly data found for the selected year.")
         st.stop()
 
-    latest = monthly_view.iloc[-1]
-    prev = monthly_view.iloc[-2] if len(monthly_view) >= 2 else None
+    # KPI cards should represent the business as of the current month, not the
+    # furthest future month created by scheduled show fees or future expenses.
+    # Future rows stay visible in the table/charts for planning, but they do not
+    # drive the top-line KPI cards.
+    current_month = pd.Timestamp(date.today().replace(day=1))
+    kpi_view = monthly_view[monthly_view["month"] <= current_month].copy()
+    if kpi_view.empty:
+        # This only happens if the user filters to a future-only year. In that
+        # case, fall back to the selected view so the dashboard still renders.
+        kpi_view = monthly_view.copy()
+
+    latest = kpi_view.iloc[-1]
+    prev = kpi_view.iloc[-2] if len(kpi_view) >= 2 else None
+    latest_month_label = pd.Timestamp(latest["month"]).strftime("%Y-%m")
 
     business_delta = float(latest["business_value"] - prev["business_value"]) if prev is not None else float(latest["business_value"])
     business_delta_pct = (business_delta / abs(float(prev["business_value"]))) if prev is not None and float(prev["business_value"]) != 0 else 0.0
 
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Business Value", _fmt_money(latest["business_value"]), delta=f"{business_delta:+,.0f} / {business_delta_pct*100:+.1f}%")
-    k2.metric("Cumulative Realized Profit", _fmt_money(latest["cumulative_realized_profit"]))
-    k3.metric("Inventory Liquidity Value", _fmt_money(latest["inventory_liquidity_value"]), help="70% of current market value")
-    k4.metric("Conservative Value Created", _fmt_money(latest["conservative_value_created"]))
-    k5.metric("Latest Month Profit", _fmt_money(latest["realized_profit"]), delta=f"Margin {latest['net_margin']*100:,.1f}%")
+    k1.metric("Business Value", _fmt_money(latest["business_value"]), delta=f"{business_delta:+,.0f} / {business_delta_pct*100:+.1f}%", help=f"As of {latest_month_label}. Future scheduled expenses are excluded from KPI cards.")
+    k2.metric("Cumulative Realized Profit", _fmt_money(latest["cumulative_realized_profit"]), help=f"As of {latest_month_label}")
+    k3.metric("Inventory Liquidity Value", _fmt_money(latest["inventory_liquidity_value"]), help=f"70% of current market value, as of {latest_month_label}")
+    k4.metric("Conservative Value Created", _fmt_money(latest["conservative_value_created"]), help=f"As of {latest_month_label}")
+    k5.metric("Current Month Profit", _fmt_money(latest["realized_profit"]), delta=f"Margin {latest['net_margin']*100:,.1f}%", help=f"Uses {latest_month_label}, not future expense months.")
+
+    if monthly_view["month"].max() > current_month:
+        st.caption("KPI cards are as-of the current month. Future scheduled expenses remain visible in the monthly table and charts for planning, but they do not drive Current Month Profit.")
 
     st.markdown("---")
 
@@ -2536,8 +2551,10 @@ with tab_forecast:
 
     table = monthly_view.copy()
     table["Month"] = table["month"].dt.strftime("%Y-%m")
+    table["Period Status"] = np.where(table["month"] > current_month, "Future Scheduled", "Actual / Current")
     table = table[[
         "Month",
+        "Period Status",
         "sales",
         "cogs_sold",
         "selling_fees",
