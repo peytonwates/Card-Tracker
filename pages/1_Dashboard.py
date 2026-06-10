@@ -1981,6 +1981,18 @@ with tab_forecast:
 
     LIQUIDITY_RATE = 0.70
 
+    def _to_dt_monthly(x):
+        """Parse mixed date formats like 2026-06-06 and 06/09/2026 in the same column."""
+        try:
+            return pd.to_datetime(x, errors="coerce", format="mixed")
+        except TypeError:
+            # Older pandas fallback
+            return pd.to_datetime(x, errors="coerce", infer_datetime_format=True)
+
+    def _month_start_monthly(dt_series):
+        d = _to_dt_monthly(dt_series)
+        return d.dt.to_period("M").dt.to_timestamp()
+
     f1, f2 = st.columns([1, 4])
     with f1:
         year_choice_2 = st.selectbox("Year", options=year_opts, index=0, key="monthly_summary_year")
@@ -2040,7 +2052,7 @@ with tab_forecast:
 
         if "__sold_dt" not in out.columns:
             out["__sold_dt"] = pd.NaT
-        out["__sold_dt"] = _to_dt(out["__sold_dt"])
+        out["__sold_dt"] = _to_dt_monthly(out["__sold_dt"])
         out = out[out["__sold_dt"].notna()].copy()
 
         if "__dollar_sales" not in out.columns:
@@ -2048,10 +2060,26 @@ with tab_forecast:
         else:
             out["__dollar_sales"] = _to_num(out["__dollar_sales"])
 
+        # Fees / proceeds: prefer an already-computed net value when available.
+        # This keeps the Monthly Summary aligned with the validated sales ledger.
         if "__total_fees" not in out.columns:
             out["__total_fees"] = _to_num(out.get("__fees", 0.0)) + _to_num(out.get("__ship_charged", 0.0))
         else:
             out["__total_fees"] = _to_num(out["__total_fees"])
+
+        existing_net = None
+        if "__net" in out.columns:
+            existing_net = _to_num(out["__net"])
+        elif "net_proceeds" in out.columns:
+            existing_net = _to_num(out["net_proceeds"])
+
+        if existing_net is not None:
+            # If fees are missing/0 but net proceeds exist, back into fees from gross - net.
+            inferred_fees = (out["__dollar_sales"] - existing_net).clip(lower=0.0)
+            out["__total_fees"] = np.where(out["__total_fees"] > 0, out["__total_fees"], inferred_fees)
+            out["__net"] = existing_net
+        else:
+            out["__net"] = (out["__dollar_sales"] - out["__total_fees"]).fillna(0.0)
 
         fallback_cogs = out["__inventory_id"].apply(_inv_cost_monthly)
         if "__all_in_cost" in out.columns:
@@ -2060,12 +2088,125 @@ with tab_forecast:
         else:
             out["__cogs"] = fallback_cogs
 
-        out["__net"] = (out["__dollar_sales"] - out["__total_fees"]).fillna(0.0)
         out["__profit_calc"] = (out["__net"] - out["__cogs"]).fillna(0.0)
-        out["__sold_month"] = _month_start(out["__sold_dt"])
+        out["__sold_month"] = _month_start_monthly(out["__sold_dt"])
         return out
 
-    tx_math_all = _monthly_sales_math(txn)
+    def _monthly_sales_math_from_inventory(inv_df: pd.DataFrame) -> pd.DataFrame:
+        """Build the monthly sales ledger directly from the inventory sheet.
+
+        This is intentionally inventory-first so sales written only to inventory
+        still count, regardless of sale_channel/platform wording such as
+        Card Show, Online, Ebay, or FACEBOOK MARKETPLACE.
+        """
+        empty_cols = [
+            "__sold_dt", "__sold_month", "__inventory_id", "__dollar_sales",
+            "__total_fees", "__net", "__cogs", "__profit_calc", "__sale_channel"
+        ]
+        if inv_df is None or inv_df.empty or inv_id_col not in inv_df.columns:
+            return pd.DataFrame(columns=empty_cols)
+
+        d = inv_df.copy()
+        d[inv_id_col] = d[inv_id_col].apply(lambda x: _safe_str(x).strip())
+        d["__inventory_id"] = d[inv_id_col]
+
+        status = (
+            d[inv_status_col].astype(str).str.upper().str.strip()
+            if inv_status_col in d.columns
+            else pd.Series("", index=d.index)
+        )
+
+        if inv_sold_price_col and inv_sold_price_col in d.columns:
+            d["__dollar_sales"] = _to_num(d[inv_sold_price_col])
+        else:
+            d["__dollar_sales"] = 0.0
+
+        if inv_sold_date_col and inv_sold_date_col in d.columns:
+            d["__sold_dt"] = _to_dt_monthly(d[inv_sold_date_col])
+        else:
+            d["__sold_dt"] = pd.NaT
+
+        # Count every inventory row marked SOLD that has a sale date or sold price.
+        # Do NOT filter by sale_channel; channel names are inconsistent by design.
+        d = d[(status.eq("SOLD")) & ((d["__dollar_sales"] > 0) | d["__sold_dt"].notna())].copy()
+        if d.empty:
+            return pd.DataFrame(columns=empty_cols)
+
+        d = d[d["__sold_dt"].notna()].copy()
+        if d.empty:
+            return pd.DataFrame(columns=empty_cols)
+
+        base_fees = _to_num(d[inv_fees_col]) if inv_fees_col and inv_fees_col in d.columns else 0.0
+        ship_charged = _to_num(d[inv_shipping_charged_col]) if inv_shipping_charged_col and inv_shipping_charged_col in d.columns else 0.0
+
+        # For sold inventory rows, align to the validated sales fields on the inventory sheet:
+        # sold_price = gross sales before fees
+        # net_proceeds = cash after selling fees / shipping
+        # total_cost = COGS
+        # This prevents the monthly summary from drifting away from the Sales table.
+        net_col_m = inv_net_col if inv_net_col and inv_net_col in d.columns else None
+        if net_col_m:
+            net_raw_text = d[net_col_m].astype(str).str.strip()
+            has_net = net_raw_text.ne("") & net_raw_text.str.lower().ne("nan")
+            stored_net = _to_num(d[net_col_m])
+        else:
+            has_net = pd.Series(False, index=d.index)
+            stored_net = pd.Series(0.0, index=d.index)
+
+        if inv_fees_total_col and inv_fees_total_col in d.columns:
+            fees_from_sheet = _to_num(d[inv_fees_total_col])
+        else:
+            fees_from_sheet = pd.Series(0.0, index=d.index)
+
+        fees_from_net = (d["__dollar_sales"] - stored_net).clip(lower=0.0)
+        d["__total_fees"] = np.where(
+            fees_from_sheet > 0,
+            fees_from_sheet,
+            np.where(has_net, fees_from_net, base_fees + ship_charged),
+        )
+
+        inv_direct_cost_col = _pick_col(d, "total_cost", None) or _pick_col(d, "all_in_cost", None)
+        fallback_cost = _to_num(d[inv_total_col]) if inv_total_col in d.columns else 0.0
+        if inv_direct_cost_col and inv_direct_cost_col in d.columns:
+            direct_cost = _to_num(d[inv_direct_cost_col])
+            d["__cogs"] = np.where(direct_cost > 0, direct_cost, fallback_cost)
+        else:
+            d["__cogs"] = fallback_cost
+
+        d["__net"] = np.where(has_net, stored_net, (d["__dollar_sales"] - d["__total_fees"]).fillna(0.0))
+        d["__profit_calc"] = (d["__net"] - d["__cogs"]).fillna(0.0)
+        d["__sold_month"] = _month_start_monthly(d["__sold_dt"])
+
+        if inv_sale_channel_col and inv_sale_channel_col in d.columns:
+            d["__sale_channel"] = d[inv_sale_channel_col].astype(str).replace("nan", "").fillna("")
+        else:
+            d["__sale_channel"] = ""
+
+        # Fill blank channels from platform/transaction_type when available so the audit table is useful.
+        for fallback_col in ["platform", "transaction_type"]:
+            if fallback_col in d.columns:
+                blank = d["__sale_channel"].astype(str).str.strip().eq("")
+                d.loc[blank, "__sale_channel"] = d.loc[blank, fallback_col].astype(str).replace("nan", "")
+
+        return d[empty_cols].copy()
+
+    # Use inventory as the source of truth for monthly sales, then add only
+    # legacy transaction rows whose inventory_id was not already counted.
+    tx_inventory_sales = _monthly_sales_math_from_inventory(inv_monthly)
+    tx_legacy_sales = _monthly_sales_math(txn)
+
+    if not tx_inventory_sales.empty and not tx_legacy_sales.empty:
+        counted_ids = set(tx_inventory_sales["__inventory_id"].astype(str).str.strip())
+        tx_legacy_sales = tx_legacy_sales[~tx_legacy_sales["__inventory_id"].astype(str).str.strip().isin(counted_ids)].copy()
+
+    tx_math_all = pd.concat(
+        [x for x in [tx_inventory_sales, tx_legacy_sales] if x is not None and not x.empty],
+        ignore_index=True,
+        sort=False,
+    ) if (not tx_inventory_sales.empty or not tx_legacy_sales.empty) else pd.DataFrame(columns=[
+        "__sold_dt", "__sold_month", "__inventory_id", "__dollar_sales",
+        "__total_fees", "__net", "__cogs", "__profit_calc", "__sale_channel"
+    ])
 
     # Sold-date lookup lets month-end inventory include items that were held in old months but sold later.
     sold_date_by_inv_id = {}
@@ -2173,16 +2314,16 @@ with tab_forecast:
     inventory_rows = []
     if not inv_monthly.empty and "__purchase_dt" in inv_monthly.columns:
         inv_asof_base = inv_monthly.copy()
-        inv_asof_base["__purchase_dt"] = _to_dt(inv_asof_base["__purchase_dt"])
+        inv_asof_base["__purchase_dt"] = _to_dt_monthly(inv_asof_base["__purchase_dt"])
         inv_asof_base["__inv_id_key"] = inv_asof_base[inv_id_col].apply(lambda x: _safe_str(x).strip())
 
         if inv_sold_date_col and inv_sold_date_col in inv_asof_base.columns:
-            inv_asof_base["__sold_dt_monthly"] = _to_dt(inv_asof_base[inv_sold_date_col])
+            inv_asof_base["__sold_dt_monthly"] = _to_dt_monthly(inv_asof_base[inv_sold_date_col])
         else:
             inv_asof_base["__sold_dt_monthly"] = pd.NaT
 
         mapped_sold_dt = inv_asof_base["__inv_id_key"].map(sold_date_by_inv_id)
-        inv_asof_base["__sold_dt_monthly"] = inv_asof_base["__sold_dt_monthly"].combine_first(_to_dt(mapped_sold_dt))
+        inv_asof_base["__sold_dt_monthly"] = inv_asof_base["__sold_dt_monthly"].combine_first(_to_dt_monthly(mapped_sold_dt))
         inv_asof_base["__status_upper"] = inv_asof_base[inv_status_col].astype(str).str.upper().str.strip()
         inv_asof_base["__held_cost"] = inv_asof_base["__inv_id_key"].apply(_inv_cost_monthly)
 
@@ -2354,6 +2495,35 @@ with tab_forecast:
             ],
         ).properties(height=340).interactive()
         st.altair_chart(bar_chart, use_container_width=True)
+
+    with st.expander("Audit: sales included by month/channel"):
+        if tx_math_all.empty:
+            st.info("No sold rows were included in the monthly sales ledger.")
+        else:
+            audit = tx_math_all.copy()
+            audit["Month"] = audit["__sold_month"].dt.strftime("%Y-%m")
+            audit["Channel"] = audit.get("__sale_channel", "").astype(str).replace("", "Unknown")
+            audit_df = (
+                audit.groupby(["Month", "Channel"], as_index=False)
+                     .agg(
+                         Items=("__inventory_id", "count"),
+                         Sales=("__dollar_sales", "sum"),
+                         COGS=("__cogs", "sum"),
+                         Fees=("__total_fees", "sum"),
+                         Profit=("__profit_calc", "sum"),
+                     )
+                     .sort_values(["Month", "Channel"])
+            )
+            st.dataframe(
+                audit_df.style.format({
+                    "Sales": "${:,.2f}",
+                    "COGS": "${:,.2f}",
+                    "Fees": "${:,.2f}",
+                    "Profit": "${:,.2f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     # -------------------------
     # Monthly summary table
