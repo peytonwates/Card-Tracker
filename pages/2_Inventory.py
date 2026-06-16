@@ -214,53 +214,44 @@ def _extract_spreadsheet_id(value) -> str:
     Returns only the Sheet ID needed by gspread.open_by_key().
     """
     raw = str(value or "").strip()
-
     if not raw:
         return ""
 
-    # Full URL example:
-    # https://docs.google.com/spreadsheets/d/<SPREADSHEET_ID>/edit#gid=0
     match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", raw)
     if match:
         return match.group(1).strip()
 
-    # If someone pasted a partial URL or ID with query/hash junk, clean it.
     raw = raw.replace("https://docs.google.com/spreadsheets/d/", "")
-    raw = raw.replace("http://docs.google.com/spreadsheets/d/", "")
     raw = raw.split("/edit")[0]
     raw = raw.split("?")[0]
     raw = raw.split("#")[0]
-
     return raw.strip()
 
 
 def _normalize_service_account_info(sa_info: dict) -> dict:
     """
-    Streamlit secrets sometimes store private_key with escaped \n characters.
+    Streamlit secrets sometimes store private_key with escaped \\n.
     Google Credentials requires actual newline characters.
     """
     sa_info = dict(sa_info)
-
     if "private_key" in sa_info and isinstance(sa_info["private_key"], str):
         sa_info["private_key"] = sa_info["private_key"].replace("\\n", "\n")
-
     return sa_info
 
 
-def _service_account_email_hint() -> str:
-    """Return the service account email when available. Safe to show in the app."""
+def _get_service_account_email() -> str:
+    """Safely return the service account client_email, if available."""
     try:
-        if "gcp_service_account" in st.secrets and not isinstance(st.secrets["gcp_service_account"], str):
-            sa = st.secrets["gcp_service_account"]
-            return str(sa.get("client_email", "")).strip()
+        if "gcp_service_account" not in st.secrets:
+            return ""
 
-        if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], str):
-            sa_info = json.loads(st.secrets["gcp_service_account"])
-            return str(sa_info.get("client_email", "")).strip()
+        sa = st.secrets["gcp_service_account"]
+        if isinstance(sa, str):
+            return str(json.loads(sa).get("client_email", "")).strip()
+
+        return str(sa.get("client_email", "")).strip()
     except Exception:
         return ""
-
-    return ""
 
 
 def _google_api_error_message(exc: Exception) -> str:
@@ -269,20 +260,14 @@ def _google_api_error_message(exc: Exception) -> str:
     status_code = getattr(response, "status_code", None)
     response_text = getattr(response, "text", "")
 
-    if not response_text:
-        response_text = str(exc)
+    if response_text:
+        response_text = str(response_text)[:1200]
 
-    response_text = str(response_text)[:1500]
     return f"Status: {status_code}\nResponse: {response_text}"
 
 
 def _stop_with_sheets_error(message: str, exc: Exception | None = None, spreadsheet_id: str = ""):
-    """
-    Show a helpful Streamlit error and print details to Streamlit Cloud logs.
-    This avoids Streamlit's redacted generic app error.
-    """
-    service_email = _service_account_email_hint()
-
+    """Show a helpful Streamlit error and print details to Streamlit Cloud logs."""
     safe_id_hint = ""
     if spreadsheet_id:
         safe_id_hint = (
@@ -291,10 +276,12 @@ def _stop_with_sheets_error(message: str, exc: Exception | None = None, spreadsh
             else spreadsheet_id
         )
 
+    client_email = _get_service_account_email()
+
     print("========== GOOGLE SHEETS ERROR ==========")
     print(message)
-    if service_email:
-        print(f"Service account email: {service_email}")
+    if client_email:
+        print(f"Service account email: {client_email}")
     if safe_id_hint:
         print(f"Spreadsheet ID hint: {safe_id_hint}")
         print(f"Spreadsheet ID length: {len(spreadsheet_id)}")
@@ -307,21 +294,18 @@ def _stop_with_sheets_error(message: str, exc: Exception | None = None, spreadsh
 
     with st.expander("Google Sheets troubleshooting", expanded=True):
         st.write("Most common fixes:")
-        st.write("1. Share the Google Sheet with the service account email as Editor.")
-        st.write("2. Make sure `spreadsheet_id` is the Google Sheet ID, not the tab `gid`.")
+        st.write("1. Share the Google Sheet with your service account email as Editor.")
+        st.write("2. Make sure `spreadsheet_id` is only the Sheet ID, not the full URL.")
         st.write("3. Make sure the worksheet tab name matches your secret, usually `inventory`.")
-        st.write("4. Check Streamlit Cloud logs for the Google status code and response.")
-
-        if service_email:
+        st.write("4. Check Streamlit Cloud logs for the Google status code.")
+        if client_email:
             st.write("Service account email to share the Sheet with:")
-            st.code(service_email)
-
+            st.code(client_email)
         if safe_id_hint:
             st.write("Spreadsheet ID loaded by the app:")
             st.code(safe_id_hint)
-
         if exc is not None:
-            st.write("Google API details:")
+            st.write("Google/API response:")
             st.code(_google_api_error_message(exc))
 
     st.stop()
@@ -358,7 +342,7 @@ def get_gspread_client():
             return gspread.authorize(creds)
         except Exception as exc:
             _stop_with_sheets_error(
-                "Google service account JSON in Streamlit secrets could not be parsed or loaded.",
+                "Google service account JSON in Streamlit secrets could not be parsed/loaded.",
                 exc,
             )
 
@@ -367,13 +351,10 @@ def get_gspread_client():
         try:
             sa_rel = st.secrets["service_account_json_path"]
             sa_path = Path(sa_rel)
-
             if not sa_path.is_absolute():
                 sa_path = Path.cwd() / sa_rel
-
             if not sa_path.exists():
                 raise FileNotFoundError(f"Service account JSON not found at: {sa_path}")
-
             sa_info = json.loads(sa_path.read_text(encoding="utf-8"))
             sa_info = _normalize_service_account_info(sa_info)
             creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
@@ -397,7 +378,6 @@ def _get_spreadsheet_id() -> str:
         "SPREADSHEET_ID",
         default="",
     )
-
     spreadsheet_id = _extract_spreadsheet_id(spreadsheet_id_raw)
 
     if not spreadsheet_id:
@@ -408,14 +388,13 @@ def _get_spreadsheet_id() -> str:
     return spreadsheet_id
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def get_spreadsheet():
     client = get_gspread_client()
     spreadsheet_id = _get_spreadsheet_id()
 
     try:
         return client.open_by_key(spreadsheet_id)
-
     except SpreadsheetNotFound as exc:
         _stop_with_sheets_error(
             "Google Sheet was not found or the service account does not have access. "
@@ -423,7 +402,6 @@ def get_spreadsheet():
             exc,
             spreadsheet_id,
         )
-
     except APIError as exc:
         _stop_with_sheets_error(
             "Google Sheets API rejected the request. Check whether the Sheet is shared with the service account, "
@@ -431,7 +409,6 @@ def get_spreadsheet():
             exc,
             spreadsheet_id,
         )
-
     except Exception as exc:
         _stop_with_sheets_error(
             "Unexpected error while opening the Google Sheet.",
@@ -446,7 +423,6 @@ def get_worksheet():
 
     try:
         return sh.worksheet(worksheet_name)
-
     except WorksheetNotFound:
         available_tabs = [ws.title for ws in sh.worksheets()]
         st.error(
@@ -468,8 +444,6 @@ def get_grading_worksheet():
     if configured_name:
         try:
             return sh.worksheet(configured_name)
-        except WorksheetNotFound:
-            pass
         except Exception:
             pass
 
@@ -495,6 +469,72 @@ def get_grading_worksheet():
     except Exception:
         pass
 
+    return None
+
+
+def _default_sheet_headers() -> list[str]:
+    sheet_headers = []
+    for internal in DEFAULT_COLUMNS:
+        if internal == "product_type":
+            sheet_headers.append("Product Type")
+        elif internal == "sealed_product_type":
+            sheet_headers.append("Sealed Product Type")
+        elif internal == "inventory_type":
+            sheet_headers.append("Inventory Type")
+        else:
+            sheet_headers.append(internal)
+    return sheet_headers
+
+
+def _dedupe_headers_for_dataframe(headers: list[str]) -> list[str]:
+    """Return unique dataframe-safe headers while preserving the original names as much as possible.
+
+    Google Sheets itself can contain duplicate headers, but gspread.get_all_records()
+    refuses to read sheets with duplicate headers.  The Inventory page therefore
+    reads raw values and applies temporary __dup suffixes only inside pandas.
+    """
+    counts = {}
+    out = []
+    for i, h in enumerate(headers, start=1):
+        base = str(h or "").strip() or f"unnamed_col_{i}"
+        counts[base] = counts.get(base, 0) + 1
+        out.append(base if counts[base] == 1 else f"{base}__dup{counts[base]}")
+    return out
+
+
+def _strip_dup_suffix(h: str) -> str:
+    return re.sub(r"__dup\d+$", "", str(h or "").strip())
+
+
+def ensure_headers(ws):
+    first_row = ws.row_values(1)
+    if not first_row:
+        sheet_headers = _default_sheet_headers()
+        ws.append_row(sheet_headers)
+        return sheet_headers
+
+    existing = [str(h or "").strip() for h in first_row]
+    existing_internal = set(sheet_header_to_internal(_strip_dup_suffix(h)) for h in existing if str(h).strip())
+
+    missing_internal = [h for h in DEFAULT_COLUMNS if h not in existing_internal]
+    if missing_internal:
+        additions = [internal_to_sheet_header(h, existing) for h in missing_internal]
+        new_headers = existing + additions
+        ws.update("1:1", [new_headers])
+        return new_headers
+
+    return existing
+
+
+def _normalize_header_name(x: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(x).strip().lower())
+
+
+def _find_matching_column(columns, aliases):
+    wanted = {_normalize_header_name(a) for a in aliases}
+    for col in columns:
+        if _normalize_header_name(col) in wanted:
+            return col
     return None
 
 
