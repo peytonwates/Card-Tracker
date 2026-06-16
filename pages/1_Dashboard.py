@@ -1461,7 +1461,45 @@ with tab_bs:
     if not inv.empty:
         inv_keyed = inv.copy()
         inv_keyed[inv_id_col] = inv_keyed[inv_id_col].apply(lambda x: _safe_str(x).strip())
-        inv_by_id = inv_keyed.set_index(inv_id_col, drop=False).to_dict("index")
+
+        # Fix: pandas requires a unique index for to_dict("index").
+        # Duplicate inventory_id values can happen from manual sheet edits, repeated imports,
+        # or older migrations. Keep the last row for dashboard lookups instead of crashing.
+        inv_keyed = inv_keyed[inv_keyed[inv_id_col] != ""].copy()
+        if not inv_keyed.empty:
+            duplicate_mask = inv_keyed[inv_id_col].duplicated(keep=False)
+            duplicate_count = int(duplicate_mask.sum())
+
+            if duplicate_count > 0:
+                st.warning(
+                    f"Found {duplicate_count} inventory rows with duplicate inventory_id values. "
+                    "Dashboard lookup is using the last row for each duplicate ID. "
+                    "Clean the duplicate IDs in the inventory sheet when convenient."
+                )
+
+                # Prefer newer/last-updated rows when timestamp columns exist; otherwise sheet order wins.
+                sort_cols = []
+                for c in [
+                    "sold_updated_at",
+                    "market_price_updated_at",
+                    "created_at",
+                    "purchase_date",
+                ]:
+                    if c in inv_keyed.columns:
+                        helper_col = f"__sort_{c}"
+                        inv_keyed[helper_col] = _to_dt(inv_keyed[c])
+                        sort_cols.append(helper_col)
+
+                inv_keyed["__sheet_order"] = np.arange(len(inv_keyed))
+                if sort_cols:
+                    inv_keyed = inv_keyed.sort_values(sort_cols + ["__sheet_order"], na_position="first")
+                else:
+                    inv_keyed = inv_keyed.sort_values(["__sheet_order"])
+
+                inv_keyed = inv_keyed.drop_duplicates(subset=[inv_id_col], keep="last")
+                inv_keyed = inv_keyed.drop(columns=[c for c in inv_keyed.columns if str(c).startswith("__sort_") or c == "__sheet_order"], errors="ignore")
+
+            inv_by_id = inv_keyed.set_index(inv_id_col, drop=False).to_dict("index")
 
     grading_cost_by_inv_id = {}
     if not grd.empty:
